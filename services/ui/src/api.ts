@@ -9,35 +9,117 @@
 
 export interface ApiErrorShape {
 	error: string;
-	type?: string;
+	/** Present on a 500; quote it when reporting a fault so the log can be found. */
+	requestId?: string;
 }
 
 export class ApiError extends Error {
 	constructor(
 		message: string,
 		readonly status: number,
+		readonly requestId?: string,
 	) {
 		super(message);
 	}
 }
 
+// ── session ─────────────────────────────────────────────────────────────────
+
+export interface SessionUser {
+	username: string;
+	role: "viewer" | "analyst" | "admin";
+	ontologyRole: string;
+}
+
+const TOKEN_KEY = "tms.auth.token";
+const USER_KEY = "tms.auth.user";
+const EXPIRY_KEY = "tms.auth.expires";
+
+/**
+ * The signed-in session, held in localStorage.
+ *
+ * Every read is wrapped: storage throws in a private window and can come back
+ * empty after a clear, and neither case should stop the app rendering - it
+ * just means nobody is signed in.
+ */
+export const session = {
+	token(): string | null {
+		try {
+			const expires = window.localStorage.getItem(EXPIRY_KEY);
+			// Drop a token the server would reject anyway, so the UI shows the
+			// login form rather than a wall of 401s.
+			if (expires && Date.parse(expires) <= Date.now()) {
+				session.clear();
+				return null;
+			}
+			return window.localStorage.getItem(TOKEN_KEY);
+		} catch {
+			return null;
+		}
+	},
+	user(): SessionUser | null {
+		try {
+			const raw = window.localStorage.getItem(USER_KEY);
+			return raw ? (JSON.parse(raw) as SessionUser) : null;
+		} catch {
+			return null;
+		}
+	},
+	set(token: string, user: SessionUser, expiresAt: string): void {
+		try {
+			window.localStorage.setItem(TOKEN_KEY, token);
+			window.localStorage.setItem(USER_KEY, JSON.stringify(user));
+			window.localStorage.setItem(EXPIRY_KEY, expiresAt);
+		} catch {
+			/* a session that cannot be persisted still works for this tab */
+		}
+	},
+	clear(): void {
+		try {
+			window.localStorage.removeItem(TOKEN_KEY);
+			window.localStorage.removeItem(USER_KEY);
+			window.localStorage.removeItem(EXPIRY_KEY);
+		} catch {
+			/* nothing to clear */
+		}
+	},
+};
+
+/** Notified when the server rejects our token, so the app can show the login. */
+type UnauthorizedHandler = () => void;
+let onUnauthorized: UnauthorizedHandler = () => {};
+export function setUnauthorizedHandler(handler: UnauthorizedHandler): void {
+	onUnauthorized = handler;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+	const token = session.token();
 	const response = await fetch(path, {
 		...init,
 		headers: {
 			"content-type": "application/json",
+			...(token ? { authorization: `Bearer ${token}` } : {}),
 			...(init?.headers ?? {}),
 		},
 	});
 	if (!response.ok) {
 		let message = `${response.status} ${response.statusText}`;
+		let requestId: string | undefined;
 		try {
 			const body = (await response.json()) as ApiErrorShape & { detail?: string };
 			message = body.error ?? body.detail ?? message;
+			requestId = body.requestId;
 		} catch {
 			/* keep the status line */
 		}
-		throw new ApiError(message, response.status);
+		// 401 means this token is finished - expired, revoked, or the user was
+		// deactivated. Drop it and let the app re-authenticate, rather than
+		// leaving every subsequent call to fail the same way.
+		if (response.status === 401) {
+			session.clear();
+			onUnauthorized();
+		}
+		throw new ApiError(message, response.status, requestId);
 	}
 	if (response.status === 204) return undefined as T;
 	const text = await response.text();
@@ -55,6 +137,25 @@ export const api = {
 	post: <T>(path: string, body?: unknown) =>
 		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}) }),
 	del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
+
+	async login(username: string, password: string): Promise<SessionUser> {
+		const result = await request<{
+			token: string;
+			expiresAt: string;
+			user: SessionUser;
+		}>("/api/auth/login", {
+			method: "POST",
+			body: JSON.stringify({ username, password }),
+		});
+		session.set(result.token, result.user, result.expiresAt);
+		return result.user;
+	},
+
+	logout(): void {
+		// The token is stateless, so signing out is a local act. Revoking one
+		// before it expires is an admin operation: pipeline.users revoke.
+		session.clear();
+	},
 };
 
 // ── types mirrored from the services ───────────────────────────────────────

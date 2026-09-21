@@ -1,3 +1,4 @@
+import { assertSimulationAllowed } from "./dataPolicy";
 import { query } from "./db";
 import { BadRequest, getRegistry, type KpiMeta, NotFound, quoteIdentifier, quoteQualified } from "./registry";
 
@@ -38,6 +39,21 @@ async function metricViewColumns(view: string): Promise<Map<string, ColumnMeta>>
 	const map = new Map(rows.map((r) => [r.column_name, { name: r.column_name, sqlType: r.data_type }]));
 	columnCache.set(view, map);
 	return map;
+}
+
+/**
+ * Clamp a caller-supplied row limit into [1, ceiling].
+ *
+ * Interpolated into the SQL text rather than bound, because Postgres will not
+ * take a parameter for LIMIT in every position these builders emit. The
+ * explicit Number() and finite check are therefore part of the safety story:
+ * a non-numeric limit becomes the default rather than reaching the query as
+ * NaN.
+ */
+function clampLimit(supplied: unknown, fallback: number, ceiling: number): number {
+	const requested = supplied === undefined || supplied === null ? fallback : Number(supplied);
+	if (!Number.isFinite(requested)) return fallback;
+	return Math.min(Math.max(1, Math.floor(requested)), ceiling);
 }
 
 export function clearColumnCache(): void {
@@ -185,6 +201,10 @@ export async function executeKpi(
 	request: KpiExecuteRequest = {},
 ): Promise<KpiExecuteResult> {
 	const kpi = resolveKpi(apiName);
+	// Every KPI read reaches this function - the API, a dashboard widget and
+	// the assistant's execute_kpi tool all come through here - so this is the
+	// one place the policy has to hold.
+	assertSimulationAllowed(`KPI ${kpi.apiName}`, kpi.dependsOnSimulation);
 	const columns = await metricViewColumns(kpi.sourceView);
 	const expression = valueExpression(kpi, columns);
 	const { sql: whereSql, values, applied } = buildFilters(kpi, columns, request.filters ?? {});
@@ -222,7 +242,7 @@ export async function executeKpi(
 
 	if (dimension) {
 		const dimensionColumn = quoteIdentifier(dimension);
-		const limit = Math.min(Math.max(1, request.limit ?? 25), 500);
+		const limit = clampLimit(request.limit, 25, 500);
 		const sort = request.sort ?? "value_desc";
 		const orderSql =
 			sort === "value_asc"
@@ -304,7 +324,12 @@ export async function dimensionValues(
 		  WHERE ${column} IS NOT NULL
 		  GROUP BY ${column}
 		  ORDER BY count(*) DESC, ${column}
-		  LIMIT ${Math.min(Math.max(1, limit), 1000)}`,
+		  LIMIT ${clampLimit(limit, 100, 1000)}`,
 	);
 	return rows.map((r) => ({ value: r.value, count: Number(r.n) }));
 }
+
+/**
+ * Internals exposed for tests only. Nothing in src/ imports this.
+ */
+export const __testing = { clampLimit, valueExpression, buildFilters };

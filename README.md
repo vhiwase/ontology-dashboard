@@ -76,11 +76,20 @@ KPIs then honestly read as no data.
 
 ```bash
 cp .env.example .env
+./scripts/init-secrets.sh                      # generates ./secrets/*, once
+
+# Set a bootstrap admin password of at least 12 characters, or the stack comes
+# up with no users and every API route answers 401.
+echo "BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 18)" >> .env
+
 docker compose up -d --build
-docker compose logs -f pipeline      # watch ingest -> ontology -> lineage
+docker compose logs -f pipeline      # migrations -> ingest -> ontology -> users
 ```
 
-Then open **http://127.0.0.1:3000**.
+Then open **https://127.0.0.1:3000** and sign in as `admin` with that password.
+
+The certificate is self-signed on first run, so the browser will warn once.
+Mount a real one over `/etc/nginx/certs` for anything public.
 
 ### The path that picks the right LLM for your hardware
 
@@ -94,15 +103,23 @@ brings the stack up with the GPU overlay if there is a GPU. See
 
 ### Ports
 
-All bound to `127.0.0.1` only.
+All bound to `127.0.0.1` only. That binding is a development control, not a
+security boundary: it disappears the moment this runs on a host that publishes
+the port, which is why the services authenticate rather than relying on it.
 
 | Service | URL | Notes |
 |---|---|---|
-| UI | http://127.0.0.1:3000 | nginx, also proxies both APIs |
-| Ontology service | http://127.0.0.1:4000/api/stats | |
-| AI-FDE | http://127.0.0.1:4100/health | reports which model is live |
-| Postgres | `127.0.0.1:55432` | user/password/db all `ontology` |
+| UI | https://127.0.0.1:3000 | nginx, terminates TLS and proxies both APIs |
+| UI (plain HTTP) | http://127.0.0.1:3080 | redirect and `/health` only |
+| Ontology service | http://127.0.0.1:4000/api/stats | needs a bearer token |
+| AI-FDE | http://127.0.0.1:4100/health | liveness only; detail needs a token |
+| Postgres | `127.0.0.1:55432` | password in `secrets/postgres_password` |
 | Ollama | `127.0.0.1:11435` | moved off 11434; see below |
+
+> The HTTPS redirect on port 3080 targets the standard 443, which is right
+> wherever the stack is published on 443 and wrong locally, where compose maps
+> container 443 to host 3000 and nginx cannot learn that external port. In
+> development, go to `https://127.0.0.1:3000` directly.
 
 > **Use `127.0.0.1`, not `localhost`, from the host.** On Windows `localhost`
 > resolves to `::1` first, and Docker Desktop's IPv6 proxy accepts the connection
@@ -350,11 +367,32 @@ place.
 
 ### Schema changes
 
-`db/init/*.sql` runs **only when the Postgres data directory is empty**. To pick
-up a schema change:
+`db/init/*.sql` runs **only when the Postgres data directory is empty**, so it
+is the bootstrap for a fresh database and nothing else. Anything that has to
+change a database which already holds data goes in `db/migrations/` as
+`NNNN_name.sql`, and is applied by `pipeline.migrate` on every pipeline run:
 
 ```bash
-docker compose down -v && docker compose up -d
+# Apply anything pending (the pipeline does this automatically at startup)
+docker compose run --rm pipeline python -m pipeline.migrate
+
+# Show applied and pending without changing anything
+docker compose run --rm pipeline python -m pipeline.migrate --status
+```
+
+Each migration runs in its own transaction and is recorded in
+`platform.schema_migration` with a checksum, so editing one after it has been
+applied is reported rather than silently skipped. Migrations are immutable once
+applied: add a new one instead.
+
+`docker compose down -v` still rebuilds from `db/init` — but it **destroys the
+volume**, including every AI-built dashboard and chat conversation. Take a
+backup first:
+
+```bash
+./scripts/backup.sh dump              # everything
+./scripts/backup.sh dump --user-only  # just the work people did
+./scripts/backup.sh restore backups/user-<timestamp>.sql.gz
 ```
 
 `07_verify.sql` runs last and fails loudly if any expected object is missing. This
@@ -376,6 +414,222 @@ tells you to run `down -v`.
 | Anything from the host takes ~130 s | `localhost` resolving to `::1`. Use `127.0.0.1`. |
 
 ---
+
+## Pipeline builder
+
+`/pipeline` is a canvas where a pipeline is drawn — sources, transforms, the
+object types they produce, the links and actions on those, and the dashboards
+at the end.
+
+It is not a drawing tool that resembles a data platform. Every node is
+validated against the **published ontology**: an Object Type node naming a type
+the registry does not have is an error, and a Link node whose cardinality
+contradicts the one the pipeline discovered in the data is an error too. The
+palette is the real ontology — 20 object types, 41 links, 12 actions, 31 KPIs —
+so a node is configured by choosing something that exists rather than by typing
+a name.
+
+| Node group | Kinds |
+|---|---|
+| Data | Data Source, Dataset |
+| Transform | Filter, Join, Aggregate, SQL, Python |
+| Ontology | Object Type, Link Type, Action Type |
+| AI | LLM |
+| Output | Output, Dashboard, Validation |
+
+Which groups may feed which kinds is part of the model, so an illegal
+connection is refused with a reason rather than drawn.
+
+**Validation** runs server-side as the graph is edited. Errors block a run;
+warnings do not — "this object type does not exist" makes the pipeline
+meaningless, "this node has no description" only makes it rude. Every issue
+carries the node it belongs to, so clicking one in the bottom panel focuses
+that card.
+
+**Runs** exercise the graph's shape and dependency order. They do **not** move
+data: this platform reads a captured snapshot and has no execution engine, so
+every run is stored with `is_simulated = true` and the panel says so. Row
+counts are honest about what is known — an Object Type node reports the real
+count from the registry, a source with no configured row count reports
+*unknown* rather than zero, and unknown propagates downstream instead of
+silently becoming zero.
+
+**Versions** are kept on every save (`platform.pipeline_version`), and
+restoring an old one creates a new version rather than rewriting history.
+
+Keyboard: `N` add node · `Ctrl/Cmd+S` save · `Ctrl/Cmd+Z` undo ·
+`Ctrl/Cmd+Shift+Z` redo · `Delete` remove the selected node · `F` fit.
+
+```bash
+# The palette the builder offers, straight from the published ontology
+curl -H "authorization: Bearer $TOKEN" .../api/pipelines/palette
+
+# Validate a graph without saving it
+curl -X POST -H "authorization: Bearer $TOKEN" -d '{"graph":{…}}' .../api/pipelines/validate
+```
+
+Editing a pipeline needs the `analyst` role; deleting one needs `admin`.
+Reading, validating and the palette are `viewer`.
+
+## Choosing the model per conversation
+
+The assistant's composer has a model picker. **Ollama is the default** where it
+is usable; the option falls back to whatever is actually available, because a
+default that cannot answer is not a default.
+
+An explicit choice is honoured exactly, with **no failover**: someone who
+picked the local model should be told it is unreachable rather than have the
+hosted one answer — and be billed for it — without saying so. `Automatic`
+keeps the server's configured chain and its failover.
+
+The picker reports live availability, and flags Ollama as **slow (CPU)** when
+no GPU offload is detected. That is not cosmetic: a 7B model with this
+fifteen-tool schema needs minutes per round on CPU, and on hardware without a
+GPU it will usually exhaust `OLLAMA_TIMEOUT` (default 300s) before answering.
+With a GPU it is the better choice; without one, Azure answers in seconds.
+
+## Dashboard history and backup
+
+`/dashboards/history` shows every dashboard with where it came from: the
+conversation that built it, the prompt it was built from, and every rename it
+has been through.
+
+- **Search** matches the name, description, prompt, creator and *previous*
+  names — people look for a board by what they asked for, or by what it used to
+  be called.
+- **Rename** gives a generated board a name of your own. The slug follows the
+  title (so the URL stays readable), the old name and slug are recorded, and a
+  clash with an existing name is refused rather than silently resolved.
+- **Back up to file** downloads every dashboard as JSON to your machine, which
+  is the copy that survives `docker compose down -v`. **Restore** reads one back.
+
+A restore validates each dashboard against the **current** ontology before
+writing it: a backup taken before the KPI catalogue changed can name metrics
+that no longer exist, and importing those would put a permanently broken widget
+on someone's screen. Such a dashboard is skipped with its reason and the rest
+still land.
+
+A dashboard outlives the chat that made it — retention purges conversations and
+the foreign key is `ON DELETE SET NULL` — so the history says *purged* rather
+than implying the board never had a conversation.
+
+## Security and operations
+
+### Authentication
+
+Every API route requires a bearer token except `/health`, which the compose
+healthcheck probes and which carries no detail. The ontology service is the
+only thing that issues a token; the assistant verifies the same token with the
+shared `AUTH_JWT_SECRET`, so one sign-in works across both APIs.
+
+Two role concepts, deliberately separate:
+
+| | What it decides | Values |
+|---|---|---|
+| `role` | which API routes are reachable | `viewer`, `analyst`, `admin` |
+| `ontology_role` | which **actions** may be executed | the roles declared in the ontology |
+
+A dispatcher and a finance user are both `analyst` on the platform but may run
+different actions, which one column could not express.
+
+| Route | Needs |
+|---|---|
+| reads: object types, objects, KPIs, lineage, dashboards | `viewer` |
+| dashboard create / validate, action validate / apply | `analyst` |
+| audit trail, registry reload, dashboard delete | `admin` |
+
+Anything under `/api` added later is authenticated by default and needs at
+least `viewer`: the guard is mounted once, ahead of the routes, so forgetting
+about a new route makes it *demand a login* rather than leaving it anonymous.
+
+```bash
+docker compose run --rm pipeline python -m pipeline.users list
+docker compose run --rm pipeline python -m pipeline.users add jo analyst '<password>'     --ontology-role tms:DispatcherRole
+docker compose run --rm pipeline python -m pipeline.users passwd jo '<password>'
+docker compose run --rm pipeline python -m pipeline.users revoke jo   # kills issued tokens
+```
+
+Passwords are scrypt, in a format both Python and Node derive from their
+standard library, so neither service carries a hashing dependency.
+
+The assistant calls the ontology service **as the signed-in user**, forwarding
+their token, so its queries are bound by their permissions and the audit trail
+names a person rather than the assistant.
+
+### Secrets
+
+`./scripts/init-secrets.sh` writes `./secrets/*`, which compose mounts at
+`/run/secrets` and each service reads through a `*_FILE` variable. They are not
+plain `environment:` values, which `docker inspect` prints to anyone who can
+run it. `./secrets` is gitignored.
+
+| File | Used by |
+|---|---|
+| `jwt_secret` | both APIs, to sign and verify tokens |
+| `postgres_password` | Postgres |
+| `database_url` | all three services |
+| `azure_openai_key` | the assistant |
+
+### Cost controls
+
+`/api/assistant/chat` reaches a paid model for up to `AI_FDE_MAX_TOOL_ROUNDS`
+rounds, so two limits apply per user: a request rate
+(`CHAT_RATE_PER_MINUTE`, `CHAT_RATE_BURST`) and a rolling 24-hour token budget
+(`CHAT_DAILY_TOKEN_BUDGET`). Both are **per process** — running more than one
+`ai-fde` replica multiplies them, and the service logs that warning at startup.
+
+### Simulated data
+
+The pipeline synthesises execution data into `tms_sim`, which is what makes the
+service and cost KPIs answerable from a snapshot with no execution history. 17
+of the 31 KPIs depend on it.
+
+Set `ALLOW_SIMULATED_DATA=false` in production. Those KPIs, the dashboard
+widgets built on them and the three simulation-backed actions then return
+**409** with an explanation instead of a number, so an invented figure cannot
+be quoted as a measured one. `/api/stats` reports which mode is active.
+
+### Retention
+
+`CHAT_RETENTION_DAYS` purges conversations idle longer than the window on each
+pipeline run; `0` disables it. Set a real window if answers can quote customer
+data. A session can be exempted with `platform.chat_session.is_retained`, and
+each purge is recorded in `platform.retention_run`.
+
+### Logs
+
+Both services emit one JSON line per request carrying a `requestId`, and the
+assistant forwards that id to the ontology service, so a single chat turn and
+every query it caused share one value:
+
+```bash
+docker compose logs ai-fde ontology-service | grep '<request-id>'
+```
+
+A 5xx returns only `{"error": "Internal server error.", "requestId": "..."}`;
+the message, type and stack stay in the log under that id.
+
+### Tests
+
+```bash
+cd services/ontology-service && npm test          # 47 tests
+cd services/ai-fde          && pytest tests/ -q   # 19 tests
+cd services/pipeline        && pytest tests/ -q   # 19 tests
+```
+
+The TypeScript tests cover the dynamic SQL builders in `objectSet.ts` and
+`kpi.ts` — identifiers allowlisted, every value bound, limits clamped and
+coerced. `.github/workflows/ci.yml` runs all of it plus a typecheck, an
+`nginx -t` and a full image build.
+
+### Known limits
+
+- Rate limiting, the token budget and the ontology registry are all in-process,
+  so horizontal scaling needs a shared store and a cache-invalidation story.
+- The pipeline reads a relative host path (`../api_responses`) and runs once.
+  There is no schedule, no incremental ingest and no late-data handling;
+  production needs the real TMS API or object storage behind it.
+- No metrics or tracing, only structured logs.
 
 ## Layout
 

@@ -46,6 +46,8 @@ export interface DashboardRecord {
 	createdAt: string;
 	updatedAt: string;
 	isPinned: boolean;
+	/** The conversation that produced it, for an AI-built dashboard. */
+	chatSessionId: number | null;
 }
 
 interface DashboardRow {
@@ -62,6 +64,7 @@ interface DashboardRow {
 	created_at: Date;
 	updated_at: Date;
 	is_pinned: boolean;
+	chat_session_id: number | null;
 }
 
 function toRecord(row: DashboardRow): DashboardRecord {
@@ -79,6 +82,7 @@ function toRecord(row: DashboardRow): DashboardRecord {
 		createdAt: row.created_at.toISOString(),
 		updatedAt: row.updated_at.toISOString(),
 		isPinned: row.is_pinned,
+		chatSessionId: row.chat_session_id ?? null,
 	};
 }
 
@@ -170,14 +174,30 @@ export interface SaveDashboardRequest {
 	sourcePrompt?: string | null;
 	createdBy?: string;
 	isPinned?: boolean;
+	chatSessionId?: number | null;
 }
 
 export function slugify(title: string): string {
 	const slug = title
+		// Decompose accented characters into base letter + combining mark, then
+		// drop the marks, so "Kraków" becomes "krakow" rather than "krak-w".
+		// Without this, every non-ASCII letter became a separator and a title in
+		// French, Polish or German slugged into something unreadable - which
+		// matters now that the slug is the URL of a user-named dashboard.
+		.normalize("NFD")
+		.replace(/\p{Diacritic}/gu, "")
+		// A few letters have no decomposition and need naming outright.
+		.replace(/ß/gi, "ss")
+		.replace(/[øØ]/g, "o")
+		.replace(/[æÆ]/g, "ae")
+		.replace(/[đĐ]/g, "d")
+		.replace(/[łŁ]/g, "l")
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-+|-+$/g, "")
-		.slice(0, 60);
+		.slice(0, 60)
+		// The slice can leave a trailing separator behind.
+		.replace(/-+$/g, "");
 	return slug || `dashboard-${Date.now()}`;
 }
 
@@ -332,8 +352,8 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 	const row = await queryOne<DashboardRow>(
 		`INSERT INTO platform.dashboard
 		   (slug, title, description, layout, filters, audience, is_ai_generated,
-		    source_prompt, created_by, is_pinned, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
+		    source_prompt, created_by, is_pinned, chat_session_id, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
 		 ON CONFLICT (slug) DO UPDATE SET
 		   title = EXCLUDED.title,
 		   description = EXCLUDED.description,
@@ -343,6 +363,9 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 		   is_ai_generated = EXCLUDED.is_ai_generated,
 		   source_prompt = EXCLUDED.source_prompt,
 		   is_pinned = EXCLUDED.is_pinned,
+		   -- COALESCE, so re-saving a dashboard from the UI does not wipe the
+		   -- conversation it originally came from.
+		   chat_session_id = COALESCE(EXCLUDED.chat_session_id, platform.dashboard.chat_session_id),
 		   updated_at = now()
 		 RETURNING *`,
 		[
@@ -356,6 +379,7 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 			request.sourcePrompt ?? null,
 			request.createdBy ?? "user",
 			request.isPinned ?? false,
+			request.chatSessionId ?? null,
 		],
 	);
 	if (!row) throw new Error("Dashboard save returned no row.");
@@ -377,6 +401,258 @@ export async function deleteDashboard(slug: string): Promise<void> {
  * prose that would cost a lot of context for no gain when the model is only
  * choosing which metric to chart.
  */
+// ── history, rename and backup ─────────────────────────────────────────────
+
+export interface DashboardHistoryEntry extends DashboardRecord {
+	/** The conversation that produced it, when there was one and it still exists. */
+	session: {
+		id: number;
+		title: string | null;
+		userId: string;
+		messageCount: number;
+		createdAt: string;
+		/** False once the retention purge has removed the conversation. */
+		available: boolean;
+	} | null;
+	renames: Array<{
+		previousTitle: string;
+		newTitle: string;
+		renamedBy: string;
+		renamedAt: string;
+	}>;
+}
+
+/**
+ * Every dashboard with its provenance: the conversation that built it and the
+ * renames it has been through.
+ *
+ * A dashboard outlives the chat that produced it - retention purges
+ * conversations and the foreign key is ON DELETE SET NULL - so `session` is
+ * null for a dashboard whose conversation has aged out, and the view reports
+ * that rather than implying it never had one.
+ */
+export async function dashboardHistory(): Promise<DashboardHistoryEntry[]> {
+	const rows = await query<
+		DashboardRow & {
+			session_title: string | null;
+			session_user: string | null;
+			session_messages: number | null;
+			session_created: Date | null;
+		}
+	>(
+		`SELECT d.*,
+		        s.title          AS session_title,
+		        s.user_id        AS session_user,
+		        s.message_count  AS session_messages,
+		        s.created_at     AS session_created
+		   FROM platform.dashboard d
+		   LEFT JOIN platform.chat_session s
+		          ON s.chat_session_id = d.chat_session_id
+		  ORDER BY d.updated_at DESC`,
+	);
+
+	const renames = await query<{
+		dashboard_id: number;
+		previous_title: string;
+		new_title: string;
+		renamed_by: string;
+		renamed_at: Date;
+	}>(
+		`SELECT dashboard_id, previous_title, new_title, renamed_by, renamed_at
+		   FROM platform.dashboard_rename ORDER BY renamed_at DESC`,
+	);
+
+	const renamesById = new Map<number, DashboardHistoryEntry["renames"]>();
+	for (const row of renames) {
+		const list = renamesById.get(row.dashboard_id) ?? [];
+		list.push({
+			previousTitle: row.previous_title,
+			newTitle: row.new_title,
+			renamedBy: row.renamed_by,
+			renamedAt: row.renamed_at.toISOString(),
+		});
+		renamesById.set(row.dashboard_id, list);
+	}
+
+	return rows.map((row) => ({
+		...toRecord(row),
+		session:
+			row.chat_session_id === null
+				? null
+				: {
+						id: row.chat_session_id,
+						title: row.session_title,
+						userId: row.session_user ?? "unknown",
+						messageCount: row.session_messages ?? 0,
+						createdAt: row.session_created?.toISOString() ?? "",
+						// The join missed, so the conversation has been purged.
+						available: row.session_user !== null,
+					},
+		renames: renamesById.get(row.dashboard_id) ?? [],
+	}));
+}
+
+/**
+ * Give a dashboard a new name.
+ *
+ * The slug is regenerated from the new title, because a dashboard called
+ * "Q3 Margin" living at /dashboards/untitled-4 is a worse outcome than a
+ * changed URL. The old name and slug are recorded, so a stale link can still
+ * be explained.
+ */
+export async function renameDashboard(
+	slug: string,
+	newTitle: string,
+	renamedBy: string,
+): Promise<DashboardRecord> {
+	const title = String(newTitle ?? "").trim();
+	if (!title) throw new BadRequest("A dashboard needs a title.");
+	if (title.length > 120) throw new BadRequest("Title must be 120 characters or fewer.");
+
+	const existing = await queryOne<DashboardRow>(
+		"SELECT * FROM platform.dashboard WHERE slug = $1",
+		[slug],
+	);
+	if (!existing) throw new NotFound(`No dashboard '${slug}'.`);
+
+	const newSlug = slugify(title);
+	if (newSlug !== existing.slug) {
+		const clash = await queryOne<{ slug: string }>(
+			"SELECT slug FROM platform.dashboard WHERE slug = $1",
+			[newSlug],
+		);
+		if (clash) {
+			throw new BadRequest(
+				`Another dashboard already uses the name '${title}'. Pick a different one.`,
+			);
+		}
+	}
+
+	const updated = await queryOne<DashboardRow>(
+		`UPDATE platform.dashboard
+		    SET title = $1, slug = $2, updated_at = now()
+		  WHERE dashboard_id = $3
+		RETURNING *`,
+		[title, newSlug, existing.dashboard_id],
+	);
+	if (!updated) throw new NotFound(`No dashboard '${slug}'.`);
+
+	// Only recorded when something actually changed, so re-saving the same
+	// title does not fill the history with no-ops.
+	if (existing.title !== title || existing.slug !== newSlug) {
+		await query(
+			`INSERT INTO platform.dashboard_rename
+			   (dashboard_id, previous_title, new_title, previous_slug, new_slug, renamed_by)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			[existing.dashboard_id, existing.title, title, existing.slug, newSlug, renamedBy],
+		);
+	}
+
+	return toRecord(updated);
+}
+
+/** The shape written by an export and accepted by an import. */
+export interface DashboardBackup {
+	kind: "tms-ontology-dashboards";
+	version: 1;
+	exportedAt: string;
+	exportedBy: string;
+	dashboards: DashboardRecord[];
+}
+
+export async function exportDashboards(
+	exportedBy: string,
+	slugs?: string[],
+): Promise<DashboardBackup> {
+	const all = await listDashboards();
+	const selected =
+		slugs && slugs.length > 0 ? all.filter((d) => slugs.includes(d.slug)) : all;
+	return {
+		kind: "tms-ontology-dashboards",
+		version: 1,
+		exportedAt: new Date().toISOString(),
+		exportedBy,
+		dashboards: selected,
+	};
+}
+
+export interface ImportOutcome {
+	imported: string[];
+	skipped: Array<{ slug: string; reason: string }>;
+}
+
+/**
+ * Restore dashboards from an export.
+ *
+ * Each one is validated against the CURRENT ontology before being written: a
+ * backup taken before the KPI catalogue changed can name metrics that no
+ * longer exist, and importing those would put a permanently broken widget on
+ * someone's screen. Such a dashboard is skipped with its reason, and the rest
+ * still land.
+ *
+ * `overwrite` decides what happens to a slug that is already present.
+ */
+export async function importDashboards(
+	backup: unknown,
+	importedBy: string,
+	overwrite: boolean,
+): Promise<ImportOutcome> {
+	const parsed = backup as Partial<DashboardBackup>;
+	if (!parsed || parsed.kind !== "tms-ontology-dashboards") {
+		throw new BadRequest(
+			"That is not a dashboard export. Expected a file whose kind is 'tms-ontology-dashboards'.",
+		);
+	}
+	if (!Array.isArray(parsed.dashboards)) {
+		throw new BadRequest("The export contains no dashboards array.");
+	}
+
+	const existing = new Set((await listDashboards()).map((d) => d.slug));
+	const outcome: ImportOutcome = { imported: [], skipped: [] };
+
+	for (const candidate of parsed.dashboards) {
+		const slug = String(candidate?.slug ?? "").trim();
+		const title = String(candidate?.title ?? "").trim();
+		if (!slug || !title) {
+			outcome.skipped.push({ slug: slug || "(unnamed)", reason: "Missing slug or title." });
+			continue;
+		}
+		if (existing.has(slug) && !overwrite) {
+			outcome.skipped.push({
+				slug,
+				reason: "Already exists. Re-import with overwrite to replace.",
+			});
+			continue;
+		}
+
+		const validation = validateLayout(candidate.layout ?? []);
+		if (!validation.valid) {
+			outcome.skipped.push({
+				slug,
+				reason: `Does not fit the current ontology: ${validation.errors[0]}`,
+			});
+			continue;
+		}
+
+		await saveDashboard({
+			slug,
+			title,
+			description: candidate.description ?? null,
+			layout: validation.widgets,
+			filters: candidate.filters ?? {},
+			audience: candidate.audience ?? null,
+			isAiGenerated: candidate.isAiGenerated ?? false,
+			sourcePrompt: candidate.sourcePrompt ?? null,
+			createdBy: candidate.createdBy ?? importedBy,
+			isPinned: candidate.isPinned ?? false,
+			chatSessionId: null,
+		});
+		outcome.imported.push(slug);
+	}
+
+	return outcome;
+}
+
 export function kpiCatalogueForPrompt(): Array<Record<string, unknown>> {
 	return getRegistry().kpis.map((kpi) => ({
 		apiName: kpi.apiName,

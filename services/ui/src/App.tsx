@@ -1,13 +1,22 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { type AssistantHealth, api } from "./api";
+import {
+	type AssistantHealth,
+	type SessionUser,
+	api,
+	session,
+	setUnauthorizedHandler,
+} from "./api";
 import { useDebounced } from "./components/common";
 import { Actions } from "./pages/Actions";
+import { Login } from "./pages/Login";
 import { Assistant } from "./pages/Assistant";
+import { DashboardHistory } from "./pages/DashboardHistory";
 import { DashboardDetail, DashboardList } from "./pages/Dashboards";
 import { GraphView } from "./pages/GraphView";
 import { LineagePage } from "./pages/LineagePage";
 import { ObjectExplorer } from "./pages/ObjectExplorer";
+import { PipelineBuilder } from "./pages/PipelineBuilder";
 import { OntologyManager } from "./pages/OntologyManager";
 import { Overview } from "./pages/Overview";
 
@@ -25,6 +34,7 @@ const NAV = [
 	{ to: "/ontology", label: "Object types", glyph: "◇" },
 	{ to: "/graph", label: "Graph", glyph: "◉" },
 	{ to: "/lineage", label: "Lineage", glyph: "⑃" },
+	{ to: "/pipeline", label: "Pipeline builder", glyph: "⑄" },
 	{ section: "Work" },
 	{ to: "/explorer", label: "Object explorer", glyph: "▤" },
 	{ to: "/dashboards", label: "Dashboards", glyph: "▦" },
@@ -38,14 +48,19 @@ const TITLES: Record<string, string> = {
 	"/ontology": "Object types",
 	"/graph": "Ontology graph",
 	"/lineage": "Data lineage",
+	"/pipeline": "Pipeline builder",
 	"/explorer": "Object explorer",
 	"/dashboards": "Dashboards",
+	"/dashboards/history": "Dashboard history",
 	"/actions": "Actions",
 	"/assistant": "AI-FDE assistant",
 };
 
 export function App() {
 	const location = useLocation();
+	const [user, setUser] = useState<SessionUser | null>(() =>
+		session.token() ? session.user() : null,
+	);
 	const [health, setHealth] = useState<HealthPayload | null>(null);
 	const [assistantHealth, setAssistantHealth] = useState<AssistantHealth | null>(null);
 	const [theme, setTheme] = useState<"dark" | "light">(
@@ -61,13 +76,30 @@ export function App() {
 		}
 	}, [theme]);
 
+	// One handler for "the server refused our token", wherever the call came
+	// from. Without it a revoked session would leave the shell mounted and
+	// every panel failing on its own.
 	useEffect(() => {
+		setUnauthorizedHandler(() => setUser(null));
+	}, []);
+
+	const signOut = useCallback(() => {
+		api.logout();
+		setUser(null);
+		setHealth(null);
+		setAssistantHealth(null);
+	}, []);
+
+	useEffect(() => {
+		if (!user) return;
 		api.get<HealthPayload>("/health").then(setHealth).catch(() => setHealth(null));
 		api
 			.get<AssistantHealth>("/api/assistant/health")
 			.then(setAssistantHealth)
 			.catch(() => setAssistantHealth(null));
-	}, []);
+	}, [user]);
+
+	if (!user) return <Login onSignedIn={setUser} />;
 
 	const title =
 		TITLES[location.pathname] ??
@@ -100,8 +132,15 @@ export function App() {
 									{entry.glyph}
 								</span>
 								<span>{entry.label}</span>
-								{entry.to === "/dashboards" && health && <span className="count">{health.kpis}</span>}
-								{entry.to === "/graph" && health && <span className="count">{health.linkTypes}</span>}
+								{/* Each badge counts the thing its own link leads to. The
+								    dashboards badge used to show health.kpis, so it read as
+								    "31 dashboards" when 31 was the number of metrics. */}
+								{entry.to === "/ontology" && health && (
+									<span className="count" title="Object types">{health.objectTypes}</span>
+								)}
+								{entry.to === "/graph" && health && (
+									<span className="count" title="Link types">{health.linkTypes}</span>
+								)}
 							</NavLink>
 						),
 					)}
@@ -139,6 +178,14 @@ export function App() {
 					>
 						{theme === "dark" ? "Light theme" : "Dark theme"}
 					</button>
+					<div className="rail-user">
+						<span className="mono" title={`Ontology role: ${user.ontologyRole}`}>
+							{user.username} · {user.role}
+						</span>
+						<button className="btn sm" onClick={signOut}>
+							Sign out
+						</button>
+					</div>
 				</div>
 			</nav>
 
@@ -149,15 +196,28 @@ export function App() {
 					<GlobalSearch />
 				</header>
 
-				<div className="content">
-					<div className="content-wide" style={{ height: location.pathname === "/assistant" ? "100%" : undefined }}>
+				{/* The builder is a full-bleed canvas: it needs the padding and the
+				    max-width off, and its own scrolling rather than the page's. */}
+				<div className={`content${location.pathname === "/pipeline" ? " content-flush" : ""}`}>
+					<div
+						className="content-wide"
+						style={{
+							height:
+								location.pathname === "/assistant" || location.pathname === "/pipeline"
+									? "100%"
+									: undefined,
+						}}
+					>
 						<Routes>
 							<Route path="/" element={<Overview />} />
 							<Route path="/ontology" element={<OntologyManager />} />
 							<Route path="/graph" element={<GraphView />} />
 							<Route path="/lineage" element={<LineagePage />} />
+							<Route path="/pipeline" element={<PipelineBuilder />} />
 							<Route path="/explorer" element={<ObjectExplorer />} />
 							<Route path="/dashboards" element={<DashboardList />} />
+							{/* Before /dashboards/:slug, or "history" is read as a slug. */}
+							<Route path="/dashboards/history" element={<DashboardHistory />} />
 							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
 							<Route path="/actions" element={<Actions />} />
 							<Route path="/assistant" element={<Assistant />} />

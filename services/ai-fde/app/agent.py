@@ -118,6 +118,34 @@ def _looks_temporal(dimension: str | None) -> bool:
     return any(token in dimension for token in ("date", "week", "month", "day"))
 
 
+def _accumulate_usage(
+    total: dict[str, Any], latest: dict[str, Any]
+) -> dict[str, Any]:
+    """Sum token counts across rounds, keeping non-numeric fields from the last.
+
+    The two providers do not report the same keys: Azure sends totalTokens,
+    Ollama sends prompt and completion counts plus a duration. totalTokens is
+    therefore derived when it is missing, so a budget charged on it measures
+    the same thing whichever provider answered.
+    """
+    merged = dict(total)
+    for key, value in latest.items():
+        if isinstance(value, (int, float)):
+            merged[key] = (merged.get(key) or 0) + value
+        else:
+            merged[key] = value
+
+    # Recomputed from the running prompt/completion totals every round rather
+    # than derived once. Ollama omits totalTokens, so round one derives it and
+    # later rounds have nothing to add to it - which silently froze the total
+    # at the first round's value.
+    prompt = merged.get("promptTokens") or 0
+    completion = merged.get("completionTokens") or 0
+    if prompt or completion:
+        merged["totalTokens"] = prompt + completion
+    return merged
+
+
 class Agent:
     def __init__(self, provider: LlmProvider) -> None:
         self.provider = provider
@@ -143,6 +171,10 @@ class Agent:
         schemas = tool_schemas()
         invocations: list[ToolInvocation] = []
         artifacts: list[dict[str, Any]] = []
+        # Accumulated across every round, not replaced by the last one. A turn
+        # can spend AI_FDE_MAX_TOOL_ROUNDS model calls, and reporting only the
+        # final round's counts understated the cost of exactly the turns that
+        # cost the most - which is also what the chat token budget charges on.
         usage: dict[str, Any] = {}
         # Keyed on name + arguments, so a genuine second call with different
         # arguments still runs.
@@ -182,7 +214,7 @@ class Agent:
                 )
 
             if reply.usage:
-                usage = reply.usage
+                usage = _accumulate_usage(usage, reply.usage)
             provider_used = reply.provider or provider_used
             model_used = reply.model or model_used
             failover_reason = reply.failover_reason or failover_reason

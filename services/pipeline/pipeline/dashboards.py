@@ -218,22 +218,46 @@ DASHBOARDS: list[dict[str, Any]] = [
 def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
     """Insert the starter dashboards.
 
-    A user's own edits are never overwritten: an existing slug is skipped unless
-    overwrite is set. Only AI-generated and seeded dashboards are replaceable.
+    A user's own edits are never overwritten: an already-seeded dashboard is
+    skipped unless overwrite is set.
+
+    Identity is seed_key, not slug. Dashboards can be renamed, and a rename
+    rewrites the slug - so matching on slug meant a renamed starter dashboard
+    looked absent, got seeded again, and the user was left with two of them.
+    seed_key never changes, so the renamed one is recognised and left alone.
     """
     existing = {
-        row["slug"]: row["is_ai_generated"]
-        for row in conn.execute("SELECT slug, is_ai_generated FROM platform.dashboard").fetchall()
+        row["seed_key"]
+        for row in conn.execute(
+            "SELECT seed_key FROM platform.dashboard WHERE seed_key IS NOT NULL"
+        ).fetchall()
+    }
+
+    # A slug already taken by something that is NOT this seeded dashboard - a
+    # user's own dashboard, say - would collide on insert.
+    taken = {
+        row["slug"]: row["seed_key"]
+        for row in conn.execute("SELECT slug, seed_key FROM platform.dashboard").fetchall()
     }
 
     rows = []
     skipped = 0
     for dashboard in DASHBOARDS:
-        if dashboard["slug"] in existing and not overwrite:
+        seed_key = dashboard["slug"]
+        if seed_key in existing and not overwrite:
+            skipped += 1
+            continue
+        if taken.get(dashboard["slug"]) not in (None, seed_key):
+            log.warning(
+                "Slug %r is used by another dashboard, so %r was not seeded.",
+                dashboard["slug"],
+                seed_key,
+            )
             skipped += 1
             continue
         rows.append(
             (
+                seed_key,
                 dashboard["slug"],
                 dashboard["title"],
                 dashboard.get("description"),
@@ -251,11 +275,11 @@ def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
         conn,
         "platform.dashboard",
         [
-            "slug", "title", "description", "layout", "filters", "audience",
-            "is_ai_generated", "source_prompt", "created_by", "is_pinned",
+            "seed_key", "slug", "title", "description", "layout", "filters",
+            "audience", "is_ai_generated", "source_prompt", "created_by", "is_pinned",
         ],
         rows,
-        ["slug"],
+        ["seed_key"],
         # updated_at is deliberately not in the update list so a reseed does not
         # look like a user edit in the dashboard list ordering.
         update_columns=[

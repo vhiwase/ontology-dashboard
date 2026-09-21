@@ -1,17 +1,40 @@
 # ============================================================================
 #  TMS Ontology Platform - full stack
 #  ---------------------------------------------------------------------------
+#    ./scripts/init-secrets.sh        generate secrets (once, before first up)
 #    docker compose up -d --build     bring everything up
-#    docker compose logs -f pipeline  watch ingestion + ontology generation
+#    docker compose logs -f pipeline  watch migrations + ingestion + ontology
 #    docker compose run --rm pipeline python -m pipeline.run --force
+#    docker compose run --rm pipeline python -m pipeline.users list
 #
 #  Ports are bound to 127.0.0.1 only. Docker Desktop's ::1 proxy accepts
 #  connections and then hangs, which stops a browser opening "localhost" from
 #  falling back to IPv4 - the same problem ContractProcessing/docker-compose.yml
-#  documents.
+#  documents. Note that this binding is a development control: it disappears
+#  the moment this runs on a host where the port is published, which is why the
+#  services authenticate rather than relying on it.
+#
+#  Secrets are files under ./secrets, mounted at /run/secrets and read through
+#  the *_FILE environment variables. They are deliberately not plain
+#  `environment:` values, which `docker inspect` prints to anyone who can run
+#  it.
+#
+#  Resource limits are set on every service. Without them one runaway container
+#  can take the host down, and the assistant's model server is the most likely
+#  candidate.
 # ============================================================================
 
 name: tms-ontology
+
+secrets:
+  jwt_secret:
+    file: ./secrets/jwt_secret
+  postgres_password:
+    file: ./secrets/postgres_password
+  database_url:
+    file: ./secrets/database_url
+  azure_openai_key:
+    file: ./secrets/azure_openai_key
 
 services:
   # ─── Postgres: raw tables, semantic views, ontology registry ──────────────
@@ -20,16 +43,19 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-ontology}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ontology}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       POSTGRES_DB: ${POSTGRES_DB:-tms_ontology}
       # Deterministic collation so ORDER BY in the UI matches ORDER BY in tests.
       POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    secrets:
+      - postgres_password
     ports:
       - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       # Runs in filename order, and only when the data directory is empty.
-      # `docker compose down -v` is the way to force a schema rebuild.
+      # Anything that has to change an existing database goes in db/migrations
+      # instead, applied by pipeline.migrate.
       - ./db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ontology} -d ${POSTGRES_DB:-tms_ontology}"]
@@ -37,16 +63,23 @@ services:
       timeout: 5s
       retries: 20
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "${POSTGRES_CPUS:-2}"
+          memory: ${POSTGRES_MEMORY:-1g}
 
   # ─── Ollama: hosts the open-source LLM ───────────────────────────────────
   ollama:
-    image: ollama/ollama:latest
+    # Pinned, like every other image here. `latest` meant the model server
+    # could change under a stack that had not been rebuilt.
+    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
     restart: unless-stopped
     environment:
       # Keeping the model resident avoids a 20-30 s cold load on every question.
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
     ports:
-      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
+      - "127.0.0.1:${OLLAMA_PORT:-11435}:11434"
     volumes:
       - ollama:/root/.ollama
     healthcheck:
@@ -55,11 +88,23 @@ services:
       timeout: 5s
       retries: 30
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # A 7B model quantised to 4 bits needs roughly 5-6 GB resident; the
+          # headroom above that is for the KV cache on a long conversation.
+          cpus: "${OLLAMA_CPUS:-6}"
+          memory: ${OLLAMA_MEMORY:-10g}
 
   # ─── One-shot: pull the chat model so the first question is not a 404 ────
   ollama-init:
-    image: ollama/ollama:latest
-    profiles: ["default", "llm"]
+    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
+    # No `profiles:` here. It used to carry profiles: ["default", "llm"], and
+    # "default" is not a special name in Compose - a service with any profile
+    # starts only when that profile is explicitly enabled. So this never ran on
+    # a plain `docker compose up`, the model was never pulled, and the first
+    # question to the local model got a 404 from Ollama. OLLAMA_AUTO_PULL=false
+    # is the supported way to skip the pull; the command below honours it.
     depends_on:
       ollama:
         condition: service_healthy
@@ -79,8 +124,13 @@ services:
         echo "Pulling $${OLLAMA_MODEL} (several GB on first run)..."
         ollama pull "$${OLLAMA_MODEL}"
     restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
 
-  # ─── Pipeline: api_responses -> raw -> views -> ontology -> lineage ──────
+  # ─── Pipeline: migrations, ingestion, ontology, users, retention ─────────
   pipeline:
     build:
       context: ./services/pipeline
@@ -88,17 +138,40 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://ontology:ontology@postgres:5432/tms_ontology}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      PIPELINE_MIGRATIONS_DIR: /db/migrations
       PIPELINE_SOURCE_DIR: ${PIPELINE_SOURCE_DIR:-/data/api_responses}
       PIPELINE_SIMULATE_EXECUTION: ${PIPELINE_SIMULATE_EXECUTION:-true}
       PIPELINE_SIM_SEED: ${PIPELINE_SIM_SEED:-20260919}
       PIPELINE_FORCE_REINGEST: ${PIPELINE_FORCE_REINGEST:-false}
       PIPELINE_LINK_MIN_MATCH_RATIO: ${PIPELINE_LINK_MIN_MATCH_RATIO:-0.05}
+      # Creates the first admin when no users exist. Unset means no user is
+      # created and every route answers 401, which is a visible failure rather
+      # than a default credential.
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      CHAT_RETENTION_DAYS: ${CHAT_RETENTION_DAYS:-0}
+    secrets:
+      - database_url
     volumes:
       # The captured TMS payloads, mounted read-only from the sibling folder.
       - ../api_responses:/data/api_responses:ro
+      - ./db/migrations:/db/migrations:ro
+    # migrate -> run -> seed users -> retention, in that order, with any
+    # failure stopping the rest. The sequence lives in pipeline.bootstrap
+    # rather than as an `entrypoint: sh -c` chain here, because overriding the
+    # entrypoint would break the documented one-off form:
+    #     docker compose run --rm pipeline python -m pipeline.users list
+    # (sh -c takes only its first argument as the command, so python would
+    # start with no arguments and silently do nothing.)
+    command: ["python", "-m", "pipeline.bootstrap"]
     # Runs to completion and exits; the services below wait for that.
     restart: "no"
+    deploy:
+      resources:
+        limits:
+          cpus: "${PIPELINE_CPUS:-2}"
+          memory: ${PIPELINE_MEMORY:-1g}
 
   # ─── Ontology service: @ontograph/core over the generated ontology ──────
   ontology-service:
@@ -115,10 +188,22 @@ services:
       pipeline:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://ontology:ontology@postgres:5432/tms_ontology}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      AUTH_JWT_SECRET_FILE: /run/secrets/jwt_secret
+      AUTH_TOKEN_TTL: ${AUTH_TOKEN_TTL:-28800}
+      AUTH_LOGIN_MAX_FAILURES: ${AUTH_LOGIN_MAX_FAILURES:-10}
+      AUTH_LOGIN_WINDOW_MINUTES: ${AUTH_LOGIN_WINDOW_MINUTES:-15}
+      # Empty means same-origin only, which is what the nginx topology needs.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       PORT: ${ONTOLOGY_SERVICE_PORT:-4000}
       ONTOLOGY_MAX_PAGE_SIZE: ${ONTOLOGY_MAX_PAGE_SIZE:-500}
+      # false refuses every KPI, widget and action derived from tms_sim, so a
+      # simulated figure cannot be served as though it were measured.
+      ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-true}
       NODE_ENV: production
+    secrets:
+      - database_url
+      - jwt_secret
     ports:
       - "127.0.0.1:${ONTOLOGY_SERVICE_PORT:-4000}:${ONTOLOGY_SERVICE_PORT:-4000}"
     healthcheck:
@@ -127,6 +212,11 @@ services:
       timeout: 5s
       retries: 12
       start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "${ONTOLOGY_SERVICE_CPUS:-2}"
+          memory: ${ONTOLOGY_SERVICE_MEMORY:-768m}
 
   # ─── AI-FDE: the assistant that reads the ontology and builds dashboards ─
   ai-fde:
@@ -141,9 +231,15 @@ services:
       ollama:
         condition: service_started
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://ontology:ontology@postgres:5432/tms_ontology}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      AUTH_JWT_SECRET_FILE: /run/secrets/jwt_secret
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       ONTOLOGY_SERVICE_URL: http://ontology-service:${ONTOLOGY_SERVICE_PORT:-4000}
       PORT: ${AI_FDE_PORT:-4100}
+      # Bounds on the paid path: requests per user, and tokens per user per day.
+      CHAT_RATE_PER_MINUTE: ${CHAT_RATE_PER_MINUTE:-10}
+      CHAT_RATE_BURST: ${CHAT_RATE_BURST:-5}
+      CHAT_DAILY_TOKEN_BUDGET: ${CHAT_DAILY_TOKEN_BUDGET:-200000}
       # auto resolves from whether Ollama has GPU offload; see .env.example.
       LLM_PROVIDER: ${LLM_PROVIDER:-auto}
       LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
@@ -153,12 +249,20 @@ services:
       AI_FDE_TEMPERATURE: ${AI_FDE_TEMPERATURE:-0.1}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
-      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-90}
+      # 300s, not 90s: a 7B model on CPU with a fifteen-tool schema routinely
+      # needs minutes for one round, and 90s meant the local model was selected
+      # and then always timed out. Still bounded, so a wedged model does not
+      # hang the request forever.
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
-      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY:-}
+      AZURE_OPENAI_KEY_FILE: /run/secrets/azure_openai_key
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4.1}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
       AZURE_OPENAI_TIMEOUT: ${AZURE_OPENAI_TIMEOUT:-120}
+    secrets:
+      - database_url
+      - jwt_secret
+      - azure_openai_key
     ports:
       - "127.0.0.1:${AI_FDE_PORT:-4100}:${AI_FDE_PORT:-4100}"
     healthcheck:
@@ -167,8 +271,13 @@ services:
       timeout: 6s
       retries: 12
       start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "${AI_FDE_CPUS:-2}"
+          memory: ${AI_FDE_MEMORY:-768m}
 
-  # ─── UI: the ontology workbench ─────────────────────────────────────────
+  # ─── UI: the ontology workbench, and TLS termination ─────────────────────
   ui:
     build:
       context: ./services/ui
@@ -177,19 +286,36 @@ services:
       ontology-service:
         condition: service_healthy
     environment:
-      # nginx proxies /api/ontology -> ontology-service and /api/assistant ->
-      # ai-fde, so the browser only ever talks to one origin.
+      # nginx proxies /api/assistant -> ai-fde and the rest -> ontology-service,
+      # so the browser only ever talks to one origin.
       ONTOLOGY_SERVICE_URL: http://ontology-service:${ONTOLOGY_SERVICE_PORT:-4000}
       AI_FDE_URL: http://ai-fde:${AI_FDE_PORT:-4100}
+      # Names the self-signed certificate generated when none is mounted.
+      TLS_COMMON_NAME: ${TLS_COMMON_NAME:-localhost}
+    volumes:
+      # Mount a real certificate here as server.crt / server.key. With nothing
+      # mounted the entrypoint writes a self-signed pair on first start.
+      - ui-certs:/etc/nginx/certs
     ports:
-      - "127.0.0.1:${UI_PORT:-3000}:80"
+      # The app is served over HTTPS: https://127.0.0.1:3000
+      - "127.0.0.1:${UI_PORT:-3000}:443"
+      # Plain HTTP, which only redirects to the above and answers /health.
+      - "127.0.0.1:${UI_HTTP_PORT:-3080}:80"
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      # Probes port 80, which is not redirected for /health, so this needs no
+      # trust store for the self-signed certificate.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/health >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 12
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "${UI_CPUS:-1}"
+          memory: ${UI_MEMORY:-256m}
 
 volumes:
   pgdata:
   ollama:
+  ui-certs:

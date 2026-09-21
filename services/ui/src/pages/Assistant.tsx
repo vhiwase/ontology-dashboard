@@ -45,6 +45,24 @@ interface Starter {
 	prompt: string;
 }
 
+interface ProviderOption {
+	id: string;
+	label: string;
+	model: string;
+	configured: boolean;
+	available: boolean;
+	/** Usable, but slow enough to warn about — a CPU-only local model. */
+	slow: boolean;
+	detail: string | null;
+}
+
+interface ProviderCatalogue {
+	providers: ProviderOption[];
+	auto: { id: string; label: string; resolvedTo: string | null; reason: string | null };
+	/** Which option to preselect; the server yields off Ollama if it is not usable. */
+	default: string;
+}
+
 export function Assistant() {
 	const [turns, setTurns] = useState<Turn[]>([]);
 	const [input, setInput] = useState("");
@@ -53,6 +71,11 @@ export function Assistant() {
 	const [error, setError] = useState<string | null>(null);
 	const [health, setHealth] = useState<AssistantHealth | null>(null);
 	const [starters, setStarters] = useState<Starter[]>([]);
+	const [catalogue, setCatalogue] = useState<ProviderCatalogue | null>(null);
+	// Null until the catalogue loads, then the server's suggested default.
+	// Pinned per conversation rather than per turn, so a thread does not
+	// silently change model half way through.
+	const [provider, setProvider] = useState<string | null>(null);
 	const scrollRef = useScrollToBottom(turns.length + (busy ? 1 : 0));
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -65,7 +88,18 @@ export function Assistant() {
 			.get<{ starters: Starter[] }>("/api/assistant/starters")
 			.then((body) => setStarters(body.starters))
 			.catch(() => setStarters([]));
+		api
+			.get<ProviderCatalogue>("/api/assistant/providers")
+			.then((body) => {
+				setCatalogue(body);
+				// Only adopt the server's default before the user has chosen, so a
+				// refresh of availability never overrides an explicit pick.
+				setProvider((current) => current ?? body.default);
+			})
+			.catch(() => setCatalogue(null));
 	}, []);
+
+	const selected = catalogue?.providers.find((p) => p.id === provider) ?? null;
 
 	const send = async (message: string) => {
 		const trimmed = message.trim();
@@ -79,6 +113,9 @@ export function Assistant() {
 			const response = await api.post<ChatResponse>("/api/assistant/chat", {
 				message: trimmed,
 				sessionId,
+				// Omitted while the catalogue is still loading, which leaves the
+				// server on its configured chain rather than guessing here.
+				...(provider ? { provider } : {}),
 			});
 			setSessionId(response.sessionId);
 			setTurns((current) => [
@@ -225,6 +262,36 @@ export function Assistant() {
 					</button>
 				</form>
 				<div className="row muted" style={{ fontSize: 11, marginTop: 6, gap: 10 }}>
+					<label className="model-picker">
+						<span>Model</span>
+						<select
+							value={provider ?? ""}
+							disabled={!catalogue}
+							onChange={(event) => setProvider(event.target.value)}
+							// Changing model mid-thread is allowed; the prior turns are
+							// replayed to whichever model answers next.
+							title={selected?.detail ?? undefined}
+						>
+							{catalogue?.providers.map((option) => (
+								<option key={option.id} value={option.id} disabled={!option.available}>
+									{option.label}
+									{!option.available ? " — unavailable" : option.slow ? " — slow (CPU)" : ""}
+								</option>
+							))}
+							{catalogue && (
+								<option value="auto">
+									{catalogue.auto.label}
+									{catalogue.auto.resolvedTo ? ` — ${catalogue.auto.resolvedTo}` : ""}
+								</option>
+							)}
+						</select>
+					</label>
+					{selected && <span className="mono">{selected.model}</span>}
+					{selected?.detail && (selected.slow || !selected.available) && (
+						<span className="model-warn" title={selected.detail}>
+							⚠ {selected.slow ? "CPU-only — answers take minutes" : selected.detail}
+						</span>
+					)}
 					<span>Enter to send · Shift+Enter for a new line</span>
 					{sessionId && <span>session {sessionId}</span>}
 					{turns.length > 0 && (

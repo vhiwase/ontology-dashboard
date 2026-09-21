@@ -36,8 +36,11 @@ RUN npx tsc -p tsconfig.build.json \
     && echo '{"type":"commonjs"}' > dist/package.json
 
 WORKDIR /srv/app/service
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# npm ci rather than npm install: it installs exactly what package-lock.json
+# describes and fails if the lock and the manifest disagree, so two builds of
+# the same commit produce the same tree.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
@@ -56,10 +59,10 @@ COPY --from=build /srv/vendor/ontograph-core/package.json ./
 COPY --from=build /srv/vendor/ontograph-core/dist ./dist
 
 WORKDIR /srv/app/service
-COPY package.json ./
+COPY package.json package-lock.json ./
 # Installs runtime deps and links the vendored library, hoisting its own
 # dependency (zod) into this node_modules.
-RUN npm install --omit=dev --no-audit --no-fund \
+RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 COPY --from=build /srv/app/service/dist ./dist
 

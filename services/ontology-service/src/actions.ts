@@ -1,3 +1,4 @@
+import { assertSimulationAllowed } from "./dataPolicy";
 import { AccessController, ActionValidator } from "@ontograph/core";
 import type { ActionType, OntologyDefinition } from "@ontograph/core";
 import { query, queryOne } from "./db";
@@ -407,6 +408,19 @@ const READ_ONLY_IMPLEMENTATIONS: Record<
 	RecalculateTransportCost: recalculateTransportCost,
 };
 
+/**
+ * Read-only actions whose numbers come from the simulated execution data.
+ *
+ * Each of these computes against tms_sim or the same synthetic rate table the
+ * simulation uses, so their output is invented however carefully it is
+ * captioned. ALLOW_SIMULATED_DATA=false refuses them outright.
+ */
+const SIMULATION_BACKED = new Set([
+	"SimulateRateChange",
+	"ProjectOnTimeImpact",
+	"RecalculateTransportCost",
+]);
+
 // ── the mutating path: stage, never pretend ─────────────────────────────────
 
 async function stageMutation(
@@ -467,6 +481,12 @@ export async function executeAction(
 ): Promise<ActionOutcome> {
 	const started = Date.now();
 	const meta = resolveAction(apiName);
+
+	// Checked before parameter validation and before the role check: whether
+	// this deployment serves simulated figures at all is a property of the
+	// deployment, not of the request, so a malformed request should get the
+	// same refusal a well-formed one would.
+	assertSimulationAllowed(`Action ${meta.apiName}`, SIMULATION_BACKED.has(meta.apiName));
 
 	const record = async (
 		status: ActionOutcome["status"],
@@ -592,6 +612,6 @@ export async function listAudit(limit = 100): Promise<Array<Record<string, unkno
 		        initiated_by_ai, duration_ms, error_message, created_at, parameters, result
 		   FROM platform.action_audit
 		  ORDER BY created_at DESC LIMIT $1`,
-		[Math.min(Math.max(1, limit), 500)],
+		[Math.min(Math.max(1, Number.isFinite(Number(limit)) ? Number(limit) : 100), 500)],
 	);
 }

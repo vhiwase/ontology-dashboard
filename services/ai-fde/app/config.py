@@ -6,6 +6,24 @@ import os
 from dataclasses import dataclass, field
 
 
+def _secret(name: str, default: str = "") -> str:
+    """A value from NAME, or from the file NAME_FILE.
+
+    Docker secrets arrive as files under /run/secrets rather than as
+    environment variables, and an environment variable is visible to anyone who
+    can run `docker inspect` on the container. The _FILE form is preferred when
+    both are set.
+    """
+    path = os.environ.get(f"{name}_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError as exc:
+            raise RuntimeError(f"Could not read {name}_FILE ({path}): {exc}") from exc
+    return os.environ.get(name, default)
+
+
 def _flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -27,7 +45,7 @@ def _num(name: str, default: float) -> float:
 class Config:
     port: int = field(default_factory=lambda: int(_num("PORT", 4100)))
     database_url: str = field(
-        default_factory=lambda: os.environ.get(
+        default_factory=lambda: _secret(
             "DATABASE_URL", "postgresql://ontology:ontology@127.0.0.1:55432/tms_ontology"
         )
     )
@@ -80,7 +98,7 @@ class Config:
     azure_endpoint: str = field(
         default_factory=lambda: os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
     )
-    azure_key: str = field(default_factory=lambda: os.environ.get("AZURE_OPENAI_KEY", ""))
+    azure_key: str = field(default_factory=lambda: _secret("AZURE_OPENAI_KEY"))
     azure_deployment: str = field(
         default_factory=lambda: os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
     )
@@ -96,7 +114,7 @@ class Config:
     # Per-provider timeouts. Ollama's is deliberately short: on CPU-only hardware a
     # 7B model can take minutes per call, and failing over to a hosted model in 90 s
     # beats waiting five minutes for a local answer.
-    ollama_timeout: float = field(default_factory=lambda: _num("OLLAMA_TIMEOUT", 90))
+    ollama_timeout: float = field(default_factory=lambda: _num("OLLAMA_TIMEOUT", 300))
     azure_timeout: float = field(default_factory=lambda: _num("AZURE_OPENAI_TIMEOUT", 120))
 
     @property

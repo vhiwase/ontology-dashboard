@@ -27,6 +27,7 @@ from typing import Any, Callable, Awaitable
 import httpx
 
 from .config import CONFIG
+from .context import current_request_id, current_token
 
 log = logging.getLogger("ai_fde.tools")
 
@@ -43,6 +44,23 @@ class OntologyClient:
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}{path}"
+
+        # Forward the caller's bearer token. Without one the ontology service
+        # answers 401, which is the correct outcome: there is no ambient
+        # service identity here that could read the ontology on nobody's
+        # behalf.
+        headers = dict(kwargs.pop("headers", None) or {})
+        token = current_token.get()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        # Carry the correlation id downstream so the ontology service logs the
+        # same id against the queries this turn caused.
+        request_id = current_request_id.get()
+        if request_id:
+            headers["X-Request-ID"] = request_id
+        if headers:
+            kwargs["headers"] = headers
+
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.request(method, url, **kwargs)
         if response.status_code >= 400:
@@ -425,12 +443,16 @@ async def apply_action(arguments: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
+    # actor and actorRole used to be sent from here as "ai-fde" plus a default
+    # role. The ontology service now takes both from the forwarded token, so
+    # the action runs as the signed-in user with their own ontology role, and
+    # the audit row names a person rather than the assistant. initiatedByAi
+    # still travels in the body: it records how the request arrived and grants
+    # nothing on its own.
     outcome = await client.post(
         f"/api/actions/{meta['apiName']}/apply",
         {
             "parameters": parameters,
-            "actor": arguments.get("actor") or "ai-fde",
-            "actorRole": CONFIG.default_role,
             "initiatedByAi": True,
             "chatSessionId": arguments.get("chatSessionId"),
         },

@@ -11,11 +11,17 @@ import {
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { executeAction, listAudit, resolveAction, validateParameters } from "./actions";
+import { apiAuthorization, login, me, requestId } from "./auth";
+import { describePolicy } from "./dataPolicy";
 import {
+	dashboardHistory,
 	deleteDashboard,
+	exportDashboards,
 	getDashboard,
+	importDashboards,
 	kpiCatalogueForPrompt,
 	listDashboards,
+	renameDashboard,
 	resolveDashboard,
 	saveDashboard,
 	validateLayout,
@@ -23,6 +29,18 @@ import {
 import { pool, query, waitForOntology } from "./db";
 import { clearColumnCache, dimensionValues, executeKpi, resolveKpi } from "./kpi";
 import { columnLineage, fetchGraph, trace, traceKpi, traceObjectType } from "./lineage";
+import {
+	deletePipeline,
+	getPipeline,
+	listPipelines,
+	listRuns,
+	listVersions,
+	ontologyPalette,
+	restoreVersion,
+	runPipeline,
+	savePipeline,
+	validateGraph,
+} from "./pipelines";
 import {
 	aggregateObjects,
 	getObject,
@@ -35,7 +53,59 @@ import { BadRequest, getRegistry, loadRegistry, NotFound, resolveObjectType } fr
 const app = express();
 const PORT = Number(process.env.PORT ?? 4000);
 
-app.use(cors());
+// Express is behind nginx; without this req.ip is the proxy's address, which
+// would make the per-username login throttle log one source for everyone.
+app.set("trust proxy", true);
+
+// nginx serves the SPA and proxies both APIs, so the browser only ever calls
+// its own origin and needs no CORS at all. CORS_ALLOWED_ORIGINS exists for the
+// case of a separately hosted front end; left unset, cross-origin calls are
+// simply refused rather than allowed from anywhere.
+const allowedOrigins = (process.env.CORS_ALLOWED_ORIGINS ?? "")
+	.split(",")
+	.map((value) => value.trim())
+	.filter(Boolean);
+
+if (allowedOrigins.length > 0) {
+	app.use(cors({ origin: allowedOrigins, credentials: true }));
+	console.log(`[boot] CORS restricted to: ${allowedOrigins.join(", ")}`);
+} else {
+	console.log("[boot] CORS disabled (same-origin only).");
+}
+
+app.use(requestId);
+
+/**
+ * One structured line per request.
+ *
+ * Logging here was console.log prose with no request id, so a 500 could not be
+ * tied to the call that caused it and nothing could be correlated with the
+ * assistant. The id comes from X-Request-ID when the caller supplied one, so a
+ * chat turn and the ontology queries it triggered share a value.
+ *
+ * /health is skipped: the compose healthcheck hits it every ten seconds.
+ */
+app.use((req, res, next) => {
+	if (req.path === "/health") return next();
+	const started = process.hrtime.bigint();
+	res.on("finish", () => {
+		const durationMs = Number(process.hrtime.bigint() - started) / 1e6;
+		console.log(
+			JSON.stringify({
+				level: res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info",
+				requestId: req.requestId,
+				method: req.method,
+				path: req.originalUrl,
+				status: res.statusCode,
+				durationMs: Math.round(durationMs),
+				user: req.principal?.username ?? null,
+				role: req.principal?.role ?? null,
+			}),
+		);
+	});
+	next();
+});
+
 app.use(express.json({ limit: "2mb" }));
 
 /** Wrap an async handler so a rejected promise reaches the error middleware. */
@@ -68,6 +138,28 @@ app.get("/health", (_req, res) => {
 	}
 });
 
+// ── authentication ──────────────────────────────────────────────────────────
+//
+//  ORDER MATTERS, and the order is the security boundary.
+//
+//  /health is registered above this point and stays anonymous, because the
+//  compose healthcheck has no credential to present.
+//
+//  /api/auth/login is registered before the guard, so it is reachable without a
+//  token - it is what issues one.
+//
+//  app.use("/api", apiAuthorization()) then covers every route registered
+//  after it. Anything added below this line is authenticated by default and
+//  requires at least the viewer role; see ELEVATED in auth.ts for the routes
+//  that demand more. A new route is protected by forgetting about it, not
+//  exposed by forgetting about it.
+
+app.post("/api/auth/login", handle(login));
+
+app.use("/api", apiAuthorization());
+
+app.get("/api/auth/me", me);
+
 app.post(
 	"/api/registry/reload",
 	handle(async (_req, res) => {
@@ -96,6 +188,7 @@ app.get(
 		]);
 		const totalObjects = registry.objectTypes.reduce((sum, t) => sum + t.rowCount, 0);
 		res.json({
+			dataPolicy: describePolicy(),
 			ontology: {
 				id: registry.ontologyId,
 				version: registry.version,
@@ -456,6 +549,54 @@ app.get(
 
 app.get("/api/dashboards", handle(async (_req, res) => res.json(await listDashboards())));
 
+// Provenance for every dashboard: which conversation built it, and how it has
+// been renamed since. Registered before /api/dashboards/:slug so "history" is
+// not read as a slug.
+app.get(
+	"/api/dashboards/history",
+	handle(async (_req, res) => res.json(await dashboardHistory())),
+);
+
+// A backup the user keeps locally. The browser saves the response as a file,
+// so this never depends on the server retaining anything.
+app.get(
+	"/api/dashboards/export",
+	handle(async (req, res) => {
+		const slugs = String(req.query.slugs ?? "")
+			.split(",")
+			.map((value) => value.trim())
+			.filter(Boolean);
+		res.json(await exportDashboards(req.principal?.username ?? "unknown", slugs));
+	}),
+);
+
+app.post(
+	"/api/dashboards/import",
+	handle(async (req, res) => {
+		const body = req.body ?? {};
+		res.json(
+			await importDashboards(
+				body.backup ?? body,
+				req.principal?.username ?? "unknown",
+				Boolean(body.overwrite),
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/dashboards/:slug/rename",
+	handle(async (req, res) => {
+		res.json(
+			await renameDashboard(
+				String(req.params.slug),
+				String((req.body ?? {}).title ?? ""),
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
 app.get(
 	"/api/dashboards/:slug",
 	handle(async (req, res) => {
@@ -554,11 +695,20 @@ app.post(
 	"/api/actions/:apiName/apply",
 	handle(async (req, res) => {
 		const body = req.body ?? {};
+		// Identity comes from the verified token, never from the body. It used to
+		// be read from body.actor / body.actorRole, which meant a caller could
+		// name any actor and claim any ontology role - including one whose rules
+		// permit actions their own role forbids - and the audit row would record
+		// whatever they chose. The body can still say what it likes; nothing here
+		// reads it.
+		const principal = req.principal;
+		if (!principal) throw new Error("apply route reached without a principal");
+
 		const outcome = await executeAction(String(req.params.apiName), body.parameters ?? {}, {
-			actor: String(body.actor ?? "anonymous"),
-			// Analyst is the default on purpose: it can read everything and mutate
-			// nothing, so an unattended call cannot stage a write by omission.
-			actorRole: String(body.actorRole ?? "tms:AnalystRole"),
+			actor: principal.username,
+			actorRole: principal.ontologyRole,
+			// Whether the assistant drove this is a property of how the request
+			// arrived, so it stays caller-supplied; it grants nothing.
 			initiatedByAi: Boolean(body.initiatedByAi),
 			chatSessionId: body.chatSessionId ? Number(body.chatSessionId) : null,
 		});
@@ -575,16 +725,116 @@ app.get(
 	}),
 );
 
+
+// ── pipeline builder ────────────────────────────────────────────────────────
+
+// The real object types, links, actions and KPIs, offered as palette entries
+// so a node is configured against something that exists.
+app.get(
+	"/api/pipelines/palette",
+	handle(async (_req, res) => res.json(ontologyPalette())),
+);
+
+app.get("/api/pipelines", handle(async (_req, res) => res.json(await listPipelines())));
+
+// Validate a graph without saving it, which is what the canvas calls as the
+// user edits.
+app.post(
+	"/api/pipelines/validate",
+	handle(async (req, res) => {
+		res.json(validateGraph((req.body ?? {}).graph ?? { nodes: [], edges: [] }));
+	}),
+);
+
+app.post(
+	"/api/pipelines",
+	handle(async (req, res) => {
+		res.json(await savePipeline(req.body ?? {}, req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.get(
+	"/api/pipelines/:slug",
+	handle(async (req, res) => res.json(await getPipeline(String(req.params.slug)))),
+);
+
+app.delete(
+	"/api/pipelines/:slug",
+	handle(async (req, res) => {
+		await deletePipeline(String(req.params.slug));
+		res.status(204).end();
+	}),
+);
+
+app.get(
+	"/api/pipelines/:slug/versions",
+	handle(async (req, res) => res.json(await listVersions(String(req.params.slug)))),
+);
+
+app.post(
+	"/api/pipelines/:slug/versions/:version/restore",
+	handle(async (req, res) => {
+		res.json(
+			await restoreVersion(
+				String(req.params.slug),
+				Number(req.params.version),
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/pipelines/:slug/run",
+	handle(async (req, res) => {
+		res.json(await runPipeline(String(req.params.slug), req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.get(
+	"/api/pipelines/:slug/runs",
+	handle(async (req, res) => {
+		res.json(await listRuns(String(req.params.slug), Number(req.query.limit ?? 20)));
+	}),
+);
+
 // ── errors ──────────────────────────────────────────────────────────────────
 
 app.use((_req, res) => {
 	res.status(404).json({ error: "No such endpoint." });
 });
 
-app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
+app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
 	const status = (error as BadRequest | NotFound & { status?: number }).status ?? 500;
-	if (status >= 500) console.error("[error]", error);
-	res.status(status).json({ error: error.message, type: error.constructor.name });
+
+	// A 4xx was raised deliberately by this code and its message is written for
+	// the caller ("No such object type: Foo"), so it is safe to return.
+	//
+	// A 5xx is an unhandled exception. Its message and class name describe our
+	// internals - SQL text, connection strings, library internals - so the
+	// client gets the request id instead and the detail stays in the log, where
+	// the two are joined by that same id.
+	if (status >= 500) {
+		console.error(
+			JSON.stringify({
+				level: "error",
+				requestId: req.requestId,
+				method: req.method,
+				path: req.originalUrl,
+				user: req.principal?.username ?? null,
+				error: error.message,
+				type: error.constructor.name,
+				stack: error.stack,
+			}),
+		);
+		res.status(500).json({
+			error: "Internal server error.",
+			requestId: req.requestId,
+		});
+		return;
+	}
+
+	res.status(status).json({ error: error.message, requestId: req.requestId });
 });
 
 // ── startup ─────────────────────────────────────────────────────────────────

@@ -70,6 +70,22 @@ interface Bindings {
 	bind(value: unknown): string;
 }
 
+/**
+ * Clamp a caller-supplied row limit into [1, MAX_PAGE_SIZE].
+ *
+ * The result is interpolated straight into the SQL text rather than bound,
+ * because Postgres will not take a parameter for LIMIT in every position this
+ * builder emits. That makes the coercion part of the safety story, not a
+ * convenience: Number() first, then an explicit finite check, so a
+ * non-numeric limit becomes the default instead of reaching the query as NaN
+ * (which Postgres rejects) or as anything else.
+ */
+function clampLimit(supplied: unknown, fallback: number): number {
+	const requested = supplied === undefined || supplied === null ? fallback : Number(supplied);
+	if (!Number.isFinite(requested)) return fallback;
+	return Math.min(Math.max(1, Math.floor(requested)), MAX_PAGE_SIZE);
+}
+
 function makeBindings(): Bindings {
 	const values: unknown[] = [];
 	return {
@@ -241,7 +257,7 @@ export async function searchObjects(
 		orderParts.push(`${quoteIdentifier(fallback)} ASC NULLS LAST`);
 	}
 
-	const limit = Math.min(Math.max(1, request.limit ?? DEFAULT_PAGE_SIZE), MAX_PAGE_SIZE);
+	const limit = clampLimit(request.limit, DEFAULT_PAGE_SIZE);
 	const offset = Math.max(0, request.offset ?? 0);
 
 	const view = quoteQualified(type.sourceView);
@@ -429,7 +445,7 @@ export async function traverseLink(
 	const dataSql =
 		`SELECT ${selectList} FROM ${quoteQualified(other.sourceView)} o ${joinSql} ` +
 		`ORDER BY o.${quoteIdentifier(other.titleColumn ?? other.primaryKeyColumn)} ` +
-		`LIMIT ${Math.min(Math.max(1, limit), MAX_PAGE_SIZE)}`;
+		`LIMIT ${clampLimit(limit, 100)}`;
 	const countSql = `SELECT count(*)::bigint AS n FROM ${quoteQualified(other.sourceView)} o ${joinSql}`;
 
 	const [rows, countRows] = await Promise.all([
@@ -542,7 +558,7 @@ export async function aggregateObjects(
 		orderSql = `ORDER BY ${quoteIdentifier(aliases[0])} DESC NULLS LAST`;
 	}
 
-	const limit = Math.min(Math.max(1, request.limit ?? 100), MAX_PAGE_SIZE);
+	const limit = clampLimit(request.limit, 100);
 	const sql =
 		`SELECT ${selectParts.join(", ")} FROM ${quoteQualified(type.sourceView)} ` +
 		`${whereSql} ${groupSql} ${orderSql} LIMIT ${limit}`;
@@ -604,3 +620,14 @@ export async function globalSearch(
 	}
 	return results;
 }
+
+/**
+ * Internals exposed for tests only.
+ *
+ * buildPredicate and castTo are where a filter turns into SQL, which makes
+ * them the part of this file most worth pinning down: every value has to leave
+ * as a bound parameter and every identifier has to come from the registry.
+ * They stay module-private for production use - this object is the seam the
+ * unit tests bind to, and nothing in src/ imports it.
+ */
+export const __testing = { buildPredicate, castTo, makeBindings, clampLimit };

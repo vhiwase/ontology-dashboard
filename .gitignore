@@ -258,3 +258,9 @@ data/
 .DS_Store
 Thumbs.db
 .idea/
+
+# DB dumps taken before destructive resets
+backups/
+
+# Generated secret files mounted at /run/secrets. Never commit these.
+secrets/

@@ -48,16 +48,22 @@ def create_session(
     return int(row["chat_session_id"])
 
 
-def list_sessions(limit: int = 50) -> list[dict[str, Any]]:
+def list_sessions(owner: str | None, limit: int = 50) -> list[dict[str, Any]]:
+    """Sessions belonging to `owner`, or every session when owner is None.
+
+    A conversation can quote whatever the ontology holds, so one user's history
+    is not another user's to read. Only an admin passes None.
+    """
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT chat_session_id, title, user_id, user_role, llm_provider, llm_model,
                    message_count, created_at, updated_at
               FROM platform.chat_session
+             WHERE (%s::text IS NULL OR user_id = %s)
              ORDER BY updated_at DESC LIMIT %s
             """,
-            (limit,),
+            (owner, owner, limit),
         )
         return list(cur.fetchall())
 
@@ -76,10 +82,18 @@ def get_messages(session_id: int) -> list[dict[str, Any]]:
         return list(cur.fetchall())
 
 
-def session_exists(session_id: int) -> bool:
+def session_exists(session_id: int, owner: str | None = None) -> bool:
+    """Whether the session exists and, when `owner` is given, belongs to them.
+
+    Callers answer 404 rather than 403 on a miss, so this does not double as a
+    probe for which session ids other users hold.
+    """
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM platform.chat_session WHERE chat_session_id = %s", (session_id,)
+            """SELECT 1 FROM platform.chat_session
+                WHERE chat_session_id = %s
+                  AND (%s::text IS NULL OR user_id = %s)""",
+            (session_id, owner, owner),
         )
         return cur.fetchone() is not None
 
@@ -159,10 +173,14 @@ def append_message(
     return message_id
 
 
-def delete_session(session_id: int) -> bool:
+def delete_session(session_id: int, owner: str | None = None) -> bool:
+    """Delete a session the caller owns. Admins pass owner=None to delete any."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "DELETE FROM platform.chat_session WHERE chat_session_id = %s RETURNING chat_session_id",
-            (session_id,),
+            """DELETE FROM platform.chat_session
+                WHERE chat_session_id = %s
+                  AND (%s::text IS NULL OR user_id = %s)
+            RETURNING chat_session_id""",
+            (session_id, owner, owner),
         )
         return cur.fetchone() is not None

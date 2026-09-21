@@ -18,6 +18,7 @@ export function DashboardList() {
 	const [dashboards, setDashboards] = useState<DashboardSummary[] | null>(null);
 	const [kpis, setKpis] = useState<KpiMeta[]>([]);
 	const [error, setError] = useState<string | null>(null);
+	const [query, setQuery] = useState("");
 
 	const load = () => {
 		Promise.all([
@@ -43,18 +44,50 @@ export function DashboardList() {
 		else byCategory.set(kpi.category, [kpi]);
 	}
 
+	const needle = query.trim().toLowerCase();
+	const visible = needle
+		? dashboards.filter((dashboard) =>
+				[dashboard.title, dashboard.description ?? "", dashboard.audience ?? "", dashboard.slug]
+					.join(" ")
+					.toLowerCase()
+					.includes(needle),
+			)
+		: dashboards;
+
 	return (
 		<div className="col" style={{ gap: 14 }}>
 			<div className="card">
 				<div className="card-head">
 					<h3>Dashboards</h3>
-					<span className="sub">{dashboards.length} boards</span>
-					<Link className="btn sm primary" to="/assistant" style={{ marginLeft: 10 }}>
+					<span className="sub">
+						{visible.length === dashboards.length
+							? `${dashboards.length} boards`
+							: `${visible.length} of ${dashboards.length}`}
+					</span>
+					<Link className="btn sm" to="/dashboards/history" style={{ marginLeft: 10 }}>
+						History &amp; backup
+					</Link>
+					<Link className="btn sm primary" to="/assistant" style={{ marginLeft: 6 }}>
 						Ask the assistant for a new one
 					</Link>
 				</div>
+
+				<div className="history-controls" style={{ marginBottom: 12 }}>
+					<input
+						className="search-input"
+						type="search"
+						value={query}
+						placeholder="Search dashboards…"
+						onChange={(event) => setQuery(event.target.value)}
+						aria-label="Search dashboards"
+					/>
+				</div>
+
+				{visible.length === 0 ? (
+					<Empty>No dashboard matches “{query}”.</Empty>
+				) : (
 				<div className="grid grid-3">
-					{dashboards.map((dashboard) => (
+					{visible.map((dashboard) => (
 						<Link
 							key={dashboard.slug}
 							to={`/dashboards/${dashboard.slug}`}
@@ -76,6 +109,7 @@ export function DashboardList() {
 						</Link>
 					))}
 				</div>
+				)}
 			</div>
 
 			<div className="card">

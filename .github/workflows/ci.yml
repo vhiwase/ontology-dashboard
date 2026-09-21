@@ -1,0 +1,152 @@
+name: CI
+
+# There was no CI at the repository root, so nothing checked that a commit
+# typechecked, passed its tests or still produced buildable images.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ontology-service:
+    name: ontology-service (typecheck, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            services/ontology-service/package-lock.json
+            vendor/ontograph-core/package-lock.json
+
+      # The service depends on the vendored library through
+      # "file:../../vendor/ontograph-core", and typechecking resolves against
+      # its dist/, so the library is compiled first - exactly as the Dockerfile
+      # does it.
+      - name: Compile the vendored ontograph-core
+        working-directory: vendor/ontograph-core
+        run: |
+          npm install --no-save --no-audit --no-fund typescript@6.0.3 @types/node@26.6.2
+          npx tsc -p tsconfig.build.json
+          echo '{"type":"commonjs"}' > dist/package.json
+
+      - name: Install
+        working-directory: services/ontology-service
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: services/ontology-service
+        run: npm run typecheck
+
+      - name: Test
+        working-directory: services/ontology-service
+        run: npm test
+
+      - name: Build
+        working-directory: services/ontology-service
+        run: npm run build
+
+  ui:
+    name: ui (typecheck, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: services/ui/package-lock.json
+
+      - name: Install
+        working-directory: services/ui
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        working-directory: services/ui
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Build
+        working-directory: services/ui
+        run: npm run build
+
+  python:
+    name: ${{ matrix.service }} (pytest)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [ai-fde, pipeline]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: services/${{ matrix.service }}/requirements-dev.txt
+
+      - name: Install
+        working-directory: services/${{ matrix.service }}
+        run: pip install -r requirements-dev.txt
+
+      - name: Test
+        working-directory: services/${{ matrix.service }}
+        run: python -m pytest tests/ -q
+
+  nginx:
+    name: nginx config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # nginx -t parses the config, so a typo in a proxy_pass or a missing
+      # directive fails here rather than when the container will not start.
+      - name: Validate
+        run: |
+          docker run --rm \
+            -v "$PWD/services/ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
+            -v "$PWD/services/ui/security-headers.conf:/etc/nginx/snippets/security-headers.conf:ro" \
+            --entrypoint sh nginx:1.27-alpine -c '
+              mkdir -p /etc/nginx/certs
+              openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+                -keyout /etc/nginx/certs/server.key \
+                -out /etc/nginx/certs/server.crt \
+                -subj "/CN=ci" 2>/dev/null
+              nginx -t
+            '
+
+  images:
+    name: docker images build
+    runs-on: ubuntu-latest
+    # Only worth the minutes once the cheaper checks have passed.
+    needs: [ontology-service, ui, python, nginx]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secrets the compose file expects
+        # docker compose build does not read them, but `compose config`
+        # validates the file and the paths must resolve.
+        run: |
+          mkdir -p secrets
+          for name in jwt_secret postgres_password database_url azure_openai_key; do
+            printf 'ci-placeholder-value-at-least-32-characters' > "secrets/$name"
+          done
+
+      - name: Validate the compose file
+        run: docker compose config >/dev/null
+
+      - name: Build
+        run: docker compose build
