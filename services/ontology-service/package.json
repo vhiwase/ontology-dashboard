@@ -1,0 +1,27 @@
+{
+  "name": "tms-ontology-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serves the generated TMS ontology, object-set queries, KPIs, lineage and actions via @ontograph/core",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@ontograph/core": "file:../../vendor/ontograph-core",
+    "cors": "2.8.5",
+    "express": "4.21.2",
+    "pg": "8.13.1"
+  },
+  "devDependencies": {
+    "@types/cors": "2.8.17",
+    "@types/express": "4.17.21",
+    "@types/node": "22.10.2",
+    "@types/pg": "8.11.10",
+    "typescript": "5.7.2"
+  },
+  "engines": { "node": ">=20" }
+}

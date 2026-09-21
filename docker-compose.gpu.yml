@@ -1,0 +1,56 @@
+# ============================================================================
+#  GPU overlay for Ollama - opt in, NVIDIA only.
+#  ---------------------------------------------------------------------------
+#    docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+#  Or let scripts/bootstrap.sh decide: it runs nvidia-smi and only adds this
+#  file when a GPU actually answers.
+#
+#  WHY THIS IS A SEPARATE FILE rather than part of docker-compose.yml: a device
+#  reservation for driver `nvidia` makes the container fail to start outright on a
+#  host without the NVIDIA Container Toolkit. Keeping it in an overlay means the
+#  base stack runs anywhere and the GPU path is a deliberate choice.
+#
+#  Requirements on the host:
+#    * an NVIDIA GPU with a current driver (`nvidia-smi` works)
+#    * the NVIDIA Container Toolkit, so Docker can pass the device through
+#      (on Docker Desktop for Windows this means WSL2 with a CUDA-capable driver)
+#
+#  Intel Arc / Iris Xe and Apple Silicon are NOT covered: the official
+#  ollama/ollama image ships CUDA and ROCm backends only. On that hardware Ollama
+#  runs on CPU, which is exactly the case LLM_PROVIDER=auto detects and routes
+#  around by making the hosted model primary.
+#
+#  Verify the GPU is really being used after starting:
+#    docker compose exec ollama nvidia-smi
+#    curl -s http://127.0.0.1:11434/api/ps | jq '.models[] | {name, size_vram}'
+#  size_vram greater than zero is the proof; a GPU that is present but not
+#  passed through shows zero here and the assistant will route to Azure.
+# ============================================================================
+
+services:
+  ollama:
+    environment:
+      # Offload every layer it can. Ollama silently keeps layers on the CPU when
+      # VRAM is short, which looks like "the GPU is not working"; check /api/ps.
+      OLLAMA_NUM_GPU: ${OLLAMA_NUM_GPU:-999}
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  ai-fde:
+    environment:
+      # A GPU makes the local open-source model the better primary: no keys, no
+      # data leaving the machine. Azure stays configured as the fallback.
+      LLM_PROVIDER: ollama
+      LLM_FALLBACK_PROVIDER: azure_openai
+      OLLAMA_GPU: "true"
+      # With GPU offload the local model answers in seconds, so it is worth
+      # waiting longer for it than the CPU default allows.
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-180}

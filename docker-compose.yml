@@ -1,0 +1,195 @@
+# ============================================================================
+#  TMS Ontology Platform - full stack
+#  ---------------------------------------------------------------------------
+#    docker compose up -d --build     bring everything up
+#    docker compose logs -f pipeline  watch ingestion + ontology generation
+#    docker compose run --rm pipeline python -m pipeline.run --force
+#
+#  Ports are bound to 127.0.0.1 only. Docker Desktop's ::1 proxy accepts
+#  connections and then hangs, which stops a browser opening "localhost" from
+#  falling back to IPv4 - the same problem ContractProcessing/docker-compose.yml
+#  documents.
+# ============================================================================
+
+name: tms-ontology
+
+services:
+  # ─── Postgres: raw tables, semantic views, ontology registry ──────────────
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ontology}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ontology}
+      POSTGRES_DB: ${POSTGRES_DB:-tms_ontology}
+      # Deterministic collation so ORDER BY in the UI matches ORDER BY in tests.
+      POSTGRES_INITDB_ARGS: "--locale=C --encoding=UTF8"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs in filename order, and only when the data directory is empty.
+      # `docker compose down -v` is the way to force a schema rebuild.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ontology} -d ${POSTGRES_DB:-tms_ontology}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  # ─── Ollama: hosts the open-source LLM ───────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      # Keeping the model resident avoids a 20-30 s cold load on every question.
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
+    ports:
+      - "127.0.0.1:${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ─── One-shot: pull the chat model so the first question is not a 404 ────
+  ollama-init:
+    image: ollama/ollama:latest
+    profiles: ["default", "llm"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_AUTO_PULL: ${OLLAMA_AUTO_PULL:-true}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ "$${OLLAMA_AUTO_PULL}" != "true" ]; then
+          echo "OLLAMA_AUTO_PULL=false - skipping model pull."; exit 0
+        fi
+        if ollama list 2>/dev/null | grep -q "$${OLLAMA_MODEL%%:*}"; then
+          echo "Model $${OLLAMA_MODEL} already present."; exit 0
+        fi
+        echo "Pulling $${OLLAMA_MODEL} (several GB on first run)..."
+        ollama pull "$${OLLAMA_MODEL}"
+    restart: "no"
+
+  # ─── Pipeline: api_responses -> raw -> views -> ontology -> lineage ──────
+  pipeline:
+    build:
+      context: ./services/pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ontology:ontology@postgres:5432/tms_ontology}
+      PIPELINE_SOURCE_DIR: ${PIPELINE_SOURCE_DIR:-/data/api_responses}
+      PIPELINE_SIMULATE_EXECUTION: ${PIPELINE_SIMULATE_EXECUTION:-true}
+      PIPELINE_SIM_SEED: ${PIPELINE_SIM_SEED:-20260919}
+      PIPELINE_FORCE_REINGEST: ${PIPELINE_FORCE_REINGEST:-false}
+      PIPELINE_LINK_MIN_MATCH_RATIO: ${PIPELINE_LINK_MIN_MATCH_RATIO:-0.05}
+    volumes:
+      # The captured TMS payloads, mounted read-only from the sibling folder.
+      - ../api_responses:/data/api_responses:ro
+    # Runs to completion and exits; the services below wait for that.
+    restart: "no"
+
+  # ─── Ontology service: @ontograph/core over the generated ontology ──────
+  ontology-service:
+    build:
+      context: ./services/ontology-service
+      additional_contexts:
+        # The vendored clone of github.com/openshuyi/ontograph-core, built from
+        # source inside the image rather than pulled from npm.
+        ontograph: ./vendor/ontograph-core
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pipeline:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ontology:ontology@postgres:5432/tms_ontology}
+      PORT: ${ONTOLOGY_SERVICE_PORT:-4000}
+      ONTOLOGY_MAX_PAGE_SIZE: ${ONTOLOGY_MAX_PAGE_SIZE:-500}
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:${ONTOLOGY_SERVICE_PORT:-4000}:${ONTOLOGY_SERVICE_PORT:-4000}"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:'+(process.env.PORT||4000)+'/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ─── AI-FDE: the assistant that reads the ontology and builds dashboards ─
+  ai-fde:
+    build:
+      context: ./services/ai-fde
+    restart: unless-stopped
+    depends_on:
+      ontology-service:
+        condition: service_healthy
+      # Started, not healthy: with Azure as primary the assistant must not wait on
+      # a multi-gigabyte model pull, and Ollama is only the fallback.
+      ollama:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ontology:ontology@postgres:5432/tms_ontology}
+      ONTOLOGY_SERVICE_URL: http://ontology-service:${ONTOLOGY_SERVICE_PORT:-4000}
+      PORT: ${AI_FDE_PORT:-4100}
+      # auto resolves from whether Ollama has GPU offload; see .env.example.
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
+      LLM_FALLBACK_COOLDOWN: ${LLM_FALLBACK_COOLDOWN:-300}
+      OLLAMA_GPU: ${OLLAMA_GPU:-}
+      AI_FDE_MAX_TOOL_ROUNDS: ${AI_FDE_MAX_TOOL_ROUNDS:-8}
+      AI_FDE_TEMPERATURE: ${AI_FDE_TEMPERATURE:-0.1}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-90}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_KEY: ${AZURE_OPENAI_KEY:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4.1}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
+      AZURE_OPENAI_TIMEOUT: ${AZURE_OPENAI_TIMEOUT:-120}
+    ports:
+      - "127.0.0.1:${AI_FDE_PORT:-4100}:${AI_FDE_PORT:-4100}"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','4100')+'/health',timeout=4).status==200 else 1)\""]
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 15s
+
+  # ─── UI: the ontology workbench ─────────────────────────────────────────
+  ui:
+    build:
+      context: ./services/ui
+    restart: unless-stopped
+    depends_on:
+      ontology-service:
+        condition: service_healthy
+    environment:
+      # nginx proxies /api/ontology -> ontology-service and /api/assistant ->
+      # ai-fde, so the browser only ever talks to one origin.
+      ONTOLOGY_SERVICE_URL: http://ontology-service:${ONTOLOGY_SERVICE_PORT:-4000}
+      AI_FDE_URL: http://ai-fde:${AI_FDE_PORT:-4100}
+    ports:
+      - "127.0.0.1:${UI_PORT:-3000}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  pgdata:
+  ollama:
