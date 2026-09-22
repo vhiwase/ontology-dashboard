@@ -172,3 +172,79 @@ def test_spend_outside_the_window_is_dropped():
     limiter._spend["user"].samples = [(time.time() - 25 * 3600, 90)]
     assert limiter.tokens_used("user") == 0
     limiter.check_budget("user")
+
+
+# ── citation validation ─────────────────────────────────────────────────────
+
+
+def _validate(reply: str, known: set[str]) -> tuple[str, int]:
+    """The server-side citation check, exercised without the HTTP layer.
+
+    Mirrors app.main._validate_citations. A citation whose path is not in the
+    corpus is downgraded to plain text: a reader checking the source is the
+    whole point of a citation, and a dead one is worse than none.
+    """
+    import re
+
+    pattern = re.compile(r":citation\[([^\]]+)\]\{([^}]*)\}")
+    dropped = 0
+
+    def check(match):
+        nonlocal dropped
+        title, attrs = match.group(1), match.group(2)
+        found = re.search(r'path="([^"]*)"', attrs)
+        if found and found.group(1) in known:
+            return match.group(0)
+        dropped += 1
+        return title
+
+    return pattern.sub(check, reply), dropped
+
+
+KNOWN = {"metric/on_time_pct", "platform/simulated-data"}
+
+
+def test_known_citation_survives():
+    reply = 'Simulated. :citation[On-Time]{path="metric/on_time_pct"}'
+    out, dropped = _validate(reply, KNOWN)
+    assert out == reply
+    assert dropped == 0
+
+
+def test_fabricated_citation_is_downgraded_to_plain_text():
+    reply = 'See :citation[Invented Page]{path="metric/does_not_exist"} for detail.'
+    out, dropped = _validate(reply, KNOWN)
+    assert dropped == 1
+    assert "does_not_exist" not in out
+    # The title survives as prose, so the sentence still reads.
+    assert out == "See Invented Page for detail."
+
+
+def test_section_attribute_is_preserved():
+    reply = ':citation[Simulated]{path="platform/simulated-data" section="What is simulated"}'
+    out, dropped = _validate(reply, KNOWN)
+    assert dropped == 0
+    assert 'section="What is simulated"' in out
+
+
+def test_mixed_reply_keeps_good_drops_bad():
+    reply = (
+        'Good :citation[A]{path="metric/on_time_pct"} '
+        'and bad :citation[B]{path="metric/nope"}.'
+    )
+    out, dropped = _validate(reply, KNOWN)
+    assert dropped == 1
+    assert "metric/on_time_pct" in out
+    assert "metric/nope" not in out
+
+
+def test_citation_without_a_path_is_downgraded():
+    out, dropped = _validate(':citation[No Path]{section="x"}', KNOWN)
+    assert dropped == 1
+    assert out == "No Path"
+
+
+def test_reply_with_no_citations_is_untouched():
+    reply = "On-time is 94%."
+    out, dropped = _validate(reply, KNOWN)
+    assert out == reply and dropped == 0

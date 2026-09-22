@@ -33,7 +33,7 @@ from typing import Any
 import psycopg
 
 from .config import CONFIG
-from .db import query, truncate, upsert_many
+from .db import delete_for_space, query, space_id, upsert_many
 from .introspect import ViewInfo
 from .relationships import DiscoveryResult
 
@@ -180,7 +180,22 @@ class LineageBuilder:
                 self.edge(source_rid, transform_rid, "flowsTo")
 
     def add_simulation(self) -> None:
-        """The execution simulation and the tables it writes, clearly labelled."""
+        """The execution simulation, where one exists.
+
+        It does not, since migration 0018 removed tms_sim: nothing in this
+        platform generates data any more. The method is kept because a lineage
+        graph that CANNOT represent generated data would be the wrong shape if
+        a future source ever needs it - but it now finds nothing and adds
+        nothing, rather than failing the run looking for a dropped table.
+        """
+        exists = query(
+            self.conn,
+            "SELECT 1 AS n FROM information_schema.tables "
+            "WHERE table_schema = 'tms_sim' AND table_name = 'sim_run'",
+        )
+        if not exists:
+            return
+
         run = query(
             self.conn,
             "SELECT sim_run_id, seed, created_at, notes FROM tms_sim.sim_run "
@@ -443,10 +458,14 @@ class LineageBuilder:
         kpis = query(
             self.conn,
             """
-            SELECT kpi_rid, api_name, label, source_view, category,
-                   depends_on_simulation, related_object_types
-            FROM platform.kpi_definition ORDER BY api_name
+            SELECT k.kpi_rid, k.api_name, k.label, k.source_view, k.category,
+                   k.depends_on_simulation, k.related_object_types
+              FROM platform.kpi_definition k
+              JOIN platform.space s ON s.space_id = k.space_id
+             WHERE s.slug = %s
+             ORDER BY k.api_name
             """,
+            (CONFIG.space,),
         )
         for row in kpis:
             rid = self.node(
@@ -503,17 +522,26 @@ class LineageBuilder:
     # ── persist ───────────────────────────────────────────────────────────
 
     def persist(self) -> dict[str, int]:
-        truncate(self.conn, ["platform.lineage_edge", "platform.lineage_node", "platform.lineage_column"])
+        # Per-space delete, not TRUNCATE: the graph belongs to the space that
+        # produced it, and wiping the table would take every other space's
+        # lineage with it.
+        space = space_id(self.conn, CONFIG.space)
+        delete_for_space(
+            self.conn,
+            ["platform.lineage_edge", "platform.lineage_node", "platform.lineage_column"],
+            space,
+        )
 
         upsert_many(
             self.conn,
             "platform.lineage_node",
             [
+                "space_id",
                 "lineage_node_rid", "node_type", "label", "description", "object_id",
                 "payload", "node_version", "layer", "created_by", "tags",
             ],
-            list(self.nodes.values()),
-            ["lineage_node_rid"],
+            [(space, *row) for row in self.nodes.values()],
+            ["space_id", "lineage_node_rid"],
         )
         # Edges whose endpoints were never registered would violate the FK; they
         # are dropped with a count rather than failing the whole stage.
@@ -522,16 +550,20 @@ class LineageBuilder:
         upsert_many(
             self.conn,
             "platform.lineage_edge",
-            ["lineage_edge_rid", "source_node_rid", "target_node_rid", "relation_type", "weight", "payload"],
-            valid_edges,
-            ["lineage_edge_rid"],
+            [
+                "space_id",
+                "lineage_edge_rid", "source_node_rid", "target_node_rid",
+                "relation_type", "weight", "payload",
+            ],
+            [(space, *row) for row in valid_edges],
+            ["space_id", "lineage_edge_rid"],
         )
         upsert_many(
             self.conn,
             "platform.lineage_column",
-            ["target_view", "target_column", "source_table", "source_column", "transform_note"],
-            self.columns,
-            ["target_view", "target_column", "source_table", "source_column"],
+            ["space_id", "target_view", "target_column", "source_table", "source_column", "transform_note"],
+            [(space, *row) for row in self.columns],
+            ["space_id", "target_view", "target_column", "source_table", "source_column"],
         )
 
         if dropped:

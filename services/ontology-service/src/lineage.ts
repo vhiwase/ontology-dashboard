@@ -1,5 +1,5 @@
 import { query, queryOne } from "./db";
-import { NotFound } from "./registry";
+import { currentSpace, NotFound } from "./registry";
 
 /**
  * Lineage queries over the graph the pipeline wrote.
@@ -84,22 +84,39 @@ function toEdge(row: EdgeRow): LineageEdge {
 	};
 }
 
+/**
+ * The lineage graph belongs to the space whose pipeline built it (0012), so
+ * every query here is filtered by the requesting space. A subquery on slug
+ * rather than a join keeps `SELECT *` returning exactly the node columns.
+ */
+const IN_SPACE = "space_id = (SELECT space_id FROM platform.space WHERE slug = $1)";
+
 export async function fetchGraph(layers?: string[]): Promise<LineageGraph> {
+	const space = currentSpace();
 	const nodeRows = layers && layers.length
-		? await query<NodeRow>("SELECT * FROM platform.lineage_node WHERE layer = ANY($1) ORDER BY layer, label", [layers])
-		: await query<NodeRow>("SELECT * FROM platform.lineage_node ORDER BY layer, label");
+		? await query<NodeRow>(
+				`SELECT * FROM platform.lineage_node WHERE ${IN_SPACE} AND layer = ANY($2) ORDER BY layer, label`,
+				[space, layers],
+			)
+		: await query<NodeRow>(
+				`SELECT * FROM platform.lineage_node WHERE ${IN_SPACE} ORDER BY layer, label`,
+				[space],
+			);
 
 	const ids = nodeRows.map((r) => r.lineage_node_rid);
 	// Only edges whose BOTH endpoints are in the requested slice: an edge dangling
 	// into a filtered-out layer would render as an arrow to nowhere.
 	const edgeRows = await query<EdgeRow>(
 		`SELECT * FROM platform.lineage_edge
-		  WHERE source_node_rid = ANY($1) AND target_node_rid = ANY($1)`,
-		[ids],
+		  WHERE ${IN_SPACE}
+		    AND source_node_rid = ANY($2) AND target_node_rid = ANY($2)`,
+		[space, ids],
 	);
 
 	const layerRows = await query<{ layer: string; n: string }>(
-		"SELECT layer, count(*)::bigint AS n FROM platform.lineage_node GROUP BY layer ORDER BY layer",
+		`SELECT layer, count(*)::bigint AS n FROM platform.lineage_node
+		  WHERE ${IN_SPACE} GROUP BY layer ORDER BY layer`,
+		[space],
 	);
 
 	return {
@@ -127,18 +144,19 @@ export async function trace(nodeId: string, options: TraceOptions = {}): Promise
 	const direction = options.direction ?? "both";
 	const maxDepth = options.maxDepth && options.maxDepth > 0 ? options.maxDepth : 12;
 
+	const space = currentSpace();
 	const originRow = await queryOne<NodeRow>(
-		"SELECT * FROM platform.lineage_node WHERE lineage_node_rid = $1",
-		[nodeId],
+		`SELECT * FROM platform.lineage_node WHERE ${IN_SPACE} AND lineage_node_rid = $2`,
+		[space, nodeId],
 	);
-	if (!originRow) throw new NotFound(`No lineage node '${nodeId}'.`);
+	if (!originRow) throw new NotFound(`No lineage node '${nodeId}' in the '${space}' space.`);
 
 	// The whole graph in one round trip, then walked in memory. Two queries beats
 	// one per ring, and the graph is small enough that loading it all is cheaper
 	// than a recursive CTE with a depth column.
 	const [allNodes, allEdges] = await Promise.all([
-		query<NodeRow>("SELECT * FROM platform.lineage_node"),
-		query<EdgeRow>("SELECT * FROM platform.lineage_edge"),
+		query<NodeRow>(`SELECT * FROM platform.lineage_node WHERE ${IN_SPACE}`, [space]),
+		query<EdgeRow>(`SELECT * FROM platform.lineage_edge WHERE ${IN_SPACE}`, [space]),
 	]);
 
 	const nodeById = new Map(allNodes.map((n) => [n.lineage_node_rid, n]));
@@ -224,8 +242,8 @@ export async function columnLineage(view: string): Promise<Array<Record<string, 
 	return query(
 		`SELECT target_view, source_table, source_column, transform_note
 		   FROM platform.lineage_column
-		  WHERE target_view = $1
+		  WHERE ${IN_SPACE} AND target_view = $2
 		  ORDER BY source_table, source_column`,
-		[view],
+		[currentSpace(), view],
 	);
 }

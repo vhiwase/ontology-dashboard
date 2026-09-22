@@ -127,9 +127,117 @@ export function DataTable({
  * shipping a parser plus a sanitiser for six constructs. Text is escaped first,
  * so nothing the model writes can inject markup.
  */
-export function Markdown({ text }: { text: string }) {
-	return <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }} />;
+/**
+ * Renders an assistant reply.
+ *
+ * `onResource` makes the :resource[kind:ref] directives clickable. The chips
+ * are emitted as buttons carrying data attributes and the click is handled by
+ * delegation on the container, because the body is set through
+ * dangerouslySetInnerHTML and React holds no handles on the nodes inside it.
+ */
+export function Markdown({
+	text,
+	onResource,
+	onCitation,
+}: {
+	text: string;
+	onResource?: (kind: string, ref: string) => void;
+	onCitation?: (path: string, section: string) => void;
+}) {
+	const host = useRef<HTMLDivElement>(null);
+	const html = renderMarkdown(text);
+
+	// Mermaid is loaded on demand and only when a reply actually contains a
+	// diagram. It is a large dependency and most answers are prose, so making
+	// every chat page pay for it up front would be the wrong trade.
+	useEffect(() => {
+		const blocks = host.current?.querySelectorAll<HTMLElement>(".mermaid-block[data-mermaid]");
+		if (!blocks || blocks.length === 0) return;
+
+		let cancelled = false;
+		void (async () => {
+			try {
+				const mermaid = (await import("mermaid")).default;
+				mermaid.initialize({
+					startOnLoad: false,
+					securityLevel: "strict",
+					theme: "dark",
+					fontFamily: "inherit",
+				});
+				for (const [index, node] of blocks.entries()) {
+					if (cancelled) return;
+					const source = node.dataset.mermaid ?? "";
+					try {
+						const { svg } = await mermaid.render(
+							`mmd-${Date.now().toString(36)}-${index}`,
+							source,
+						);
+						if (!cancelled) node.innerHTML = svg;
+					} catch (error) {
+						// A model can emit invalid mermaid. Showing the source beats
+						// showing nothing, and beats an exception taking the reply down.
+						node.innerHTML = "";
+						const pre = document.createElement("pre");
+						pre.className = "mermaid-failed";
+						pre.textContent = `Diagram could not be drawn.
+
+${source}`;
+						node.appendChild(pre);
+						void error;
+					}
+				}
+			} catch {
+				/* mermaid unavailable; the placeholders stay empty */
+			}
+		})();
+
+		return () => {
+			cancelled = true;
+		};
+	}, [html]);
+
+	return (
+		<div
+			ref={host}
+			className="md"
+			onClick={(event) => {
+				const element = event.target as HTMLElement;
+				const resource = element.closest<HTMLElement>("[data-resource-ref]");
+				if (resource && onResource) {
+					event.preventDefault();
+					onResource(resource.dataset.resourceKind ?? "", resource.dataset.resourceRef ?? "");
+					return;
+				}
+				const citation = element.closest<HTMLElement>("[data-citation-path]");
+				if (citation && onCitation) {
+					event.preventDefault();
+					onCitation(
+						citation.dataset.citationPath ?? "",
+						citation.dataset.citationSection ?? "",
+					);
+				}
+			}}
+			// biome-ignore lint/security/noDangerouslySetInnerHtml: renderMarkdown escapes first
+			dangerouslySetInnerHTML={{ __html: html }}
+		/>
+	);
 }
+
+/**
+ * Glyphs for the resource kinds an answer can reference. Kept in step with
+ * RESOURCE_SPECS so a chip in a reply and the same thing in the explorer read
+ * alike.
+ */
+const RESOURCE_GLYPHS: Record<string, string> = {
+	objectType: "◈",
+	linkType: "↔",
+	actionType: "⚡",
+	kpi: "Σ",
+	dataset: "▤",
+	dashboard: "▦",
+	pipeline: "⑄",
+	connection: "⛁",
+};
 
 function escapeHtml(text: string): string {
 	return text
@@ -139,12 +247,72 @@ function escapeHtml(text: string): string {
 		.replace(/"/g, "&quot;");
 }
 
+/**
+ * Resource directives: :resource[kind:ref]
+ *
+ * Applied BEFORE escaping would mangle the brackets, and emits already-escaped
+ * content, so the chip survives without opening a hole. An answer that names
+ * an object type now links to it instead of just spelling it.
+ */
+function resourceDirectives(text: string): string {
+	return text.replace(
+		/:resource\[([a-zA-Z]+):([^\]]+)\]/g,
+		(_whole, kind: string, ref: string) => {
+			const glyph = RESOURCE_GLYPHS[kind] ?? "▫";
+			const safeKind = escapeHtml(kind);
+			const safeRef = escapeHtml(ref.trim());
+			return (
+				`<button type="button" class="res-chip" data-resource-kind="${safeKind}" ` +
+				`data-resource-ref="${safeRef}" title="Open ${safeRef}">` +
+				`<span aria-hidden="true">${glyph}</span>${safeRef}</button>`
+			);
+		},
+	);
+}
+
+/**
+ * Citation directives: :citation[Title]{path="..." section="..."}
+ *
+ * Rendered as a superscript marker rather than a chip, because a citation
+ * annotates a claim while a resource chip IS the subject of one. Making them
+ * look alike would blur that.
+ */
+function citationDirectives(text: string): string {
+	return text.replace(
+		/:citation\[([^\]]+)\]\{([^}]*)\}/g,
+		(_whole, title: string, attrs: string) => {
+			const path = /path="([^"]*)"/.exec(attrs)?.[1] ?? "";
+			const section = /section="([^"]*)"/.exec(attrs)?.[1] ?? "";
+			if (!path) return escapeHtml(title);
+			const label = section ? `${title} · ${section}` : title;
+			return (
+				`<button type="button" class="cite" data-citation-path="${escapeHtml(path)}" ` +
+				`data-citation-section="${escapeHtml(section)}" title="${escapeHtml(label)}">` +
+				`<span aria-hidden="true">§</span>${escapeHtml(title)}</button>`
+			);
+		},
+	);
+}
+
 function inline(text: string): string {
-	return escapeHtml(text)
+	// Directives are extracted to placeholders first so escapeHtml does not
+	// destroy the markup they produce.
+	const chips: string[] = [];
+	const withPlaceholders = citationDirectives(resourceDirectives(text)).replace(
+		/<button type="button" class="(?:res-chip|cite)"[\s\S]*?<\/button>/g,
+		(chip) => {
+			chips.push(chip);
+			return `[[CHIP${chips.length - 1}]]`;
+		},
+	);
+
+	const rendered = escapeHtml(withPlaceholders)
 		.replace(/`([^`]+)`/g, "<code>$1</code>")
 		.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
 		.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
 		.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+
+	return rendered.replace(/\[\[CHIP(\d+)\]\]/g, (_m, i) => chips[Number(i)] ?? "");
 }
 
 export function renderMarkdown(source: string): string {
@@ -157,6 +325,7 @@ export function renderMarkdown(source: string): string {
 
 		// Fenced code.
 		if (line.trim().startsWith("```")) {
+			const fence = line.trim().slice(3).trim();
 			const body: string[] = [];
 			index += 1;
 			while (index < lines.length && !(lines[index] ?? "").trim().startsWith("```")) {
@@ -164,7 +333,16 @@ export function renderMarkdown(source: string): string {
 				index += 1;
 			}
 			index += 1;
-			out.push(`<pre><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+			// A mermaid fence is a diagram, not a code sample. It becomes a
+			// placeholder that the Markdown component draws into after mount,
+			// because mermaid needs a real DOM node to render against.
+			if (fence.toLowerCase() === "mermaid") {
+				out.push(
+					`<div class="mermaid-block" data-mermaid="${escapeHtml(body.join("\n"))}"></div>`,
+				);
+			} else {
+				out.push(`<pre><code>${escapeHtml(body.join("\n"))}</code></pre>`);
+			}
 			continue;
 		}
 
@@ -279,6 +457,43 @@ export function CoverageBanner({ notes }: { notes: string[] }) {
 					))}
 				</ul>
 			)}
+		</div>
+	);
+}
+
+/**
+ * What an ontology page shows in a space nothing has been published to.
+ *
+ * The ontology is produced by a pipeline, and pipelines belong to a space, so
+ * the object types, links, actions, metrics and lineage in a space are the
+ * ones its own pipeline published. A space nobody has published to has none —
+ * and saying so is the honest answer. Borrowing the sandbox's, which is what
+ * this page used to do, presented unreviewed work as though it were live in
+ * an environment it had never been promoted to.
+ */
+export function NoOntologyHere({
+	what,
+	spaceName,
+}: {
+	what: string;
+	spaceName: string;
+}) {
+	return (
+		<div className="empty-space">
+			<div className="empty-space-mark" aria-hidden>
+				◈
+			</div>
+			<h3>
+				No {what} in {spaceName}
+			</h3>
+			<p>
+				No ontology has been published to this space yet. One arrives when a pipeline runs
+				here, or when a version is promoted from another space.
+			</p>
+			<p className="empty-space-hint">
+				The sandbox holds the ontology built so far — switch to it in the space selector
+				above.
+			</p>
 		</div>
 	);
 }

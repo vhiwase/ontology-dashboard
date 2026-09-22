@@ -15,6 +15,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import { ResourcePreview } from "../components/spaces/ResourcePreview";
+import { FunctionReview } from "../components/functions/FunctionReview";
+import { useSpace } from "../SpaceContext";
 import {
 	type AssistantHealth,
 	type ChatArtifact,
@@ -37,6 +40,9 @@ interface Turn {
 		model: string;
 		stoppedBecause: string;
 		failoverReason?: string | null;
+		tokens?: number;
+		costUsd?: number;
+		priced?: boolean;
 	};
 }
 
@@ -76,6 +82,22 @@ export function Assistant() {
 	// Pinned per conversation rather than per turn, so a thread does not
 	// silently change model half way through.
 	const [provider, setProvider] = useState<string | null>(null);
+	const { spaceSlug } = useSpace();
+	// The resource a chip in a reply opened. An answer that names an object
+	// type should be able to show it, not just spell it.
+	const [previewId, setPreviewId] = useState<number | null>(null);
+	// A metric the assistant drafted, opened for review from the chat. The
+	// dialog lives on the page rather than inside the artifact so it survives
+	// the turn list re-rendering underneath it.
+	const [reviewFunction, setReviewFunction] = useState<string | null>(null);
+	// The cited document being read, if any.
+	const [doc, setDoc] = useState<{
+		path: string;
+		title: string;
+		category: string;
+		sections: Array<{ title: string; body: string }>;
+		focus: string;
+	} | null>(null);
 	const scrollRef = useScrollToBottom(turns.length + (busy ? 1 : 0));
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -101,6 +123,42 @@ export function Assistant() {
 
 	const selected = catalogue?.providers.find((p) => p.id === provider) ?? null;
 
+	// A conversation belongs to one space, so changing space starts a new one
+	// rather than carrying the old thread across an environment boundary.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset
+	useEffect(() => {
+		setTurns([]);
+		setSessionId(null);
+	}, [spaceSlug]);
+
+	/** Open the workspace resource a :resource[kind:ref] chip refers to. */
+	const openResource = async (kind: string, ref: string) => {
+		try {
+			const found = await api.get<{ id: number } | null>(
+				`/api/resources/lookup?kind=${encodeURIComponent(kind)}&ref=${encodeURIComponent(ref)}&space=${spaceSlug}`,
+			);
+			if (found?.id) setPreviewId(found.id);
+			else setError(`${ref} is not registered as a resource in this space.`);
+		} catch {
+			setError("Could not open that resource.");
+		}
+	};
+
+	/** Open a cited document, scrolled to the section that was cited. */
+	const openCitation = async (path: string, section: string) => {
+		try {
+			const page = await api.get<{
+				path: string;
+				title: string;
+				category: string;
+				sections: Array<{ title: string; body: string }>;
+			}>(`/api/docs/page/${path}`);
+			setDoc({ ...page, focus: section });
+		} catch {
+			setError(`Could not open the document '${path}'.`);
+		}
+	};
+
 	const send = async (message: string) => {
 		const trimmed = message.trim();
 		if (!trimmed || busy) return;
@@ -113,6 +171,8 @@ export function Assistant() {
 			const response = await api.post<ChatResponse>("/api/assistant/chat", {
 				message: trimmed,
 				sessionId,
+				// The conversation belongs to the space it was started in.
+				spaceSlug,
 				// Omitted while the catalogue is still loading, which leaves the
 				// server on its configured chain rather than guessing here.
 				...(provider ? { provider } : {}),
@@ -131,6 +191,9 @@ export function Assistant() {
 						model: response.model,
 						stoppedBecause: response.stoppedBecause,
 						failoverReason: response.failoverReason,
+						tokens: response.cost?.totalTokens,
+						costUsd: response.cost?.usd,
+						priced: response.cost?.priced,
 					},
 				},
 			]);
@@ -216,7 +279,14 @@ export function Assistant() {
 				)}
 
 				{turns.map((turn, index) => (
-					<TurnView key={index} turn={turn} />
+					<TurnView
+						key={index}
+						turn={turn}
+						onResource={openResource}
+						onCitation={openCitation}
+						onAnswer={(answer) => void send(answer)}
+						onReviewFunction={setReviewFunction}
+					/>
 				))}
 
 				{busy && (
@@ -308,11 +378,91 @@ export function Assistant() {
 					)}
 				</div>
 			</div>
+
+			<ResourcePreview resourceId={previewId} onClose={() => setPreviewId(null)} />
+
+			<FunctionReview
+				apiName={reviewFunction}
+				onClose={() => setReviewFunction(null)}
+				onApproved={(fn) => {
+					// Say what changed, in the conversation where it was asked for.
+					setTurns((current) => [
+						...current,
+						{
+							role: "assistant",
+							content:
+								`**${fn.name}** is approved and active. You can use it in a dashboard now, ` +
+								`or ask me to build one with it.`,
+						},
+					]);
+				}}
+			/>
+
+			{doc && (
+				<div
+					className="rp-backdrop"
+					onMouseDown={(event) => {
+						if (event.target === event.currentTarget) setDoc(null);
+					}}
+				>
+					<div className="rp" role="dialog" aria-label={doc.title}>
+						<header className="rp-head">
+							<span className="rp-glyph" aria-hidden>
+								§
+							</span>
+							<div className="rp-heading">
+								<div className="rp-kind">{doc.category.toUpperCase()}</div>
+								<h2 className="rp-title">{doc.title}</h2>
+							</div>
+							<span className="rp-rows mono">{doc.path}</span>
+							<button className="btn sm" onClick={() => setDoc(null)} aria-label="Close">
+								✕
+							</button>
+						</header>
+						<div className="rp-body">
+							{doc.sections.map((section) => (
+								<section
+									key={section.title}
+									/* The cited section is highlighted, so a citation lands on
+									   the sentence it was making rather than the top of a page. */
+									className={`doc-section ${section.title === doc.focus ? "cited" : ""}`}
+								>
+									<h4>{section.title}</h4>
+									<p>{section.body}</p>
+								</section>
+							))}
+						</div>
+					</div>
+				</div>
+			)}
 		</div>
 	);
 }
 
-function TurnView({ turn }: { turn: Turn }) {
+function TurnView({
+	turn,
+	onResource,
+	onCitation,
+	onAnswer,
+	onReviewFunction,
+}: {
+	turn: Turn;
+	/** Opens the workspace resource a :resource[...] chip names. */
+	onResource: (kind: string, ref: string) => void;
+	/** Opens the document a :citation[...] marker refers to. */
+	onCitation: (path: string, section: string) => void;
+	/** Sends the user's pick when the assistant asked for clarification. */
+	onAnswer: (answer: string) => void;
+	/** Opens the review dialog for a metric the assistant drafted. */
+	onReviewFunction?: (apiName: string) => void;
+}) {
+	// A clarification arrives as an artifact rather than prose, so the options
+	// stay structured instead of being parsed back out of a sentence.
+	const clarification = turn.artifacts?.find(
+		(artifact) => artifact.kind === "clarification",
+	) as
+		| { question?: string; options?: Array<{ label: string; detail?: string }>; allowFreeText?: boolean }
+		| undefined;
 	const [showTools, setShowTools] = useState(false);
 
 	if (turn.role === "user") {
@@ -330,12 +480,44 @@ function TurnView({ turn }: { turn: Turn }) {
 		<div className="msg assistant">
 			<div className="avatar">AI</div>
 			<div className="body">
-				<Markdown text={turn.content} />
+				{clarification ? (
+					/* The assistant asked rather than guessed. Its options are the
+					   answer, so they are buttons: picking one is far less work than
+					   retyping the question's terms. */
+					<div className="clarify">
+						<p className="clarify-q">{String(clarification.question ?? turn.content)}</p>
+						<div className="clarify-options">
+							{(clarification.options as Array<{ label: string; detail?: string }>).map(
+								(option) => (
+									<button
+										key={option.label}
+										className="clarify-option"
+										onClick={() => onAnswer(option.label)}
+									>
+										<span className="clarify-label">{option.label}</span>
+										{option.detail && <span className="muted">{option.detail}</span>}
+									</button>
+								),
+							)}
+						</div>
+						{clarification.allowFreeText !== false && (
+							<p className="muted clarify-hint">
+								Or answer in your own words below.
+							</p>
+						)}
+					</div>
+				) : (
+					<Markdown text={turn.content} onResource={onResource} onCitation={onCitation} />
+				)}
 
 				{turn.artifacts && turn.artifacts.length > 0 && (
 					<div className="col" style={{ gap: 10, marginTop: 10 }}>
 						{turn.artifacts.map((artifact, index) => (
-							<ArtifactView key={index} artifact={artifact} />
+							<ArtifactView
+								key={index}
+								artifact={artifact}
+								onReviewFunction={onReviewFunction}
+							/>
 						))}
 					</div>
 				)}
@@ -382,6 +564,15 @@ function TurnView({ turn }: { turn: Turn }) {
 						{(turn.meta.latencyMs / 1000).toFixed(1)}s · {turn.meta.model}
 						{turn.meta.stoppedBecause !== "answered" && ` · ${turn.meta.stoppedBecause}`}
 						{turn.meta.failoverReason && " · answered by the fallback model"}
+						{/* Tokens and cost per turn, so the price of a question is visible
+						    where the question was asked rather than only in a report.
+						    A turn on an unpriced provider says so instead of showing $0. */}
+						{turn.meta.tokens ? ` · ${turn.meta.tokens.toLocaleString("en-US")} tokens` : ""}
+						{turn.meta.priced === false
+							? " · unpriced model"
+							: turn.meta.costUsd !== undefined
+								? ` · $${turn.meta.costUsd < 0.01 ? turn.meta.costUsd.toFixed(6) : turn.meta.costUsd.toFixed(4)}`
+								: ""}
 					</div>
 				)}
 			</div>
@@ -389,7 +580,194 @@ function TurnView({ turn }: { turn: Turn }) {
 	);
 }
 
-function ArtifactView({ artifact }: { artifact: ChatArtifact }) {
+/**
+ * The decision card for a drafted pipeline.
+ *
+ * Its own component because it holds state - a card that has been accepted
+ * should say so rather than keep offering the button, and the artifact list
+ * re-renders around it.
+ */
+function PipelineProposalCard({
+	pipeline,
+	compiled,
+}: {
+	pipeline: {
+		slug: string;
+		name: string;
+		description: string | null;
+		graph: { nodes: Array<{ id: string; kind: string; name: string }> };
+		acceptedBy: string | null;
+	};
+	compiled: Array<{ node: string; ok: boolean; detail: string }>;
+}) {
+	const [state, setState] = useState<"pending" | "accepted" | "rejected">(
+		pipeline.acceptedBy ? "accepted" : "pending",
+	);
+	const [busy, setBusy] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const nodes = pipeline.graph?.nodes ?? [];
+
+	async function decide(action: "accept" | "reject") {
+		setBusy(true);
+		setError(null);
+		try {
+			if (action === "accept") {
+				await api.post(`/api/pipelines/${pipeline.slug}/accept`);
+				setState("accepted");
+			} else {
+				await api.del(`/api/pipelines/${pipeline.slug}`);
+				setState("rejected");
+			}
+		} catch (exc) {
+			setError((exc as Error).message);
+		} finally {
+			setBusy(false);
+		}
+	}
+
+	return (
+		<div className="card fn-proposal-card">
+			<div className="row" style={{ gap: 8, alignItems: "flex-start" }}>
+				<span className="rp-glyph" aria-hidden>
+					⑄
+				</span>
+				<div style={{ minWidth: 0, flex: "1 1 auto" }}>
+					<div className="row" style={{ gap: 6 }}>
+						<strong>{pipeline.name}</strong>
+						<span className={`chip ${state === "accepted" ? "good" : state === "rejected" ? "bad" : "warn"}`}>
+							{state === "accepted" ? "accepted" : state === "rejected" ? "rejected" : "proposed"}
+						</span>
+						<span className="chip mono">{nodes.length} nodes</span>
+					</div>
+					<p className="muted" style={{ margin: "3px 0 0", fontSize: 11.5 }}>
+						{pipeline.description || "No description."}
+					</p>
+
+					{/* The graph as a line, which is how a pipeline reads. */}
+					<p className="mono" style={{ margin: "6px 0 0", fontSize: 11 }}>
+						{nodes.map((node) => node.name).join("  →  ")}
+					</p>
+
+					{/* Anything the compiler flagged. A node that compiles but
+					    computes nothing is the failure worth surfacing here. */}
+					{compiled
+						.filter((entry) => !entry.ok || entry.detail.includes("computes nothing"))
+						.map((entry) => (
+							<p
+								key={entry.node}
+								className="muted"
+								style={{ margin: "4px 0 0", fontSize: 11 }}
+							>
+								⚠ {entry.node}: {entry.detail}
+							</p>
+						))}
+
+					{error && (
+						<p className="muted" style={{ margin: "5px 0 0", fontSize: 11, color: "var(--bad)" }}>
+							{error}
+						</p>
+					)}
+
+					<p className="muted" style={{ margin: "5px 0 0", fontSize: 11 }}>
+						{state === "accepted"
+							? "Accepted. You can run it from the Pipeline builder."
+							: state === "rejected"
+								? "Rejected and removed."
+								: "Nothing has run. Accepting makes it runnable."}
+					</p>
+				</div>
+
+				<div className="col" style={{ gap: 5, marginLeft: "auto" }}>
+					{state === "pending" && (
+						<>
+							<button className="btn sm primary" onClick={() => decide("accept")} disabled={busy}>
+								Accept
+							</button>
+							<Link className="btn sm" to="/pipeline">
+								Edit
+							</Link>
+							<button className="btn sm ghost" onClick={() => decide("reject")} disabled={busy}>
+								Reject
+							</button>
+						</>
+					)}
+					{state === "accepted" && (
+						<Link className="btn sm primary" to="/pipeline">
+							Open
+						</Link>
+					)}
+				</div>
+			</div>
+		</div>
+	);
+}
+
+function ArtifactView({
+	artifact,
+	onReviewFunction,
+}: {
+	artifact: ChatArtifact;
+	onReviewFunction?: (apiName: string) => void;
+}) {
+	// A drafted pipeline. Accept / Edit / Reject, as §18 asks - and the graph
+	// is summarised inline so the decision can be made without leaving the
+	// conversation for a canvas.
+	if (artifact.kind === "pipelineProposal") {
+		const pipeline = artifact.pipeline as {
+			slug: string;
+			name: string;
+			description: string | null;
+			graph: { nodes: Array<{ id: string; kind: string; name: string }> };
+			acceptedBy: string | null;
+		};
+		const compiled = (artifact.compiled as Array<{ node: string; ok: boolean; detail: string }>) ?? [];
+		return (
+			<PipelineProposalCard pipeline={pipeline} compiled={compiled} />
+		);
+	}
+
+	// A drafted metric. Deliberately not rendered as a finished result: it
+	// computes nothing until someone approves it, so the card is an invitation
+	// to review rather than a report of something done.
+	if (artifact.kind === "functionProposal") {
+		const fn = artifact.function as {
+			apiName: string;
+			name: string;
+			description: string | null;
+			returns: string;
+			readsViews: string[];
+		};
+		return (
+			<div className="card fn-proposal-card">
+				<div className="row" style={{ gap: 8, alignItems: "flex-start" }}>
+					<span className="rp-glyph" aria-hidden>
+						ƒ
+					</span>
+					<div style={{ minWidth: 0, flex: "1 1 auto" }}>
+						<div className="row" style={{ gap: 6 }}>
+							<strong>{fn.name}</strong>
+							<span className="chip warn">proposed</span>
+							<span className="chip mono">{fn.returns}</span>
+						</div>
+						<p className="muted" style={{ margin: "3px 0 0", fontSize: 11.5 }}>
+							{fn.description || "No description."}
+						</p>
+						<p className="muted" style={{ margin: "5px 0 0", fontSize: 11 }}>
+							Reads {fn.readsViews?.join(", ") || "nothing detected"} · not usable until approved
+						</p>
+					</div>
+					<button
+						className="btn sm primary"
+						style={{ marginLeft: "auto" }}
+						onClick={() => onReviewFunction?.(fn.apiName)}
+					>
+						Review &amp; approve
+					</button>
+				</div>
+			</div>
+		);
+	}
+
 	if (artifact.kind === "dashboard") {
 		return (
 			<div className="card" style={{ background: "var(--surface-2)" }}>

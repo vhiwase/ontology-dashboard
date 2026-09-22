@@ -45,6 +45,9 @@ import {
 } from "../components/pipeline/PipelineNodeCard";
 import { NODE_SPECS, type NodeKind } from "../components/pipeline/nodeTypes";
 import { ErrorBanner, Spinner } from "../components/common";
+import { ResourcePreview } from "../components/spaces/ResourcePreview";
+import type { ResourceKind } from "../components/spaces/resourceKinds";
+import { envTone, useSpace } from "../SpaceContext";
 
 // ── the document ────────────────────────────────────────────────────────────
 
@@ -102,7 +105,16 @@ function starterGraph(): Graph {
 				name: "TMS Postgres",
 				description: "The captured TMS snapshot this platform reads.",
 				position: { x: 40, y: 160 },
-				config: { system: "PostgreSQL", connection: "postgres:5432/tms_ontology" },
+				// A view is named, not just a connection: since the execution
+				// engine landed, a source with no view has nothing to read, and a
+				// brand-new pipeline that fails on its first node is a poor start.
+				// v_order is the strongest source available - 90 of 90 rows from
+				// the captured snapshot.
+				config: {
+					system: "PostgreSQL",
+					connection: "postgres:5432/tms_ontology",
+					sourceView: "tms_views.v_order",
+				},
 			},
 		],
 		edges: [],
@@ -121,8 +133,11 @@ function PipelineBuilderInner() {
 	const [pipelines, setPipelines] = useState<PipelineRecord[] | null>(null);
 	const [slug, setSlug] = useState<string | null>(null);
 	const [name, setName] = useState("Untitled pipeline");
-	const [environment, setEnvironment] = useState("development");
+
 	const [version, setVersion] = useState(1);
+	// The resource whose preview window is open, looked up from the selected
+	// node's target so the same popup serves the explorer and the canvas.
+	const [previewId, setPreviewId] = useState<number | null>(null);
 	const [graph, setGraph] = useState<Graph>(EMPTY_GRAPH);
 	const [palette, setPalette] = useState<Palette | null>(null);
 	const [report, setReport] = useState<ValidationReport | null>(null);
@@ -137,6 +152,7 @@ function PipelineBuilderInner() {
 	const [notice, setNotice] = useState<string | null>(null);
 
 	const { fitView, setCenter } = useReactFlow();
+	const { space, spaceSlug } = useSpace();
 
 	// Whole-graph snapshots. past/future hold documents, not commands.
 	const past = useRef<Graph[]>([]);
@@ -149,7 +165,7 @@ function PipelineBuilderInner() {
 
 	useEffect(() => {
 		Promise.all([
-			api.get<PipelineRecord[]>("/api/pipelines"),
+			api.get<PipelineRecord[]>(`/api/pipelines?space=${spaceSlug}`),
 			api.get<Palette>("/api/pipelines/palette"),
 		])
 			.then(([list, pal]) => {
@@ -166,17 +182,42 @@ function PipelineBuilderInner() {
 				}
 			})
 			.catch((exc: Error) => setError(exc.message));
-		// openPipeline is stable for this purpose; re-running on it would reload.
+		// Reloads when the space changes: a pipeline belongs to one space, so
+		// switching space must show that space's pipelines rather than leave the
+		// previous one's graph on the canvas.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [spaceSlug]);
+
+	/**
+	 * Start a fresh pipeline.
+	 *
+	 * Deliberately does not save: an unsaved draft costs nothing and a Save
+	 * button that has not been pressed is a clearer signal than a row appearing
+	 * in the list before anyone decided to keep it.
+	 */
+	const newPipeline = useCallback(() => {
+		setError(null);
+		setSlug(null);
+		setName("Untitled pipeline");
+		setVersion(1);
+		setGraph(starterGraph());
+		setReport(null);
+		setSelectedId(null);
+		setRuns([]);
+		setActiveRun(null);
+		setDirty(true);
+		past.current = [];
+		future.current = [];
 	}, []);
 
 	const openPipeline = useCallback(async (next: string) => {
 		setError(null);
 		try {
-			const record = await api.get<PipelineRecord>(`/api/pipelines/${next}`);
+			const record = await api.get<PipelineRecord>(
+				`/api/pipelines/${next}?space=${spaceSlug}`,
+			);
 			setSlug(record.slug);
 			setName(record.name);
-			setEnvironment(record.environment);
 			setVersion(record.version);
 			setGraph(record.graph ?? EMPTY_GRAPH);
 			setReport(record.validation);
@@ -184,13 +225,13 @@ function PipelineBuilderInner() {
 			setDirty(false);
 			past.current = [];
 			future.current = [];
-			const history = await api.get<Run[]>(`/api/pipelines/${next}/runs`);
+			const history = await api.get<Run[]>(`/api/pipelines/${next}/runs?space=${spaceSlug}`);
 			setRuns(history);
 			setActiveRun(history[0] ?? null);
 		} catch (exc) {
 			setError(exc instanceof ApiError ? exc.message : String(exc));
 		}
-	}, []);
+	}, [spaceSlug]);
 
 	// ── editing ─────────────────────────────────────────────────────────────
 
@@ -362,7 +403,7 @@ function PipelineBuilderInner() {
 			const saved = await api.post<PipelineRecord>("/api/pipelines", {
 				slug: slug ?? undefined,
 				name,
-				environment,
+				spaceSlug,
 				graph,
 			});
 			setSlug(saved.slug);
@@ -370,22 +411,22 @@ function PipelineBuilderInner() {
 			setReport(saved.validation);
 			setDirty(false);
 			setNotice(`Saved as version ${saved.version}.`);
-			setPipelines(await api.get<PipelineRecord[]>("/api/pipelines"));
+			setPipelines(await api.get<PipelineRecord[]>(`/api/pipelines?space=${spaceSlug}`));
 		} catch (exc) {
 			setNotice(exc instanceof ApiError ? exc.message : "Save failed.");
 		} finally {
 			setBusy(false);
 		}
-	}, [readOnly, slug, name, environment, graph]);
+	}, [readOnly, slug, name, spaceSlug, graph]);
 
 	const run = useCallback(async () => {
 		if (!slug || readOnly) return;
 		setBusy(true);
 		setNotice(null);
 		try {
-			const result = await api.post<Run>(`/api/pipelines/${slug}/run`);
+			const result = await api.post<Run>(`/api/pipelines/${slug}/run?space=${spaceSlug}`);
 			setActiveRun(result);
-			setRuns(await api.get<Run[]>(`/api/pipelines/${slug}/runs`));
+			setRuns(await api.get<Run[]>(`/api/pipelines/${slug}/runs?space=${spaceSlug}`));
 			setBottomOpen(true);
 			setNotice(`Run #${result.id} finished in ${result.durationMs}ms.`);
 		} catch (exc) {
@@ -394,7 +435,7 @@ function PipelineBuilderInner() {
 		} finally {
 			setBusy(false);
 		}
-	}, [slug, readOnly]);
+	}, [slug, readOnly, spaceSlug]);
 
 	// ── keyboard ────────────────────────────────────────────────────────────
 
@@ -433,7 +474,12 @@ function PipelineBuilderInner() {
 	// ── derived view state ──────────────────────────────────────────────────
 
 	const issues: Issue[] = useMemo(
-		() => (report ? [...report.errors, ...report.warnings] : []),
+		// Defensive on purpose. A stored pipeline whose validation is {} - a
+		// seeded row, or one written before validation had this shape - used to
+		// blank the entire page with "errors is not iterable". A record the UI
+		// cannot fully understand should degrade to "not validated", never take
+		// the builder down.
+		() => [...(report?.errors ?? []), ...(report?.warnings ?? [])],
 		[report],
 	);
 
@@ -548,6 +594,99 @@ function PipelineBuilderInner() {
 		.map((edge) => graph.nodes.find((n) => n.id === edge.target))
 		.filter(Boolean) as GraphNode[];
 
+	/**
+	 * Register an Object Type node's backing view as a dataset in the sandbox.
+	 *
+	 * This is the step that turns a drawn pipeline into something addressable:
+	 * until now the graph described how data becomes an ontology but produced
+	 * no artefact anyone could open or build on. The view comes from the
+	 * palette entry for the chosen object type, so the dataset always points at
+	 * a view the ontology actually publishes.
+	 */
+	const createDatasetFromNode = useCallback(
+		async (node: { id: string; name: string; config: Record<string, unknown> }) => {
+			const apiName = String(node.config?.objectType ?? "");
+			const entry = palette?.objectTypes.find((item) => item.apiName === apiName);
+			const sourceView = String(entry?.sourceView ?? "");
+			if (!sourceView) {
+				setNotice(`${apiName || node.name} has no backing view in the published ontology.`);
+				return;
+			}
+
+			setBusy(true);
+			setNotice(null);
+			try {
+				const projects = await api.get<Array<{ slug: string }>>("/api/spaces/sandbox/projects");
+				const project = projects[0];
+				if (!project) {
+					setNotice(
+						"The sandbox has no project yet. Open Spaces and fill it from the ontology first.",
+					);
+					return;
+				}
+				const created = await api.post<{ id: number; name: string }>(
+					`/api/spaces/sandbox/projects/${project.slug}/datasets`,
+					{
+						name: `${apiName.toLowerCase()}_from_${slug ?? "pipeline"}`,
+						description: `Registered from the ${name} pipeline, node ${node.name}.`,
+						sourceView,
+						pipelineSlug: slug,
+						nodeId: node.id,
+					},
+				);
+				setNotice(`Dataset “${created.name}” registered in Sandbox / ${project.slug}.`);
+			} catch (exc) {
+				setNotice(exc instanceof ApiError ? exc.message : "Could not register the dataset.");
+			} finally {
+				setBusy(false);
+			}
+		},
+		[palette, slug, name],
+	);
+
+	/**
+	 * Open the preview window for what a node points at.
+	 *
+	 * The canvas knows the thing by api_name; the preview window is keyed on a
+	 * resource id, so the lookup bridges them. A node pointing at something
+	 * never registered as a resource simply says so rather than opening an
+	 * empty window.
+	 */
+	const openResourcePreview = useCallback(
+		// Narrowed to what it actually reads, so it accepts both a GraphNode
+		// from the canvas and the inspector's lighter InspectorNode.
+		async (node: { kind: NodeKind; name: string; config: Record<string, unknown> }) => {
+			const map: Partial<Record<NodeKind, { kind: ResourceKind; key: string }>> = {
+				objectType: { kind: "objectType", key: "objectType" },
+				linkType: { kind: "linkType", key: "linkType" },
+				actionType: { kind: "actionType", key: "actionType" },
+			};
+			const entry = map[node.kind];
+			if (!entry) {
+				setNotice(`${node.name} is not backed by a workspace resource.`);
+				return;
+			}
+			const ref = String(node.config?.[entry.key] ?? "");
+			if (!ref) {
+				setNotice(`${node.name} has nothing configured to preview yet.`);
+				return;
+			}
+			try {
+				const found = await api.get<{ id: number } | null>(
+					`/api/resources/lookup?kind=${entry.kind}&ref=${encodeURIComponent(ref)}&space=${spaceSlug}`,
+				);
+				if (found?.id) setPreviewId(found.id);
+				else
+					setNotice(
+						`${ref} is not registered as a resource in this space. Open Spaces and fill the sandbox from the ontology.`,
+					);
+			} catch {
+				setNotice("Could not open the preview.");
+			}
+		},
+		[spaceSlug],
+	);
+
 	const focusNode = useCallback(
 		(nodeId: string) => {
 			const node = graph.nodes.find((n) => n.id === nodeId);
@@ -590,7 +729,10 @@ function PipelineBuilderInner() {
 					className="builder-select"
 					value={slug ?? ""}
 					onChange={(event) => {
+						// The empty value is the "new pipeline" option. It used to be
+						// skipped by this guard, so choosing it silently did nothing.
 						if (event.target.value) void openPipeline(event.target.value);
+						else newPipeline();
 					}}
 					aria-label="Open pipeline"
 				>
@@ -602,29 +744,36 @@ function PipelineBuilderInner() {
 					))}
 				</select>
 
-				<select
-					className="builder-select"
-					value={environment}
-					disabled={readOnly}
-					onChange={(event) => {
-						setEnvironment(event.target.value);
-						setDirty(true);
-					}}
-					aria-label="Environment"
+				<button
+					className="btn sm"
+					onClick={newPipeline}
+					title="Start a new pipeline. Nothing is saved until you press Save."
 				>
-					<option value="development">Development</option>
-					<option value="staging">Staging</option>
-					<option value="production">Production</option>
-				</select>
+					+ New
+				</button>
+
+				{/* Not a separate control any more. The environment is a property of
+				    the space, which is chosen once in the top bar — having both meant
+				    a pipeline could say "Development" while the workspace said
+				    "Sandbox", with nothing reconciling the two. */}
+				<span
+					className={`builder-space ${envTone(space?.environment)}`}
+					title={`This pipeline lives in the ${space?.name ?? spaceSlug} space. Switch space in the top bar.`}
+				>
+					{space?.name ?? spaceSlug}
+				</span>
 
 				<span className={`builder-status ${statusTone}`}>
 					<span className="pnode-dot" aria-hidden />
-					{report
+					{/* Keyed on status, not on the object: a stored {} is a record with
+					    no verdict in it, which is "not validated" rather than zero
+					    errors. */}
+					{report?.status
 						? report.status === "valid"
 							? "Valid"
 							: report.status === "warnings"
-								? `${report.warnings.length} warning${report.warnings.length === 1 ? "" : "s"}`
-								: `${report.errors.length} error${report.errors.length === 1 ? "" : "s"}`
+								? `${(report.warnings ?? []).length} warning${(report.warnings ?? []).length === 1 ? "" : "s"}`
+								: `${(report.errors ?? []).length} error${(report.errors ?? []).length === 1 ? "" : "s"}`
 						: "Not validated"}
 				</span>
 
@@ -698,6 +847,10 @@ function PipelineBuilderInner() {
 							});
 						}}
 						onNodeClick={(_event, node) => setSelectedId(node.id)}
+						onNodeDoubleClick={(_event, node) => {
+							const source = graph.nodes.find((item) => item.id === node.id);
+							if (source) void openResourcePreview(source);
+						}}
 						onPaneClick={() => setSelectedId(null)}
 						onEdgesDelete={(deleted) => {
 							const removing = new Set(deleted.map((e) => e.id));
@@ -754,6 +907,8 @@ function PipelineBuilderInner() {
 					onChange={(patch) => selectedId && updateNode(selectedId, patch)}
 					onSelect={focusNode}
 					onClose={() => setSelectedId(null)}
+					onCreateDataset={createDatasetFromNode}
+					onPreviewResource={openResourcePreview}
 				/>
 			</div>
 
@@ -768,6 +923,8 @@ function PipelineBuilderInner() {
 			/>
 
 			<CommandMenu open={menuOpen} onPick={addNode} onClose={() => setMenuOpen(false)} />
+
+			<ResourcePreview resourceId={previewId} onClose={() => setPreviewId(null)} />
 
 		</div>
 	);

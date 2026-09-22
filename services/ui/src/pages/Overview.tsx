@@ -2,24 +2,35 @@
 
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { type PlatformStats, api, round } from "../api";
+import { type PlatformStats, api, isMissingOntology, round } from "../api";
+import { useSpace } from "../SpaceContext";
 import { Chart } from "../components/Chart";
-import { DataTable, ErrorBanner, Spinner } from "../components/common";
+import { DataTable, ErrorBanner, NoOntologyHere, Spinner } from "../components/common";
 
 export function Overview() {
 	const [stats, setStats] = useState<PlatformStats | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	const [missing, setMissing] = useState(false);
+	const { spaceSlug, space } = useSpace();
 
 	const load = () => {
+		setStats(null);
 		setError(null);
+		setMissing(false);
 		api
 			.get<PlatformStats>("/api/stats")
 			.then(setStats)
-			.catch((exc: Error) => setError(exc.message));
+			.catch((exc: Error) =>
+				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
+			);
 	};
 
-	useEffect(load, []);
+	// The summary counts one space's ontology, so it reloads when the space does.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: load is stable enough here; the space is the input.
+	useEffect(load, [spaceSlug]);
 
+	if (missing)
+		return <NoOntologyHere what="published ontology" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
 	if (!stats) return <Spinner label="Loading platform summary" />;
 

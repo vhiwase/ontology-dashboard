@@ -432,6 +432,31 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "POST", pattern: /^\/actions\/[^/]+\/apply$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/actions\/[^/]+\/validate$/, role: "analyst" },
 
+	// A proposal is inert, so drafting one is an analyst act. ACCEPTING makes
+	// it runnable against the warehouse, which is the act that matters.
+	{ method: "POST", pattern: /^\/pipelines\/propose$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/accept$/, role: "admin" },
+
+	// The ontology builder. Editing a label or drawing a link changes what
+	// everyone sees and what every dashboard resolves against, so it is an
+	// analyst act; removing part of the ontology is an admin one.
+	{ method: "PATCH", pattern: /^\/ontology\/[^/]+\/.+$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/ontology\/link-types$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/ontology\/edits\/[^/]+\/undo$/, role: "analyst" },
+	{ method: "DELETE", pattern: /^\/ontology\/[^/]+\/.+$/, role: "admin" },
+
+	// Functions. Proposing is an analyst act: a proposal computes nothing and
+	// is inert until approved, so drafting one is cheap to allow and cheap to
+	// reject. APPROVING is the act that makes a definition produce numbers on
+	// other people's dashboards, so it sits at admin — the whole point of the
+	// proposed/active split is that the two are not the same person's click.
+	{ method: "POST", pattern: /^\/functions$/, role: "analyst" },
+	{ method: "PATCH", pattern: /^\/functions\/[^/]+$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/functions\/[^/]+\/run$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/functions\/[^/]+\/approve$/, role: "admin" },
+	{ method: "POST", pattern: /^\/functions\/[^/]+\/reject$/, role: "admin" },
+	{ method: "POST", pattern: /^\/functions\/[^/]+\/archive$/, role: "admin" },
+
 	// A pipeline defines how data becomes an ontology, so editing one is an
 	// analyst act and deleting one is an admin act. Reading, validating and
 	// the palette stay at viewer.
@@ -439,6 +464,25 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/run$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/versions\/[^/]+\/restore$/, role: "analyst" },
 	{ method: "DELETE", pattern: /^\/pipelines\/[^/]+$/, role: "admin" },
+
+	// Creating projects, folders, resources and datasets is authoring work.
+	// Reading the tree and previewing a resource stay at viewer, so anyone can
+	// look at what exists without being able to reshape it.
+	{ method: "POST", pattern: /^\/spaces\/sandbox\/seed$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/folders$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/resources$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/datasets$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/resources\/[^/]+\/rename$/, role: "analyst" },
+	// Testing a connection reaches out to a host of the caller's choosing and
+	// reads a credential the service can see, so it is not a viewer action.
+	{ method: "POST", pattern: /^\/spaces\/connections\/test$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/connections$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/resources\/[^/]+\/test$/, role: "analyst" },
+	// Deleting removes something other people may be building on.
+	{ method: "DELETE", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+$/, role: "admin" },
+	{ method: "DELETE", pattern: /^\/resources\/[^/]+$/, role: "admin" },
+	{ method: "DELETE", pattern: /^\/folders\/[^/]+$/, role: "admin" },
 ];
 
 /** The role a request needs, from the table above or viewer as the floor. */

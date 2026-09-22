@@ -491,7 +491,7 @@ def register_actions(conn: psycopg.Connection, ontology_version_id: int) -> int:
             "allowed_roles", "audit_level", "is_read_only", "tags",
         ],
         rows,
-        ["action_type_rid"],
+        ["ontology_version_id", "action_type_rid"],
     )
     read_only = sum(1 for a in ACTIONS if a.get("is_read_only"))
     log.info(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import os
 import time
 import uuid
@@ -18,12 +19,13 @@ from pydantic import BaseModel, Field
 from . import store
 from .agent import Agent
 from .auth import Principal, require_role
-from .context import current_request_id
+from .context import current_request_id, current_space
 from .config import CONFIG
 from .limits import REPLICA_WARNING, RateLimited, limiter
 from .llm import LlmError, _single_provider, build_provider
+from .pricing import price_turn, rates
 from .prompts import STARTER_PROMPTS
-from .tools import OntologyClient
+from .tools import NoOntologyInSpace, OntologyClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,6 +169,17 @@ async def ontology_snapshot() -> dict[str, Any]:
             await client.get("/api/kpis/catalogue"),
             await client.get("/api/stats"),
         )
+    except NoOntologyInSpace as exc:
+        # Not a fault: this space is simply empty. Said plainly, because the
+        # answer is an action the user can take, not an incident to report.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"There is no ontology in the '{current_space.get()}' space yet, so there "
+                "is nothing here to ask about. Switch to a space that has one, or run a "
+                f"pipeline in this one. ({exc})"
+            ),
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=503,
@@ -203,6 +216,18 @@ class ChatRequest(BaseModel):
     # no failover: a caller who asked for the local model should be told it is
     # unavailable, not quietly billed for the hosted one.
     provider: str | None = None
+    # Ontology entities the user attached to this question with the + control.
+    # They are resolved server-side and prepended to the turn as context, so
+    # the model starts from the right object instead of having to find it.
+    attachments: list["Attachment"] = Field(default_factory=list, max_length=12)
+    # The space this conversation belongs to. Chats are per-space like
+    # dashboards and pipelines, so switching space shows a different history.
+    spaceSlug: str | None = None
+
+
+class Attachment(BaseModel):
+    kind: str
+    ref: str
 
 
 class ToolCallView(BaseModel):
@@ -214,6 +239,8 @@ class ToolCallView(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    """What a turn produced, including what it cost."""
+
     sessionId: int
     reply: str
     toolCalls: list[ToolCallView]
@@ -226,6 +253,87 @@ class ChatResponse(BaseModel):
     model: str
     # Set when the primary provider was skipped or failed for this turn.
     failoverReason: str | None = None
+    # What the turn cost, priced with the rate in force when it ran. `priced`
+    # is false when the provider has no configured rate, so an unpriced model
+    # reads as a gap rather than as free.
+    cost: dict[str, Any] | None = None
+
+
+
+_CITATION = re.compile(r":citation\[([^\]]+)\]\{([^}]*)\}")
+
+
+async def _validate_citations(reply: str) -> tuple[str, int]:
+    """Strip citations that point at documents which do not exist.
+
+    The model is told to cite only what it found, but a fabricated path is
+    exactly the failure that a citation is supposed to rule out - a reader
+    checking the source is the whole point, and a dead one is worse than no
+    citation at all. So the paths are checked against the corpus rather than
+    trusted, and an unknown one is downgraded to plain text.
+    """
+    if ":citation[" not in reply:
+        return reply, 0
+
+    client: OntologyClient = state["ontology"]
+    try:
+        index = await client.get("/api/docs")
+        known = {doc["path"] for doc in index}
+    except Exception:  # noqa: BLE001 - never fail a turn over this
+        return reply, 0
+
+    dropped = 0
+
+    def check(match: "re.Match[str]") -> str:
+        nonlocal dropped
+        title, attrs = match.group(1), match.group(2)
+        found = re.search(r'path="([^"]*)"', attrs)
+        if found and found.group(1) in known:
+            return match.group(0)
+        dropped += 1
+        log.warning("Dropped citation to unknown document: %s", found.group(1) if found else attrs)
+        return title
+
+    return _CITATION.sub(check, reply), dropped
+
+
+async def _resolve_attachments(
+    attachments: list["Attachment"],
+) -> list[dict[str, Any]]:
+    """Look up each attached entity so the model gets its real definition."""
+    client: OntologyClient = state["ontology"]
+    paths = {
+        "objectType": "/api/object-types/{ref}",
+        "actionType": "/api/action-types",
+        "linkType": "/api/link-types",
+        "kpi": "/api/kpis/{ref}",
+        "dashboard": "/api/dashboards/{ref}",
+    }
+
+    resolved: list[dict[str, Any]] = []
+    for item in attachments[:12]:
+        template = paths.get(item.kind)
+        if template is None:
+            resolved.append({"kind": item.kind, "ref": item.ref, "error": "unknown kind"})
+            continue
+        try:
+            if "{ref}" in template:
+                payload = await client.get(template.format(ref=item.ref))
+            else:
+                # The list endpoints have no by-name route, so the entry is
+                # picked out of the collection.
+                rows = await client.get(template)
+                payload = next(
+                    (row for row in rows if row.get("apiName") == item.ref), None
+                )
+                if payload is None:
+                    raise KeyError(item.ref)
+            resolved.append({"kind": item.kind, "ref": item.ref, "definition": payload})
+        except Exception as exc:  # noqa: BLE001 - reported, never fatal
+            resolved.append(
+                {"kind": item.kind, "ref": item.ref, "error": str(exc)[:200]}
+            )
+    return resolved
 
 
 # ── endpoints ───────────────────────────────────────────────────────────────
@@ -391,14 +499,37 @@ async def providers(
             "resolvedTo": getattr(state.get("provider"), "name", None),
             "reason": state.get("providerReason"),
         },
-        # What the UI should preselect. Ollama is the intended default, but a
-        # default nobody can use is not a default, so it yields to the first
-        # provider that is actually available.
-        "default": next(
-            (p["id"] for p in described if p["id"] == "ollama" and p["available"]),
-            next((p["id"] for p in described if p["available"]), "auto"),
-        ),
+        # Automatic by default: it uses the server's configured chain and its
+        # failover, so a turn still gets answered when one provider is down.
+        # Pinning a specific model is a deliberate act - and it disables
+        # failover, which is only what you want when you meant it.
+        "default": "auto",
     }
+
+
+@app.get("/api/assistant/costs")
+async def costs(
+    days: int = 30,
+    space: str | None = None,
+    principal: Principal = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Spend and token use over a window.
+
+    An admin sees the whole platform; everyone else sees only their own,
+    because a spend report is also a record of what people have been asking.
+    """
+    summary = store.cost_summary(_visible_owner(principal), days, space)
+    # The rates are returned with the numbers so the figures can be checked
+    # rather than taken on trust.
+    summary["rates"] = {
+        name: {
+            "inputPerMillion": rate.input_per_m,
+            "outputPerMillion": rate.output_per_m,
+            "source": rate.source,
+        }
+        for name, rate in rates().items()
+    }
+    return summary
 
 
 @app.get("/api/assistant/starters")
@@ -419,9 +550,10 @@ def _visible_owner(principal: Principal) -> str | None:
 
 @app.get("/api/assistant/sessions")
 async def sessions(
+    space: str | None = None,
     principal: Principal = Depends(require_role("viewer")),
 ) -> dict[str, Any]:
-    return {"sessions": store.list_sessions(_visible_owner(principal))}
+    return {"sessions": store.list_sessions(_visible_owner(principal), space_slug=space)}
 
 
 @app.get("/api/assistant/sessions/{session_id}")
@@ -433,6 +565,8 @@ async def session_messages(
     # enumerate which session ids exist.
     if not store.session_exists(session_id, _visible_owner(principal)):
         raise HTTPException(status_code=404, detail=f"No session {session_id}.")
+    else:
+        current_space.set(store.session_space(session_id) or "sandbox")
     return {"sessionId": session_id, "messages": store.get_messages(session_id)}
 
 
@@ -446,6 +580,8 @@ async def remove_session(
 ) -> Response:
     if not store.delete_session(session_id, _visible_owner(principal)):
         raise HTTPException(status_code=404, detail=f"No session {session_id}.")
+    else:
+        current_space.set(store.session_space(session_id) or "sandbox")
     return Response(status_code=204)
 
 
@@ -502,19 +638,27 @@ async def chat(
                 ),
             )
 
+    # The space this turn reads the ontology in, fixed before the snapshot is
+    # taken and before any tool runs. For an existing conversation the stored
+    # space wins over whatever the request says, so a chat cannot be steered
+    # into another environment mid-thread.
     session_id = request.sessionId
     if session_id is None:
+        current_space.set(request.spaceSlug or "sandbox")
         session_id = store.create_session(
             title=None,
             user_id=principal.username,
             user_role=principal.ontology_role,
             provider=chosen if chosen not in ("", "auto") else CONFIG.provider,
             model=CONFIG.model_for(chosen) if chosen not in ("", "auto") else CONFIG.model_name,
+            space_slug=request.spaceSlug or "sandbox",
         )
     elif not store.session_exists(session_id, _visible_owner(principal)):
         # Continuing someone else's conversation would hand the caller its
         # history, so an unowned id is simply not found.
         raise HTTPException(status_code=404, detail=f"No session {session_id}.")
+    else:
+        current_space.set(store.session_space(session_id) or "sandbox")
 
     # What this turn actually ran against, for honest reporting below.
     attempted_provider = (
@@ -526,6 +670,12 @@ async def chat(
     snapshot = await ontology_snapshot()
     history = store.history_for_model(session_id)
 
+    # Resolve what the user attached. Anything that cannot be resolved is
+    # reported in the block rather than dropped: the model should know a
+    # requested object was unavailable, not silently answer without it.
+    if request.attachments:
+        snapshot = {**snapshot, "attached": await _resolve_attachments(request.attachments)}
+
     store.append_message(session_id, "user", request.message)
 
     result = await agent.run(request.message, history, snapshot)
@@ -533,8 +683,21 @@ async def chat(
     # Charge the budget with what the turn actually cost. This runs after the
     # call, so a single turn can overshoot the cap; the next one is refused.
     # Capping mid-stream would mean abandoning work already paid for.
+    # Citations are checked against the corpus before the reply is stored, so a
+    # fabricated source never reaches the reader or the transcript.
+    reply_text, dropped_citations = await _validate_citations(result.content)
+    result.content = reply_text
+
     usage = result.usage or {}
     limiter.record_usage(principal.username, int(usage.get("totalTokens") or 0))
+
+    # Priced with the rate in force now, and stored on the message, so a later
+    # price change does not rewrite what this turn cost.
+    cost = price_turn(
+        result.provider or attempted_provider,
+        result.model or CONFIG.model_for(attempted_provider),
+        usage,
+    )
 
     # Tool calls are persisted alongside the answer so a number can be traced to
     # the query that produced it.
@@ -555,6 +718,7 @@ async def chat(
         artifacts=result.artifacts,
         latency_ms=result.latency_ms,
         token_usage=result.usage,
+        cost=cost,
     )
 
     return ChatResponse(
@@ -584,6 +748,15 @@ async def chat(
         provider=result.provider or attempted_provider,
         model=result.model or CONFIG.model_for(attempted_provider),
         failoverReason=result.failover_reason,
+        cost={
+            "usd": cost.cost_usd,
+            "priced": cost.priced,
+            "promptTokens": cost.prompt_tokens,
+            "completionTokens": cost.completion_tokens,
+            "totalTokens": cost.total_tokens,
+            "rateInputPerM": cost.rate_input_per_m,
+            "rateOutputPerM": cost.rate_output_per_m,
+        },
     )
 
 

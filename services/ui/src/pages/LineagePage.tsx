@@ -15,9 +15,17 @@ import {
 	type LineageNode,
 	type ObjectTypeSummary,
 	api,
+	isMissingOntology,
 } from "../api";
+import { useSpace } from "../SpaceContext";
 import { GraphCanvas, type GraphLink, type GraphNode } from "../components/GraphCanvas";
-import { DataTable, Empty, ErrorBanner, Spinner } from "../components/common";
+import {
+	DataTable,
+	Empty,
+	ErrorBanner,
+	NoOntologyHere,
+	Spinner,
+} from "../components/common";
 
 const LAYER_DESCRIPTIONS: Record<string, string> = {
 	source: "The HTTP endpoint each payload was captured from.",
@@ -49,8 +57,20 @@ export function LineagePage() {
 	const [subject, setSubject] = useState<{ kind: "objectType" | "kpi"; name: string } | null>(null);
 	const [trace, setTrace] = useState<TraceResult | null>(null);
 	const [activeLayers, setActiveLayers] = useState<string[] | null>(null);
+	const [missing, setMissing] = useState(false);
+	const { spaceSlug, space } = useSpace();
 
+	// Lineage records how one space's data was built, so it reloads with the
+	// space. The traced subject is cleared: it names an object type or metric
+	// that need not exist in the space being switched to.
 	useEffect(() => {
+		setGraph(null);
+		setTypes([]);
+		setKpis([]);
+		setSubject(null);
+		setTrace(null);
+		setError(null);
+		setMissing(false);
 		Promise.all([
 			api.get<LineageGraph>("/api/lineage/graph"),
 			api.get<ObjectTypeSummary[]>("/api/object-types"),
@@ -61,8 +81,10 @@ export function LineagePage() {
 				setTypes(typeRows);
 				setKpis(kpiRows);
 			})
-			.catch((exc: Error) => setError(exc.message));
-	}, []);
+			.catch((exc: Error) =>
+				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
+			);
+	}, [spaceSlug]);
 
 	useEffect(() => {
 		if (!subject) {
@@ -118,6 +140,7 @@ export function LineagePage() {
 		return Math.max(1, ...counts.values());
 	}, [nodes]);
 
+	if (missing) return <NoOntologyHere what="lineage" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
 	if (!graph) return <Spinner label="Loading lineage graph" />;
 

@@ -17,7 +17,8 @@
 --    * Views prefixed v_kpi_ are registered as metric views, not object types.
 --
 --  data_origin is 'api' where the value came from the captured TMS payloads and
---  'simulated' where it came from tms_sim (see 03_simulation_schema.sql).
+--  Every column here is read from the captured snapshot. Nothing is
+--  generated: where the source carries no value, the column is NULL.
 -- ============================================================================
 
 SET search_path = tms_views, tms_raw, public;
@@ -395,11 +396,16 @@ SELECT
     COALESCE(s.has_pod, false)              AS has_proof_of_delivery,
     -- Charges: the API value wins wherever it exists; the simulated charge only
     -- fills the 47 of 61 shipments the snapshot left unrated.
-    COALESCE(s.total_rate_amount, sc.total_rate_amount)   AS total_charge,
-    COALESCE(s.freight_amount,    sc.freight_amount)      AS freight_charge,
-    COALESCE(s.fuel_amount,       sc.fuel_amount)         AS fuel_charge,
-    COALESCE(s.accessorial_amount, sc.accessorial_amount) AS accessorial_charge,
-    COALESCE(sc.currency_code, 'USD')       AS currency_code,
+    -- The rated amounts, straight from the snapshot. 14 of 61 shipments carry
+    -- them; the other 47 are NULL because the source never rated them, and are
+    -- no longer topped up with a generated rate.
+    s.total_rate_amount                     AS total_charge,
+    s.freight_amount                        AS freight_charge,
+    s.fuel_amount                           AS fuel_charge,
+    s.accessorial_amount                    AS accessorial_charge,
+    -- The snapshot carries a currency_id, not a code, and no reference table
+    -- to resolve it. Reported as-is rather than assumed to be USD.
+    s.currency_id                           AS currency_key,
     (s.total_rate_amount IS NOT NULL)       AS is_rated_in_source,
     ev.planned_pickup_at                    AS planned_pickup_at,
     ev.planned_delivery_at                  AS planned_delivery_at,
@@ -411,16 +417,16 @@ SELECT
     COALESCE(hu.has_hazmat, false)          AS has_hazmat,
     -- Cost per kilo is the headline unit-economics metric for a 3PL; NULLIF
     -- guards the zero-weight shipments the snapshot contains.
-    ROUND((COALESCE(s.total_rate_amount, sc.total_rate_amount)
+    ROUND((s.total_rate_amount
            / NULLIF(hu.gross_weight_kg, 0))::numeric, 4) AS charge_per_kg,
+    -- Only two outcomes now: the snapshot rated this shipment, or it did not.
+    -- 14 of 61 are rated; the rest are honestly unrated rather than filled in.
     CASE WHEN s.total_rate_amount IS NOT NULL THEN 'api'
-         WHEN sc.shipment_id IS NOT NULL      THEN 'simulated'
          ELSE 'unrated' END                  AS charge_origin,
     'api'::text                              AS data_origin
 FROM tms_raw.shipment s
 LEFT JOIN tms_views.v_order o        ON o.order_key = s.order_id
 LEFT JOIN tms_raw.ref_shipment_status ss ON ss.code = s.status
-LEFT JOIN tms_sim.shipment_charge sc ON sc.shipment_id = s.shipment_id
 LEFT JOIN hu ON hu.shipment_id = s.shipment_id
 LEFT JOIN ev ON ev.shipment_number = s.shipment_number;
 
@@ -435,25 +441,21 @@ CREATE OR REPLACE VIEW tms_views.v_transport AS
 WITH legs AS (
     SELECT l.transport_id,
            count(*) AS leg_count,
-           sum(COALESCE(ld.road_km,
-                        tms_raw.to_kilometres(l.distance_value, l.distance_unit))) AS total_km,
-           bool_or(ld.transport_id IS NOT NULL) AS has_simulated_distance
+           -- Summed from the source only. Every captured leg reports 0 m, so
+           -- this is NULL today and becomes real the moment the TMS sends a
+           -- distance. It is no longer back-filled with an estimate.
+           sum(tms_raw.to_kilometres(l.distance_value, l.distance_unit)) AS total_km
     FROM tms_raw.transport_leg l
-    LEFT JOIN tms_sim.leg_distance ld
-           ON ld.transport_id = l.transport_id AND ld.leg_number = l.leg_number
     GROUP BY l.transport_id
 ),
 stops AS (
     SELECT ts.transport_id,
            count(*) AS stop_count,
-           count(*) FILTER (WHERE COALESCE(sa.is_arrived, ts.is_arrived, false)) AS arrived_stop_count,
-           -- A transport counts as on time when no stop arrived late.
-           bool_and(COALESCE(sa.arrival_variance_minutes, 0) <= 0)
-             FILTER (WHERE sa.stop_id IS NOT NULL) AS all_stops_on_time,
-           max(sa.arrival_variance_minutes)        AS worst_arrival_variance_minutes,
-           avg(sa.dwell_minutes)                   AS avg_dwell_minutes
+           count(*) FILTER (WHERE COALESCE(ts.is_arrived, false)) AS arrived_stop_count
+           -- all_stops_on_time, worst_arrival_variance_minutes and
+           -- avg_dwell_minutes are gone: no stop in the snapshot has been
+           -- arrived at, so punctuality cannot be computed from real data.
     FROM tms_raw.transport_stop ts
-    LEFT JOIN tms_sim.stop_actual sa ON sa.stop_id = ts.stop_id
     GROUP BY ts.transport_id
 )
 SELECT
@@ -481,39 +483,29 @@ SELECT
     COALESCE(t.is_virtual, false)           AS is_virtual,
     t.planned_start                         AS planned_start_at,
     t.planned_end                           AS planned_end_at,
-    COALESCE(t.actual_start, ta.actual_start) AS actual_start_at,
-    COALESCE(t.actual_end,   ta.actual_end)   AS actual_end_at,
+    t.actual_start                          AS actual_start_at,
+    t.actual_end                            AS actual_end_at,
     t.planned_start::date                   AS planned_start_date,
     date_trunc('week',  t.planned_start)::date  AS planned_start_week,
     date_trunc('month', t.planned_start)::date  AS planned_start_month,
-    EXTRACT(EPOCH FROM (COALESCE(t.actual_end, ta.actual_end)
-                        - COALESCE(t.actual_start, ta.actual_start))) / 3600.0
+    EXTRACT(EPOCH FROM (t.actual_end - t.actual_start)) / 3600.0
                                             AS actual_transit_hours,
     EXTRACT(EPOCH FROM (t.planned_end - t.planned_start)) / 3600.0
                                             AS planned_transit_hours,
     -- Departure and arrival variance in hours, positive = late.
-    EXTRACT(EPOCH FROM (COALESCE(t.actual_start, ta.actual_start) - t.planned_start)) / 3600.0
+    EXTRACT(EPOCH FROM (t.actual_start - t.planned_start)) / 3600.0
                                             AS departure_variance_hours,
-    ta.carrier_id                           AS carrier_key,
-    ta.carrier_name                         AS carrier_name,
-    ta.scac                                 AS carrier_scac,
-    ROUND(COALESCE(legs.total_km, ta.total_km)::numeric, 2) AS total_distance_km,
-    ta.linehaul_cost                        AS linehaul_cost,
-    ta.fuel_cost                            AS fuel_cost,
-    ta.accessorial_cost                     AS accessorial_cost,
-    ta.total_cost                           AS total_cost,
-    COALESCE(ta.currency_code, 'USD')       AS currency_code,
-    ROUND((ta.total_cost / NULLIF(COALESCE(legs.total_km, ta.total_km), 0))::numeric, 4)
-                                            AS cost_per_km,
+    -- carrier_key / carrier_name / carrier_scac, the four cost columns and
+    -- cost_per_km are GONE. Unlike the columns above they had no source
+    -- operand at all: the snapshot carries no carrierId and no transport cost,
+    -- so those columns could only ever hold a generated number. A column that
+    -- can never be real is a trap, not a placeholder.
+    ROUND(legs.total_km::numeric, 2)        AS total_distance_km,
     COALESCE(legs.leg_count, t.leg_count, 0) AS leg_count,
     COALESCE(stops.stop_count, 0)           AS stop_count,
     COALESCE(stops.arrived_stop_count, 0)   AS arrived_stop_count,
-    stops.all_stops_on_time                 AS is_on_time,
-    ROUND(stops.worst_arrival_variance_minutes::numeric, 1) AS worst_arrival_variance_minutes,
-    ROUND(stops.avg_dwell_minutes::numeric, 1)              AS avg_dwell_minutes,
-    (ta.transport_id IS NOT NULL)           AS has_actuals,
-    CASE WHEN t.actual_start IS NOT NULL   THEN 'api'
-         WHEN ta.transport_id IS NOT NULL  THEN 'simulated'
+    (t.actual_start IS NOT NULL)            AS has_actuals,
+    CASE WHEN t.actual_start IS NOT NULL THEN 'api'
          ELSE 'planned_only' END            AS execution_origin,
     'api'::text                             AS data_origin
 FROM tms_raw.transport t
@@ -521,7 +513,6 @@ LEFT JOIN tms_views.v_order o            ON o.order_key = t.order_id
 LEFT JOIN tms_views.v_business_entity org ON org.business_entity_key = t.origin_id
 LEFT JOIN tms_views.v_business_entity dst ON dst.business_entity_key = t.destination_id
 LEFT JOIN tms_raw.ref_transport_status tstat ON tstat.code = t.status
-LEFT JOIN tms_sim.transport_actual ta    ON ta.transport_id = t.transport_id
 LEFT JOIN legs  ON legs.transport_id  = t.transport_id
 LEFT JOIN stops ON stops.transport_id = t.transport_id;
 
@@ -541,23 +532,22 @@ SELECT
     l.to_stop_id                    AS to_transport_stop_key,
     ts2.name                        AS to_stop_name,
     ts2.location_id                 AS to_location_key,
-    ROUND(COALESCE(ld.road_km,
-        tms_raw.to_kilometres(l.distance_value, l.distance_unit))::numeric, 2) AS distance_km,
-    ROUND(ld.haversine_km::numeric, 2) AS straight_line_km,
-    ld.circuity_factor              AS circuity_factor,
+    -- Every captured leg reports 0 m, so this is almost always NULL. It stays
+    -- because the column is real: it populates the moment the source sends a
+    -- distance. straight_line_km and circuity_factor are gone - both were
+    -- computed from demo coordinates that are not geographically coherent.
+    ROUND(tms_raw.to_kilometres(l.distance_value, l.distance_unit)::numeric, 2) AS distance_km,
     l.duration_seconds / 3600.0     AS planned_duration_hours,
     fs.departure_begin              AS planned_departure_at,
     ts2.arrival_begin               AS planned_arrival_at,
     CASE WHEN COALESCE(l.distance_value, 0) > 0 THEN 'api'
-         WHEN ld.transport_id IS NOT NULL       THEN 'simulated'
          ELSE 'unknown' END         AS distance_origin,
     'api'::text                     AS data_origin
 FROM tms_raw.transport_leg l
 JOIN tms_raw.transport t        ON t.transport_id = l.transport_id
 LEFT JOIN tms_raw.transport_stop fs  ON fs.stop_id = l.from_stop_id
 LEFT JOIN tms_raw.transport_stop ts2 ON ts2.stop_id = l.to_stop_id
-LEFT JOIN tms_sim.leg_distance ld
-       ON ld.transport_id = l.transport_id AND ld.leg_number = l.leg_number;
+;
 
 CREATE OR REPLACE VIEW tms_views.v_transport_stop AS
 SELECT
@@ -582,26 +572,21 @@ SELECT
     ts.departure_begin              AS planned_departure_from,
     ts.departure_end                AS planned_departure_to,
     ts.cut_time                     AS cut_time,
-    COALESCE(ts.actual_arrival,   sa.actual_arrival)   AS actual_arrival_at,
-    COALESCE(ts.actual_departure, sa.actual_departure) AS actual_departure_at,
-    COALESCE(sa.is_arrived,  ts.is_arrived,  false)    AS is_arrived,
-    COALESCE(sa.is_departed, ts.is_departed, false)    AS is_departed,
-    ROUND(sa.arrival_variance_minutes::numeric, 1)     AS arrival_variance_minutes,
-    ROUND(sa.dwell_minutes::numeric, 1)                AS dwell_minutes,
-    -- On time means the truck arrived at or before the end of the planned
-    -- window. NULL where no arrival has been recorded at all.
-    CASE WHEN sa.arrival_variance_minutes IS NULL THEN NULL
-         ELSE sa.arrival_variance_minutes <= 0 END     AS is_on_time,
-    sa.exception_code                                  AS exception_code,
+    ts.actual_arrival                                  AS actual_arrival_at,
+    ts.actual_departure                                AS actual_departure_at,
+    COALESCE(ts.is_arrived,  false)                    AS is_arrived,
+    COALESCE(ts.is_departed, false)                    AS is_departed,
+    -- arrival_variance_minutes, dwell_minutes, is_on_time and exception_code
+    -- are gone. No stop in the snapshot has been arrived at, so every one of
+    -- them could only ever have been computed from an invented arrival time.
     (SELECT count(*) FROM tms_raw.stop_event e WHERE e.stop_id = ts.stop_id) AS event_count,
     CASE WHEN ts.actual_arrival IS NOT NULL THEN 'api'
-         WHEN sa.stop_id IS NOT NULL        THEN 'simulated'
          ELSE 'planned_only' END            AS execution_origin,
     'api'::text                             AS data_origin
 FROM tms_raw.transport_stop ts
 JOIN tms_raw.transport t ON t.transport_id = ts.transport_id
 LEFT JOIN tms_views.v_business_entity loc ON loc.business_entity_key = ts.location_id
-LEFT JOIN tms_sim.stop_actual sa ON sa.stop_id = ts.stop_id;
+;
 
 CREATE OR REPLACE VIEW tms_views.v_stop_event AS
 SELECT
@@ -623,17 +608,17 @@ SELECT
     e.window_end                    AS window_end_at,
     EXTRACT(EPOCH FROM (e.window_end - e.window_start)) / 3600.0 AS window_hours,
     COALESCE(array_length(e.handling_unit_ids, 1), 0) AS handling_unit_count,
-    sa.actual_arrival               AS actual_arrival_at,
-    ROUND(sa.arrival_variance_minutes::numeric, 1) AS arrival_variance_minutes,
-    CASE WHEN sa.arrival_variance_minutes IS NULL THEN NULL
-         ELSE sa.arrival_variance_minutes <= 0 END  AS is_on_time,
+    -- The arrival columns are taken from the stop itself, which is where the
+    -- source would record them. They are NULL throughout this snapshot
+    -- because nothing has been arrived at yet.
+    ts.actual_arrival               AS actual_arrival_at,
     'api'::text                     AS data_origin
 FROM tms_raw.stop_event e
 LEFT JOIN tms_raw.transport_stop ts ON ts.stop_id = e.stop_id
 LEFT JOIN tms_raw.transport t       ON t.transport_id = e.transport_id
 LEFT JOIN tms_raw.ref_stop_event_type evt ON evt.code = e.event_type
 LEFT JOIN tms_raw.shipment s        ON s.shipment_number = e.shipment_number
-LEFT JOIN tms_sim.stop_actual sa    ON sa.stop_id = e.stop_id;
+;
 
 -- ===========================================================================
 --  HANDLING UNIT  (the freight itself)

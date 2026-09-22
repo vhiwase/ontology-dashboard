@@ -8,8 +8,22 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { type LinkTypeRow, type ObjectTypeDetail, type ObjectTypeSummary, api, round } from "../api";
-import { DataTable, Empty, ErrorBanner, Spinner } from "../components/common";
+import {
+	type LinkTypeRow,
+	type ObjectTypeDetail,
+	type ObjectTypeSummary,
+	api,
+	isMissingOntology,
+	round,
+} from "../api";
+import { useSpace } from "../SpaceContext";
+import {
+	DataTable,
+	Empty,
+	ErrorBanner,
+	NoOntologyHere,
+	Spinner,
+} from "../components/common";
 
 type Tab = "properties" | "links" | "actions" | "raw";
 
@@ -21,8 +35,20 @@ export function OntologyManager() {
 	const [tab, setTab] = useState<Tab>("properties");
 	const [filter, setFilter] = useState("");
 	const [error, setError] = useState<string | null>(null);
+	const [missing, setMissing] = useState(false);
+	const { spaceSlug, space } = useSpace();
 
+	// Keyed on the space: the ontology belongs to one, so switching has to
+	// reload rather than leave the previous space's types on screen. The
+	// selection is cleared too, because an api name from the old space would
+	// not resolve in the new one.
 	useEffect(() => {
+		setTypes(null);
+		setAllLinks(null);
+		setSelected(null);
+		setDetail(null);
+		setError(null);
+		setMissing(false);
 		Promise.all([
 			api.get<ObjectTypeSummary[]>("/api/object-types"),
 			api.get<LinkTypeRow[]>("/api/link-types"),
@@ -32,8 +58,10 @@ export function OntologyManager() {
 				setAllLinks(linkRows);
 				setSelected((current) => current ?? typeRows[0]?.apiName ?? null);
 			})
-			.catch((exc: Error) => setError(exc.message));
-	}, []);
+			.catch((exc: Error) =>
+				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
+			);
+	}, [spaceSlug]);
 
 	useEffect(() => {
 		if (!selected) return;
@@ -65,6 +93,8 @@ export function OntologyManager() {
 		return [...buckets.entries()];
 	}, [types, filter]);
 
+	if (missing)
+		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
 	if (!types) return <Spinner label="Loading ontology" />;
 

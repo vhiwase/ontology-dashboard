@@ -597,17 +597,99 @@ class ExecutionSimulator:
         return rows
 
 
+def _coverage_gaps(conn: psycopg.Connection) -> list[tuple[str, int, int, str]]:
+    """What the captured snapshot does and does not carry.
+
+    Counted from tms_raw, not from the views. The views are a presentation of
+    the source; asking the source directly means this report stays true if a
+    view is reshaped, and it is the source that would have to change for any of
+    these to become measurable.
+    """
+
+    def count(sql: str) -> int:
+        try:
+            rows = query(conn, sql)
+            return int(rows[0]["n"]) if rows else 0
+        except psycopg.Error:
+            # A rollback is required, not optional: a failed statement poisons
+            # the transaction, and every later query in the run would fail with
+            # "current transaction is aborted" instead of its own error.
+            conn.rollback()
+            return 0
+
+    transports = count("SELECT count(*) AS n FROM tms_raw.transport")
+    stops = count("SELECT count(*) AS n FROM tms_raw.transport_stop")
+    legs = count("SELECT count(*) AS n FROM tms_raw.transport_leg")
+
+    return [
+        (
+            "Carrier assignment",
+            # tms_raw.transport has no carrier column at all, so this is
+            # structurally zero rather than merely unpopulated.
+            0,
+            transports,
+            "the payload has no carrier field",
+        ),
+        (
+            "Execution actuals",
+            count("SELECT count(*) AS n FROM tms_raw.transport WHERE actual_start IS NOT NULL"),
+            transports,
+            "no actualStart / actualEnd",
+        ),
+        (
+            "Leg distance",
+            count(
+                "SELECT count(*) AS n FROM tms_raw.transport_leg "
+                "WHERE COALESCE(distance_value, 0) > 0"
+            ),
+            legs,
+            "every captured leg reports 0 m",
+        ),
+        (
+            "On-time arrivals",
+            count(
+                "SELECT count(*) AS n FROM tms_raw.transport_stop "
+                "WHERE actual_arrival IS NOT NULL"
+            ),
+            stops,
+            "no stop has been arrived at",
+        ),
+    ]
+
+
 def run_simulation(conn: psycopg.Connection, ingest_run: int | None = None) -> dict[str, Any]:
     """Rebuild tms_sim from scratch, or clear it when simulation is disabled."""
-    if not CONFIG.simulate_execution:
-        log.info(
-            "PIPELINE_SIMULATE_EXECUTION is false: clearing tms_sim. "
-            "On-time, transit-time, carrier and cost-per-km KPIs will read as no data."
-        )
-        truncate(conn, SIM_TABLES)
-        conn.commit()
-        return {"enabled": False}
+    # The tms_sim schema was removed in migration 0018. Nothing is generated
+    # here any more; this stage reports what the captured snapshot does and
+    # does not carry, and that report is the deliverable.
+    gaps = _coverage_gaps(conn)
+    log.info("Coverage of the captured snapshot:")
+    for area, present, total, note in gaps:
+        log.info("    %-20s %3d of %-3d from source   %s", area, present, total, note)
 
+    if CONFIG.simulate_execution:
+        # Deliberately a refusal rather than a silent re-create. Generating
+        # execution data is an act with consequences - it produced seventeen
+        # authoritative-looking metrics with nothing behind them - so it needs
+        # the schema restored on purpose, not a flag flipped in passing.
+        raise RuntimeError(
+            "PIPELINE_SIMULATE_EXECUTION is true, but the tms_sim schema was removed in "
+            "migration 0018 and the views no longer read it. Generating execution data is "
+            "a deliberate act: restore the schema from db/init/03_simulation_schema.sql and "
+            "re-point the views first. Nothing has been generated."
+        )
+
+    log.info("    No data generated. Metrics resting on these areas are not published.")
+    return {
+        "enabled": False,
+        "gaps": [
+            {"area": a, "fromSource": p, "total": t, "note": n} for a, p, t, n in gaps
+        ],
+    }
+
+
+def _unused_simulator(conn: psycopg.Connection, ingest_run: int | None = None) -> dict[str, Any]:
+    """Retained for reference only; unreachable while tms_sim does not exist."""
     truncate(conn, SIM_TABLES)
     simulator = ExecutionSimulator(conn, CONFIG.sim_seed)
     simulator.start(

@@ -24,3 +24,11 @@ current_token: ContextVar[str | None] = ContextVar("current_token", default=None
 # the browser through this service into the ontology service by grepping a
 # single id.
 current_request_id: ContextVar[str | None] = ContextVar("current_request_id", default=None)
+
+# The space the conversation belongs to. The ontology is per-space — object
+# types, links, actions, metrics and lineage are published by a pipeline that
+# ran in one space — so a tool call that does not name one reads the sandbox's
+# and answers a question about the wrong environment. Held here for the same
+# reason as the token: every tool reaches the ontology through one client, and
+# this is the one place that has to know.
+current_space: ContextVar[str] = ContextVar("current_space", default="sandbox")

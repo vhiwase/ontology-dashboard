@@ -9,7 +9,7 @@
 Stages, in order, each depending on the last:
 
     1  ingest      captured JSON payloads   -> tms_raw
-    2  simulate    execution actuals        -> tms_sim
+    2  coverage    report what the source lacks (no data is generated)
     3  introspect  tms_views schema         -> view descriptions
     4  discover    reference probing        -> link types
     5  generate    ontology document        -> platform.ontology_version + registry
@@ -30,7 +30,7 @@ import time
 from typing import Any
 
 from .config import CONFIG
-from .dashboards import seed_dashboards, validate_dashboards
+from .dashboards import prune_unavailable_widgets, seed_dashboards, validate_dashboards
 from .db import connect, count_rows, execute, query, query_one
 from .ingest import run_ingest
 from .introspect import introspect_views
@@ -65,7 +65,6 @@ def _assert_schema_ready(conn) -> None:
     missing: list[str] = []
     for schema, name, kind in [
         ("tms_raw", "tms_order", "table"),
-        ("tms_sim", "transport_actual", "table"),
         ("tms_views", "v_order", "view"),
         ("tms_views", "v_kpi_data_coverage", "view"),
         ("platform", "ontology_version", "table"),
@@ -170,7 +169,7 @@ def main(argv: list[str] | None = None) -> int:
             stages.record("ingest", "skipped" if result.get("skipped") else "success", result)
 
         # ── 2. simulate ───────────────────────────────────────────────────
-        log.info("Stage 2/8 simulate: execution actuals.")
+        log.info("Stage 2/8 coverage: what the captured snapshot does and does not carry.")
         if args.no_simulate:
             object.__setattr__(CONFIG, "simulate_execution", False)
         simulation = run_simulation(conn, ingest_run_id)
@@ -242,6 +241,10 @@ def main(argv: list[str] | None = None) -> int:
                 "or an unsupported dimension. First: " + dashboard_problems[0]
             )
         dashboard_count = seed_dashboards(conn, overwrite=args.reseed_dashboards)
+        # Reconcile boards that already existed: a widget whose metric has been
+        # withdrawn cannot render anything real, so it is removed rather than
+        # left showing a blank where a number used to be.
+        prune_unavailable_widgets(conn)
         stages.record("dashboards", "success", {"seeded": dashboard_count})
 
         execute(

@@ -133,12 +133,12 @@ trp AS (
     SELECT t.lane,
            count(*)                                      AS transport_count,
            avg(t.total_distance_km)                       AS avg_km,
-           sum(t.total_cost)                              AS total_cost,
+           -- Cost and punctuality are gone: the snapshot carries neither a
+           -- transport cost nor an arrival, so both could only ever have been
+           -- computed from generated values. Volume and weight per lane are
+           -- real and remain.
            sum(t.total_distance_km)                        AS total_km,
-           avg(t.actual_transit_hours)                     AS avg_actual_transit_hours,
-           count(*) FILTER (WHERE t.is_on_time IS TRUE)     AS on_time_count,
-           count(*) FILTER (WHERE t.is_on_time IS NOT NULL) AS measured_count,
-           avg(t.worst_arrival_variance_minutes)           AS avg_worst_variance_minutes
+           avg(t.actual_transit_hours)                     AS avg_actual_transit_hours
     FROM tms_views.v_transport t
     WHERE t.lane IS NOT NULL
     GROUP BY t.lane
@@ -162,13 +162,10 @@ SELECT
     ROUND(avg(base.planned_transit_days)::numeric, 2) AS avg_planned_transit_days,
     ROUND(max(trp.avg_actual_transit_hours)::numeric, 2) AS avg_actual_transit_hours,
     ROUND(max(trp.avg_km)::numeric, 1)          AS avg_distance_km,
+    -- Revenue is real where the snapshot rated the shipment (14 of 61) and
+    -- NULL where it did not. Cost, cost per km and on-time are removed.
     ROUND(max(shp.total_charge), 2)             AS revenue,
-    ROUND(max(trp.total_cost), 2)               AS cost,
-    ROUND(max(trp.total_cost) / NULLIF(max(trp.total_km), 0), 4) AS cost_per_km,
-    ROUND(max(shp.total_charge) / NULLIF(sum(base.gross_weight_kg), 0), 4) AS revenue_per_kg,
-    ROUND(100.0 * max(trp.on_time_count) / NULLIF(max(trp.measured_count), 0), 1) AS on_time_pct,
-    max(trp.measured_count)                     AS on_time_sample_size,
-    ROUND(max(trp.avg_worst_variance_minutes)::numeric, 1) AS avg_worst_variance_minutes
+    ROUND(max(shp.total_charge) / NULLIF(sum(base.gross_weight_kg), 0), 4) AS revenue_per_kg
 FROM base
 LEFT JOIN trp ON trp.lane = base.lane
 LEFT JOIN shp ON shp.lane = base.lane
@@ -307,18 +304,16 @@ SELECT
     count(DISTINCT ts.transport_key)             AS transport_count,
     count(DISTINCT ts.order_key)                 AS order_count,
     sum(ts.event_count)                          AS event_count,
-    ROUND(avg(ts.dwell_minutes)::numeric, 1)     AS avg_dwell_minutes,
-    ROUND(max(ts.dwell_minutes)::numeric, 1)     AS max_dwell_minutes,
-    count(*) FILTER (WHERE ts.is_on_time IS TRUE)     AS on_time_count,
-    count(*) FILTER (WHERE ts.is_on_time IS NOT NULL) AS measured_count,
-    ROUND(100.0 * count(*) FILTER (WHERE ts.is_on_time IS TRUE)
-          / NULLIF(count(*) FILTER (WHERE ts.is_on_time IS NOT NULL), 0), 1) AS on_time_pct
+    -- Dwell and punctuality removed: no stop in the snapshot has been
+    -- arrived at, so neither can be measured. Stop volume per facility is
+    -- real and is what this view now reports.
+    count(*) FILTER (WHERE ts.is_arrived)        AS arrived_stop_count
 FROM tms_views.v_transport_stop ts
 WHERE ts.location_key IS NOT NULL
 GROUP BY 1, 2, 3, 4, 5;
 
 COMMENT ON VIEW tms_views.v_kpi_facility_throughput IS
-'Per-facility stop volume, dwell time and punctuality.';
+'Per-facility stop volume. Dwell and punctuality need arrivals the snapshot does not carry.';
 
 -- ---------------------------------------------------------------------------
 --  Network: mode mix
@@ -368,14 +363,10 @@ UNION ALL
 SELECT 'Uninvoiced shipments', 'Shipment', 'medium', count(*),
        'Shipments not yet billed'
 FROM tms_views.v_shipment WHERE NOT is_invoiced
-UNION ALL
-SELECT 'Late stops', 'TransportStop', 'high', count(*),
-       'Stops that arrived after the end of the planned window'
-FROM tms_views.v_transport_stop WHERE is_on_time IS FALSE
-UNION ALL
-SELECT 'Transports without a carrier', 'Transport', 'high', count(*),
-       'Planned moves with no carrier assigned'
-FROM tms_views.v_transport WHERE carrier_key IS NULL
+-- 'Late stops' and 'Transports without a carrier' are gone. Lateness needs an
+-- arrival and carrier attribution needs a carrierId; the snapshot carries
+-- neither, so both rows could only ever have counted generated data. An
+-- exception list that invents exceptions is worse than a shorter one.
 UNION ALL
 SELECT 'Implausible handling unit weight', 'Order', 'high', count(*),
        'A single handling unit weighs more than 40 t, which exceeds any legal truck gross weight'
@@ -400,55 +391,66 @@ COMMENT ON VIEW tms_views.v_kpi_exception_summary IS
 --  listed here with its real coverage, so a dashboard can grey out a tile
 --  instead of showing a confident zero.
 CREATE OR REPLACE VIEW tms_views.v_kpi_data_coverage AS
-WITH o AS (SELECT count(*) n, count(*) FILTER (WHERE is_planned) planned FROM tms_views.v_order),
-     s AS (SELECT count(*) n,
-                  count(*) FILTER (WHERE charge_origin = 'api') api_rated,
-                  count(*) FILTER (WHERE charge_origin = 'simulated') sim_rated
-           FROM tms_views.v_shipment),
-     t AS (SELECT count(*) n,
-                  count(*) FILTER (WHERE execution_origin = 'api') api_exec,
-                  count(*) FILTER (WHERE execution_origin = 'simulated') sim_exec,
-                  count(*) FILTER (WHERE carrier_key IS NOT NULL) with_carrier,
-                  count(*) FILTER (WHERE total_distance_km > 0) with_distance
-           FROM tms_views.v_transport),
-     st AS (SELECT count(*) n,
-                   count(*) FILTER (WHERE is_on_time IS NOT NULL) measured
-            FROM tms_views.v_transport_stop)
-SELECT 'Order intake' AS metric_area, 'Order' AS object_type,
+--  How much of each metric area the captured snapshot actually carries.
+--
+--  This used to report "measured versus simulated", because the gaps were
+--  filled with generated rows. Nothing is generated any more, so it reports
+--  measured versus ABSENT: rows_simulated is retained as a column and is
+--  always zero, because dashboards and the assistant read it by name.
+--
+--  An area at 0% is not a fault. It is the snapshot honestly saying it records
+--  what was planned, not what happened.
+WITH orders AS (
+    SELECT count(*) AS n,
+           count(*) FILTER (WHERE is_planned) AS routed
+    FROM tms_views.v_order
+),
+shipments AS (
+    SELECT count(*) AS n,
+           count(*) FILTER (WHERE charge_origin = 'api') AS rated
+    FROM tms_views.v_shipment
+),
+transports AS (
+    SELECT count(*) AS n,
+           count(*) FILTER (WHERE actual_start_at IS NOT NULL) AS with_actuals,
+           count(*) FILTER (WHERE total_distance_km > 0)       AS with_distance
+    FROM tms_views.v_transport
+),
+stops AS (
+    SELECT count(*) AS n,
+           count(*) FILTER (WHERE actual_arrival_at IS NOT NULL) AS arrived
+    FROM tms_views.v_transport_stop
+)
+SELECT 'Order intake'::text AS metric_area, 'Order'::text AS object_type,
        o.n AS total_rows, o.n AS rows_from_source, 0::bigint AS rows_simulated,
-       100.0 AS source_coverage_pct,
-       'Fully present in the captured snapshot' AS note
-FROM o
+       100.0::numeric AS source_coverage_pct,
+       'Fully present in the captured snapshot'::text AS note
+FROM orders o
 UNION ALL
-SELECT 'Route planning', 'Order', o.n, o.planned, 0::bigint,
-       ROUND(100.0 * o.planned / NULLIF(o.n, 0), 1),
+SELECT 'Route planning', 'Order', o.n, o.routed, 0::bigint,
+       ROUND(100.0 * o.routed / NULLIF(o.n, 0), 1),
        'Orders that carry a scheduledRoute in the source payload'
-FROM o
+FROM orders o
 UNION ALL
-SELECT 'Freight charges', 'Shipment', s.n, s.api_rated, s.sim_rated,
-       ROUND(100.0 * s.api_rated / NULLIF(s.n, 0), 1),
-       'Revenue KPIs mix source charges with simulated ones where the snapshot left a shipment unrated'
-FROM s
+SELECT 'Freight charges', 'Shipment', sh.n, sh.rated, 0::bigint,
+       ROUND(100.0 * sh.rated / NULLIF(sh.n, 0), 1),
+       'Shipments the source rated. The rest are reported unrated rather than estimated'
+FROM shipments sh
 UNION ALL
-SELECT 'Execution actuals', 'Transport', t.n, t.api_exec, t.sim_exec,
-       ROUND(100.0 * t.api_exec / NULLIF(t.n, 0), 1),
-       'The snapshot contains no actualStart/actualEnd at all; transit-time KPIs rest on simulated execution'
-FROM t
+SELECT 'Execution actuals', 'Transport', tr.n, tr.with_actuals, 0::bigint,
+       ROUND(100.0 * tr.with_actuals / NULLIF(tr.n, 0), 1),
+       'The snapshot contains no actualStart/actualEnd, so transit time is not measured'
+FROM transports tr
 UNION ALL
-SELECT 'Carrier assignment', 'Transport', t.n, 0::bigint, t.with_carrier,
-       0.0,
-       'No order or transport in the snapshot carries a carrierId; carrier scorecards rest on simulated assignment'
-FROM t
+SELECT 'Leg distance', 'Transport', tr.n, tr.with_distance, 0::bigint,
+       ROUND(100.0 * tr.with_distance / NULLIF(tr.n, 0), 1),
+       'Every captured leg reports a distance of 0 m, so distance is not measured'
+FROM transports tr
 UNION ALL
-SELECT 'Leg distance', 'Transport', t.n, 0::bigint, t.with_distance,
-       0.0,
-       'Every captured leg reported a distance of 0 m; distance and cost-per-km rest on great-circle estimates'
-FROM t
-UNION ALL
-SELECT 'On-time measurement', 'TransportStop', st.n, 0::bigint, st.measured,
-       0.0,
-       'No stop in the snapshot has been arrived at; on-time percentages rest on simulated arrivals'
-FROM st;
+SELECT 'On-time measurement', 'TransportStop', st.n, st.arrived, 0::bigint,
+       ROUND(100.0 * st.arrived / NULLIF(st.n, 0), 1),
+       'No stop in the snapshot has been arrived at, so punctuality is not measured'
+FROM stops st;
 
 COMMENT ON VIEW tms_views.v_kpi_data_coverage IS
-'How much of each metric area is measured versus simulated. Read this before trusting a tile.';
+'How much of each metric area the snapshot measures. An area at 0% is absent at source, not estimated.';

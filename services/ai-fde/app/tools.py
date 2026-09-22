@@ -22,12 +22,13 @@ from __future__ import annotations
 
 import json
 import logging
+from urllib.parse import quote
 from typing import Any, Callable, Awaitable
 
 import httpx
 
 from .config import CONFIG
-from .context import current_request_id, current_token
+from .context import current_request_id, current_space, current_token
 
 log = logging.getLogger("ai_fde.tools")
 
@@ -61,6 +62,13 @@ class OntologyClient:
         if headers:
             kwargs["headers"] = headers
 
+        # Every call is made in the conversation's space, so the assistant
+        # reads the ontology of the environment the user is actually in. A
+        # tool that set its own space explicitly keeps it.
+        params = dict(kwargs.pop("params", None) or {})
+        params.setdefault("space", current_space.get())
+        kwargs["params"] = params
+
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.request(method, url, **kwargs)
         if response.status_code >= 400:
@@ -70,6 +78,11 @@ class OntologyClient:
                 detail = response.json().get("error") or response.text
             except Exception:
                 detail = response.text
+            if response.status_code == 409:
+                # The space has no published ontology. A distinct type because
+                # the answer is "nothing has been published here yet", which is
+                # worth saying plainly rather than reporting as a failed call.
+                raise NoOntologyInSpace(detail)
             raise ToolError(f"{method} {path} failed ({response.status_code}): {detail}")
         if response.status_code == 204:
             return None
@@ -84,6 +97,10 @@ class OntologyClient:
 
 class ToolError(RuntimeError):
     pass
+
+
+class NoOntologyInSpace(ToolError):
+    """Raised where the conversation's space has no published ontology."""
 
 
 client = OntologyClient()
@@ -517,7 +534,186 @@ async def global_search(arguments: dict[str, Any]) -> dict[str, Any]:
 
 # ── tool schemas handed to the model ───────────────────────────────────────
 
+
+async def search_documentation(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Search the platform's documentation so a claim can be cited.
+
+    The corpus is generated from the live registry, so a caveat found here is
+    the caveat actually in force rather than a remembered paraphrase.
+    """
+    query = str(arguments.get("query") or "").strip()
+    if not query:
+        raise ToolError("query is required.")
+    limit = min(int(arguments.get("limit") or 6), 12)
+    hits = await client.get(
+        f"/api/docs/search?q={quote(query)}&limit={limit}"
+    )
+    return {
+        "query": query,
+        "results": hits,
+        "note": (
+            "Cite a result with :citation[<title>]{path=\"<path>\"} , adding "
+            'section="<sectionTitle>" when the hit names one. Only cite paths that '
+            "appear in these results."
+        ),
+    }
+
+
+async def request_clarification(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Ask the user a question instead of guessing.
+
+    This tool does not look anything up. It is a terminal step: the agent stops
+    the round loop when it is called and hands the question back, because
+    continuing would mean answering the question the model was unsure about.
+    """
+    question = str(arguments.get("question") or "").strip()
+    if not question:
+        raise ToolError("question is required.")
+
+    raw_options = arguments.get("options") or []
+    options: list[dict[str, str]] = []
+    for option in raw_options[:6]:
+        if isinstance(option, dict):
+            label = str(option.get("label") or "").strip()
+            detail = str(option.get("detail") or "").strip()
+        else:
+            label, detail = str(option).strip(), ""
+        if label:
+            options.append({"label": label, "detail": detail})
+
+    return {
+        "clarificationRequested": True,
+        "question": question,
+        "options": options,
+        "allowFreeText": bool(arguments.get("allowFreeText", True)),
+    }
+
+async def propose_function(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Draft a metric that does not exist yet, for a person to approve.
+
+    The gap this closes: the assistant may not invent a KPI, so asked for
+    something the catalogue does not cover it can only say no and the
+    conversation dead-ends. This gives it a third option — write the
+    definition down and hand it over.
+
+    It is a TERMINAL step, like request_clarification. The draft is saved as
+    `proposed`, which computes nothing and cannot back a dashboard, and the
+    turn ends so the user can read it. Continuing would mean building a
+    dashboard on a metric nobody has approved, which is the exact thing the
+    proposal step exists to prevent.
+
+    The server validates the SQL before storing it, so a definition that will
+    not run is refused here rather than discovered by whoever approves it.
+    """
+    name = str(arguments.get("name") or "").strip()
+    definition = str(arguments.get("definition") or "").strip()
+    if not name:
+        raise ToolError("name is required.")
+    if not definition:
+        raise ToolError("definition is required - the SQL the metric computes.")
+
+    payload = {
+        "name": name,
+        "description": str(arguments.get("description") or "").strip(),
+        "businessQuestion": str(arguments.get("businessQuestion") or "").strip(),
+        "language": "sql",
+        "definition": definition,
+        "returns": arguments.get("returns") or "scalar",
+        "returnType": arguments.get("returnType"),
+        "unit": arguments.get("unit"),
+        "valueFormat": arguments.get("valueFormat") or "number",
+        "readsObjectTypes": arguments.get("readsObjectTypes") or [],
+        "proposedFrom": str(arguments.get("proposedFrom") or "").strip() or None,
+    }
+
+    try:
+        created = await client.post("/api/functions", payload)
+    except ToolError as exc:
+        # The server refused the definition. Handed back rather than raised so
+        # the model can correct the SQL and try once more, which is usually a
+        # column name it guessed instead of looking up.
+        return {
+            "functionProposed": False,
+            "error": str(exc),
+            "hint": (
+                "Fix the definition and call propose_function again. Use "
+                "describe_object_type or list_kpis first to get real column names."
+            ),
+        }
+
+    return {
+        "functionProposed": True,
+        # The UI opens its review dialog on this flag; the payload is what it
+        # renders, including the two identifiers it must not let anyone edit.
+        "function": created,
+        "awaitingApproval": True,
+        "note": (
+            "Saved as a PROPOSAL. It computes nothing and no dashboard can use it "
+            "until a person approves it. Tell the user what it measures and that "
+            "it is waiting for their approval."
+        ),
+    }
+
+
+async def propose_pipeline(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Draft a pipeline graph for a person to accept (§18).
+
+    Terminal, like propose_function and for the same reason. A pipeline that
+    runs writes real tables which dashboards and this assistant then read, so
+    a graph nobody has reviewed must not become a dataset because a sentence
+    asked for it.
+
+    The server compiles every node before storing the draft, so a filter on a
+    column that does not exist is refused here rather than discovered by the
+    reviewer.
+    """
+    name = str(arguments.get("name") or "").strip()
+    graph = arguments.get("graph")
+    if not name:
+        raise ToolError("name is required.")
+    if not isinstance(graph, dict) or not graph.get("nodes"):
+        raise ToolError("graph must be an object with a nodes array.")
+
+    payload = {
+        "name": name,
+        "description": str(arguments.get("description") or "").strip(),
+        "graph": graph,
+        "proposedFrom": str(arguments.get("proposedFrom") or "").strip() or None,
+    }
+
+    try:
+        created = await client.post("/api/pipelines/propose", payload)
+    except ToolError as exc:
+        # Handed back rather than raised, so the model can correct the graph.
+        # Usually a column it guessed instead of looking up.
+        return {
+            "pipelineProposed": False,
+            "error": str(exc),
+            "hint": (
+                "Fix the graph and call propose_pipeline again. Use "
+                "describe_object_type for real sqlColumn names, and remember a "
+                "source node needs sourceView set to a published view."
+            ),
+        }
+
+    return {
+        "pipelineProposed": True,
+        "pipeline": created.get("pipeline"),
+        "compiled": created.get("compiled"),
+        "awaitingAcceptance": True,
+        "note": (
+            "Saved as a PROPOSAL. Every node compiles, but nothing has run and it "
+            "cannot run until a person accepts it. Describe what it does and that "
+            "it is waiting for them."
+        ),
+    }
+
+
 TOOL_IMPLEMENTATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
+    "search_documentation": search_documentation,
+    "request_clarification": request_clarification,
+    "propose_function": propose_function,
+    "propose_pipeline": propose_pipeline,
     "list_object_types": list_object_types,
     "describe_object_type": describe_object_type,
     "search_objects": search_objects,
@@ -577,6 +773,195 @@ WIDGET_SCHEMA = {
 def tool_schemas() -> list[dict[str, Any]]:
     """The OpenAI-style function schemas both providers accept."""
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_documentation",
+                "description": (
+                    "Search this platform's documentation for a definition, a data-quality "
+                    "caveat, or how something behaves. Use it before asserting anything "
+                    "about how a metric is computed, what is simulated, how roles work or "
+                    "how actions behave - then cite the result."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What you need to know, in a few words.",
+                        },
+                        "limit": {"type": "integer", "description": "Max results, default 6."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_pipeline",
+                "description": (
+                    "Draft a data pipeline from a description, for a person to accept. "
+                    "Use this when the user asks you to BUILD or CREATE a pipeline. "
+                    "The draft is saved but inert: nothing runs until they accept it. "
+                    "Calling this ends your turn. "
+                    "Call describe_object_type first to get real sqlColumn names - a "
+                    "graph referencing a column that does not exist is refused."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Short business name for the pipeline."},
+                        "description": {"type": "string", "description": "What it produces and from what."},
+                        "proposedFrom": {
+                            "type": "string",
+                            "description": "The user's own words that prompted this.",
+                        },
+                        "graph": {
+                            "type": "object",
+                            "description": (
+                                "nodes[] and edges[]. Each node: id, kind, name, "
+                                "position{x,y}, config{}. Kinds that run SQL: dataSource "
+                                "(config.sourceView = a published view), filter "
+                                "(config.mode = filter|select|sort|dedupe|calculate|"
+                                "normalize|lookup|union), join, aggregate, sql, output. "
+                                "Each edge: id, source, target. Lay nodes left to "
+                                "right, 260px apart. An aggregate needs measures[] as "
+                                "well as groupBy[], each {aggregation, field, alias} - "
+                                "groupBy alone computes nothing."
+                            ),
+                            "properties": {
+                                "nodes": {"type": "array", "items": {"type": "object"}},
+                                "edges": {"type": "array", "items": {"type": "object"}},
+                            },
+                            "required": ["nodes", "edges"],
+                        },
+                    },
+                    "required": ["name", "graph"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_function",
+                "description": (
+                    "Draft a NEW metric when the user needs one the KPI catalogue does "
+                    "not have. Call list_kpis first: if a published KPI already answers "
+                    "the question, use it instead of proposing a duplicate. "
+                    "The draft is saved as a PROPOSAL for a person to approve - it "
+                    "computes nothing and no dashboard can use it until they do. "
+                    "Calling this ends your turn. "
+                    "The SQL must be a single SELECT over views the ontology publishes; "
+                    "use describe_object_type to get real column names rather than "
+                    "guessing them."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": (
+                                "Short business name, e.g. 'Distance Travelled Per Month'. "
+                                "The permanent id and api name are derived from this by the "
+                                "server and cannot be set or changed afterwards."
+                            ),
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "What it measures and any caveat about the data behind it.",
+                        },
+                        "businessQuestion": {
+                            "type": "string",
+                            "description": "The question a user would ask that this answers.",
+                        },
+                        "definition": {
+                            "type": "string",
+                            "description": (
+                                "A single SELECT over published views. No semicolons, no "
+                                "writes. For a scalar metric return one row and one column. "
+                                "Use each property's sqlColumn (snake_case) from "
+                                "describe_object_type, NOT its apiName (camelCase) - the "
+                                "apiName is not a column and the definition will be rejected."
+                            ),
+                        },
+                        "returns": {
+                            "type": "string",
+                            "enum": ["scalar", "table"],
+                            "description": "scalar for a KPI tile, table for a chart.",
+                        },
+                        "returnType": {
+                            "type": "string",
+                            "description": "numeric, percent, currency, duration_hours, distance_km, …",
+                        },
+                        "unit": {"type": "string", "description": "km, hours, USD, …"},
+                        "valueFormat": {
+                            "type": "string",
+                            "enum": [
+                                "number", "integer", "currency", "percent",
+                                "duration_hours", "duration_days", "weight_kg", "distance_km",
+                            ],
+                        },
+                        "readsObjectTypes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Ontology object types this reads, for lineage.",
+                        },
+                        "proposedFrom": {
+                            "type": "string",
+                            "description": "The user's own words that prompted this, for the audit trail.",
+                        },
+                    },
+                    "required": ["name", "definition", "returns"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "request_clarification",
+                "description": (
+                    "Ask the user a question instead of guessing. Use this when the request "
+                    "is genuinely ambiguous in a way that changes the answer - which lane, "
+                    "which time window, which of two metrics they mean. Do NOT use it for "
+                    "something you could look up yourself. Calling it ends your turn: you "
+                    "will be given the user's reply on the next one."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {
+                            "type": "string",
+                            "description": "One specific question, in the user's language.",
+                        },
+                        "options": {
+                            "type": "array",
+                            "description": (
+                                "Two to six concrete choices. Offer these whenever the "
+                                "possibilities are known - picking from a list is far less "
+                                "work than typing."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": {"type": "string"},
+                                    "detail": {
+                                        "type": "string",
+                                        "description": "One short line on what this choice means.",
+                                    },
+                                },
+                                "required": ["label"],
+                            },
+                        },
+                        "allowFreeText": {
+                            "type": "boolean",
+                            "description": "Whether a typed answer is also acceptable. Default true.",
+                        },
+                    },
+                    "required": ["question"],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {

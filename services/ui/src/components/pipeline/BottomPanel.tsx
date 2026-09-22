@@ -41,7 +41,14 @@ export interface Run {
 	triggeredBy: string;
 }
 
-type Tab = "validation" | "runs" | "logs";
+type Tab = "validation" | "runs" | "nodes" | "logs";
+
+const TAB_LABELS: Record<Tab, string> = {
+	validation: "Validation",
+	runs: "Runs",
+	nodes: "Nodes",
+	logs: "Logs",
+};
 
 interface Props {
 	open: boolean;
@@ -75,7 +82,7 @@ export function BottomPanel({
 				</button>
 
 				<div className="bottom-tabs">
-					{(["validation", "runs", "logs"] as Tab[]).map((id) => (
+					{(["validation", "runs", "nodes", "logs"] as Tab[]).map((id) => (
 						<button
 							key={id}
 							className={`bottom-tab ${tab === id && open ? "active" : ""}`}
@@ -84,7 +91,7 @@ export function BottomPanel({
 								if (!open) onToggle();
 							}}
 						>
-							{id === "validation" ? "Validation" : id === "runs" ? "Runs" : "Logs"}
+							{TAB_LABELS[id]}
 							{id === "validation" && errors.length > 0 && (
 								<span className="tab-badge error">{errors.length}</span>
 							)}
@@ -94,6 +101,13 @@ export function BottomPanel({
 							{id === "runs" && runs.length > 0 && (
 								<span className="tab-badge">{runs.length}</span>
 							)}
+							{id === "nodes" &&
+								(activeRun?.nodeResults.filter((n) => n.status === "failed").length ?? 0) >
+									0 && (
+									<span className="tab-badge error">
+										{activeRun?.nodeResults.filter((n) => n.status === "failed").length}
+									</span>
+								)}
 						</button>
 					))}
 				</div>
@@ -106,12 +120,16 @@ export function BottomPanel({
 						</span>
 						<span>{activeRun.durationMs ?? 0}ms</span>
 						<span>{activeRun.records.toLocaleString("en-US")} records</span>
-						{activeRun.isSimulated && (
+						{activeRun.isSimulated ? (
 							<span
 								className="chip"
-								title="This run exercised the graph's shape and dependency order. No data was moved."
+								title="An older run, recorded before the execution engine existed: it exercised the graph's shape and estimated row counts."
 							>
-								simulated
+								estimated
+							</span>
+						) : (
+							<span className="chip good" title="Every node ran SQL against the warehouse.">
+								executed
 							</span>
 						)}
 					</div>
@@ -223,6 +241,64 @@ export function BottomPanel({
 										</tbody>
 									</table>
 								</>
+							)}
+						</>
+					)}
+
+					{tab === "nodes" && (
+						<>
+							{!activeRun || activeRun.nodeResults.length === 0 ? (
+								<p className="muted">Run the pipeline to see what each node produced.</p>
+							) : (
+								<table className="dense">
+									<thead>
+										<tr>
+											<th>Node</th>
+											<th>Kind</th>
+											<th>Status</th>
+											<th className="num">Rows out</th>
+											<th className="num">Duration</th>
+											<th>Detail</th>
+										</tr>
+									</thead>
+									<tbody>
+										{activeRun.nodeResults.map((node) => (
+											<tr key={node.nodeId}>
+												<td>
+													<button
+														className="link-button"
+														onClick={() => onFocusNode(node.nodeId)}
+													>
+														{node.name}
+													</button>
+												</td>
+												<td className="mono">{node.kind}</td>
+												<td>
+													<span
+														className={
+															node.status === "success"
+																? "chip good"
+																: node.status === "failed"
+																	? "chip bad"
+																	: "chip"
+														}
+													>
+														{node.status}
+													</span>
+												</td>
+												{/* A dash, not a zero: a skipped node produced no
+												    rows, which is not the same as producing none. */}
+												<td className="num mono">
+													{node.records === null
+														? "—"
+														: node.records.toLocaleString("en-US")}
+												</td>
+												<td className="num mono">{node.durationMs}ms</td>
+												<td className="muted">{node.message}</td>
+											</tr>
+										))}
+									</tbody>
+								</table>
 							)}
 						</>
 					)}

@@ -141,7 +141,7 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       PIPELINE_MIGRATIONS_DIR: /db/migrations
       PIPELINE_SOURCE_DIR: ${PIPELINE_SOURCE_DIR:-/data/api_responses}
-      PIPELINE_SIMULATE_EXECUTION: ${PIPELINE_SIMULATE_EXECUTION:-true}
+      PIPELINE_SIMULATE_EXECUTION: ${PIPELINE_SIMULATE_EXECUTION:-false}
       PIPELINE_SIM_SEED: ${PIPELINE_SIM_SEED:-20260919}
       PIPELINE_FORCE_REINGEST: ${PIPELINE_FORCE_REINGEST:-false}
       PIPELINE_LINK_MIN_MATCH_RATIO: ${PIPELINE_LINK_MIN_MATCH_RATIO:-0.05}
@@ -199,11 +199,15 @@ services:
       ONTOLOGY_MAX_PAGE_SIZE: ${ONTOLOGY_MAX_PAGE_SIZE:-500}
       # false refuses every KPI, widget and action derived from tms_sim, so a
       # simulated figure cannot be served as though it were measured.
-      ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-true}
+      ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-false}
       NODE_ENV: production
     secrets:
       - database_url
       - jwt_secret
+      # So a connection resource can name /run/secrets/postgres_password as its
+      # credential and actually be testable. This grants nothing new: the
+      # database_url secret above already contains the same password.
+      - postgres_password
     ports:
       - "127.0.0.1:${ONTOLOGY_SERVICE_PORT:-4000}:${ONTOLOGY_SERVICE_PORT:-4000}"
     healthcheck:

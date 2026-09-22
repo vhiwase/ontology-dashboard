@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { OntologyDefinition } from "@ontograph/core";
 import { query, queryOne } from "./db";
 
@@ -133,16 +134,111 @@ export interface Registry {
 	loadedAt: string;
 }
 
-let current: Registry | null = null;
+/**
+ * Raised when a space has no published ontology.
+ *
+ * Distinct from "not loaded yet": an empty Staging is a NORMAL state with a
+ * sensible answer ("nothing has been promoted here"), not a server fault. It
+ * carries a 409 so routes render an empty state rather than a 500.
+ */
+export class NoOntologyInSpace extends Error {
+	readonly status = 409;
 
-export function getRegistry(): Registry {
-	if (!current) {
-		throw new Error("Registry not loaded yet. Call loadRegistry() during startup.");
+	constructor(readonly spaceSlug: string) {
+		super(
+			`No ontology has been published in the '${spaceSlug}' space. ` +
+				"Run a pipeline in this space, or promote one from the sandbox.",
+		);
 	}
-	return current;
 }
 
+/**
+ * The space whose ontology the current request should see.
+ *
+ * AsyncLocalStorage rather than a parameter on getRegistry(): the registry is
+ * read from thirty-five places across the SQL builders, the action layer and
+ * the documentation corpus, and threading a space through all of them would
+ * be a large change whose only purpose is carrying one string. The request
+ * middleware enters the context once and everything underneath reads it.
+ */
+const requestSpace = new AsyncLocalStorage<string>();
+
+/** Run `fn` with `spaceSlug` as the ontology in scope. */
+export function withSpace<T>(spaceSlug: string, fn: () => T): T {
+	return requestSpace.run(spaceSlug, fn);
+}
+
+/** Which space the caller is in, defaulting to the sandbox. */
+export function currentSpace(): string {
+	return requestSpace.getStore() ?? DEFAULT_SPACE;
+}
+
+export function getRegistry(): Registry {
+	const space = currentSpace();
+	const found = registries.get(space);
+	if (found) return found;
+	if (registries.size === 0) {
+		throw new Error("Registry not loaded yet. Call loadRegistry() during startup.");
+	}
+	throw new NoOntologyInSpace(space);
+}
+
+/** Which spaces currently have a published ontology. */
+export function spacesWithOntology(): string[] {
+	return [...registries.keys()].sort();
+}
+
+export function hasOntology(spaceSlug: string): boolean {
+	return registries.has(spaceSlug);
+}
+
+const DEFAULT_SPACE = "sandbox";
+
+/** One registry per space that has a published, active ontology. */
+const registries = new Map<string, Registry>();
+
+/**
+ * Load every space's active ontology.
+ *
+ * Each space is independent: one failing to load must not prevent the others,
+ * because a half-published ontology in staging should not take the sandbox
+ * down with it.
+ */
 export async function loadRegistry(): Promise<Registry> {
+	const spaces = await query<{ slug: string }>(
+		`SELECT s.slug
+		   FROM platform.space s
+		   JOIN platform.ontology_version v ON v.space_id = s.space_id AND v.is_active
+		  ORDER BY s.slug`,
+	);
+
+	registries.clear();
+	for (const { slug } of spaces) {
+		try {
+			registries.set(slug, await loadRegistryForSpace(slug));
+		} catch (error) {
+			console.error(
+				JSON.stringify({
+					level: "error",
+					message: "Could not load the ontology for a space",
+					space: slug,
+					error: (error as Error).message,
+				}),
+			);
+		}
+	}
+
+	const first = registries.get(DEFAULT_SPACE) ?? [...registries.values()][0];
+	if (!first) {
+		throw new Error(
+			"No active ontology in any space. Run the pipeline: " +
+				"docker compose run --rm pipeline python -m pipeline.run",
+		);
+	}
+	return first;
+}
+
+async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 	const versionRow = await queryOne<{
 		ontology_version_id: number;
 		version: string;
@@ -153,13 +249,15 @@ export async function loadRegistry(): Promise<Registry> {
 		validation: Record<string, unknown>;
 		created_at: Date;
 	}>(
-		`SELECT ontology_version_id, version, ontology_id, label, description,
-		        definition, validation, created_at
-		   FROM platform.ontology_version
-		  WHERE is_active`,
+		`SELECT v.ontology_version_id, v.version, v.ontology_id, v.label, v.description,
+		        v.definition, v.validation, v.created_at
+		   FROM platform.ontology_version v
+		   JOIN platform.space s ON s.space_id = v.space_id
+		  WHERE v.is_active AND s.slug = $1`,
+		[spaceSlug],
 	);
 	if (!versionRow) {
-		throw new Error("No active ontology version in platform.ontology_version.");
+		throw new NoOntologyInSpace(spaceSlug);
 	}
 	const versionId = versionRow.ontology_version_id;
 
@@ -203,8 +301,13 @@ export async function loadRegistry(): Promise<Registry> {
 		unit: string | null;
 		display_order: number;
 	}>(
+		// Joined on the version too (0013): 'tms:Order' now names a row in each
+		// published version, so matching on the RID alone would return one copy
+		// of every property per version that has ever held that type.
 		`SELECT p.* FROM platform.object_property p
-		   JOIN platform.object_type t ON t.object_type_rid = p.object_type_rid
+		   JOIN platform.object_type t
+		     ON t.ontology_version_id = p.ontology_version_id
+		    AND t.object_type_rid = p.object_type_rid
 		  WHERE t.ontology_version_id = $1
 		  ORDER BY p.object_type_rid, p.display_order`,
 		[versionId],
@@ -334,8 +437,16 @@ export async function loadRegistry(): Promise<Registry> {
 		tags: row.tags ?? [],
 	}));
 
+	// The catalogue is per-space (0012), so it is filtered by slug rather than
+	// by ontology version: the pipeline upserts it outside the version it
+	// publishes, so there is no version id on these rows to join through.
 	const kpiRows = await query<Record<string, any>>(
-		`SELECT * FROM platform.kpi_definition ORDER BY display_order, api_name`,
+		`SELECT k.*
+		   FROM platform.kpi_definition k
+		   JOIN platform.space s ON s.space_id = k.space_id
+		  WHERE s.slug = $1
+		  ORDER BY k.display_order, k.api_name`,
+		[spaceSlug],
 	);
 	const kpis: KpiMeta[] = kpiRows.map((row) => ({
 		rid: row.kpi_rid,
@@ -376,7 +487,7 @@ export async function loadRegistry(): Promise<Registry> {
 		else linksByTargetRid.set(link.targetObjectType, [link]);
 	}
 
-	current = {
+	const registry: Registry = {
 		ontologyVersionId: versionId,
 		version: versionRow.version,
 		ontologyId: versionRow.ontology_id,
@@ -400,11 +511,11 @@ export async function loadRegistry(): Promise<Registry> {
 	};
 
 	console.log(
-		`[registry] ontology v${current.version} (id ${versionId}): ` +
+		`[registry] ${spaceSlug}: ontology v${registry.version} (id ${versionId}): ` +
 			`${objectTypes.length} object types, ${propertyRows.length} properties, ` +
 			`${linkTypes.length} link types, ${actionTypes.length} actions, ${kpis.length} KPIs.`,
 	);
-	return current;
+	return registry;
 }
 
 // ── safe identifier resolution ──────────────────────────────────────────────

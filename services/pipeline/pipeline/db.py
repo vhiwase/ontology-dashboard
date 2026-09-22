@@ -167,6 +167,38 @@ def truncate(conn: psycopg.Connection, tables: Sequence[str]) -> None:
         cur.execute(sql.SQL("TRUNCATE {tables} CASCADE").format(tables=idents))
 
 
+def space_id(conn: psycopg.Connection, slug: str) -> int:
+    """The space this run publishes into, by slug.
+
+    Refuses rather than creating one: a typo in PIPELINE_SPACE should stop the
+    run, not quietly invent a fifth space that nobody can find in the UI.
+    """
+    found = scalar(conn, "SELECT space_id FROM platform.space WHERE slug = %s", (slug,))
+    if found is None:
+        known = [r["slug"] for r in query(conn, "SELECT slug FROM platform.space ORDER BY slug")]
+        raise RuntimeError(
+            f"PIPELINE_SPACE={slug!r} is not a space in this database. Known: {', '.join(known)}."
+        )
+    return int(found)
+
+
+def delete_for_space(conn: psycopg.Connection, tables: Sequence[str], space: int) -> None:
+    """Empty the given tables FOR ONE SPACE only.
+
+    Replaces TRUNCATE in the lineage stage. Truncating was correct while the
+    lineage graph was global; now that each space holds its own, truncating
+    would delete every other space's graph on every run.
+    """
+    with cursor(conn) as cur:
+        for table in tables:
+            cur.execute(
+                sql.SQL("DELETE FROM {table} WHERE space_id = %s").format(
+                    table=sql.Identifier(*table.split("."))
+                ),
+                (space,),
+            )
+
+
 def table_exists(conn: psycopg.Connection, schema: str, name: str) -> bool:
     return bool(
         scalar(

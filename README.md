@@ -415,6 +415,83 @@ tells you to run `down -v`.
 
 ---
 
+## Spaces, projects and resources
+
+`/spaces` is the workspace: where things live and how they are found.
+
+```
+space  ->  project  ->  folder (nestable)  ->  resource
+```
+
+A **space** is environment-scoped, and one exists for each environment from the
+start — **Sandbox, Development, Staging, Production** — because the environment
+list is fixed and a missing space is just a hole someone has to fill by hand.
+Separating them is the point: a pipeline promoted to production must not share
+a namespace with the sandbox copy someone is experimenting on. Each space card
+carries an environment tone, so acting on the wrong one is harder to do by
+accident.
+
+A **resource** is the addressable unit. Seven kinds:
+
+| Kind | Points at | Preview shows |
+|---|---|---|
+| Connection | the live database | version, size, connections, schema breakdown |
+| Dataset | a published view | schema, live sample rows, row count, lineage |
+| Object Type | an ontology type | properties, links, actions, row count |
+| Link Type | a discovered link | cardinality, key mapping, match ratio |
+| Action Type | an ontology action | parameters, permissions, targets |
+| Pipeline | a pipeline slug | version, node/edge count, validation status |
+| Dashboard | a dashboard slug | widget count, provenance |
+
+Opening one shows a **preview window** with the same anatomy every time —
+header, tabs, body — so the shape of the answer does not change with the kind
+of thing being asked about. Only tabs with content appear: a link type has no
+rows to preview, and an empty tab is worse than no tab.
+
+### Filling the sandbox
+
+```bash
+# Idempotent: does nothing once the sandbox has a project
+curl -X POST -H "authorization: Bearer $TOKEN" .../api/spaces/sandbox/seed
+```
+
+or press **Fill from the ontology** in the UI. It creates a *TMS Platform*
+project with `/Connections`, `/Datasets`, `/Ontology/{Object types,Links,
+Actions}` and `/Outputs`, then registers a resource for the live connection,
+one dataset per source view, and every object type, link, action, dashboard
+and pipeline — about 100 resources, all pointing at something real.
+
+### Datasets
+
+A dataset is the artefact the platform was missing: a pipeline could describe
+how data becomes an ontology, but produced nothing anyone could open, share or
+build on.
+
+Register one from the explorer (**Register dataset**) or straight from the
+canvas — select an Object Type node in the pipeline builder and press **Create
+dataset from this node**. Either way the backing view is checked against the
+published ontology first, so a dataset always points at something real; a view
+the ontology does not expose is refused with the reason.
+
+### Stale references
+
+Resources point at the rest of the platform **by api_name or slug, not by
+foreign key**, because the pipeline replaces every row in the ontology tables
+on each run. A real foreign key would either block regeneration or cascade a
+user's whole workspace away with it.
+
+The cost is that a reference can go stale, so a resource whose target no longer
+exists is marked `unresolved` and says why, rather than rendering an empty
+window as though nothing were wrong.
+
+### Row counts
+
+The connection preview reports **planner estimates**, not exact counts: an
+exact count over every table would be a table scan per table on every panel
+open. Tables Postgres has never analysed are shown as `+N?` rather than folded
+into the total — `reltuples` is `-1` for those, and summing them produced
+negative row counts.
+
 ## Pipeline builder
 
 `/pipeline` is a canvas where a pipeline is drawn — sources, transforms, the

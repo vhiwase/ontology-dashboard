@@ -49,6 +49,10 @@ interface Props {
 	onChange: (patch: Partial<InspectorNode>) => void;
 	onSelect: (nodeId: string) => void;
 	onClose: () => void;
+	/** Register this node's output as a dataset resource, where it has one. */
+	onCreateDataset?: (node: InspectorNode) => void;
+	/** Open the workspace preview window for what this node points at. */
+	onPreviewResource?: (node: InspectorNode) => void;
 }
 
 type Tab = "overview" | "configuration" | "dependencies" | "validation";
@@ -78,6 +82,8 @@ export function NodeInspector({
 	onChange,
 	onSelect,
 	onClose,
+	onCreateDataset,
+	onPreviewResource,
 }: Props) {
 	const [tab, setTab] = useState<Tab>("overview");
 
@@ -181,6 +187,37 @@ export function NodeInspector({
 								onChange={(event) => onChange({ description: event.target.value })}
 							/>
 						</label>
+
+						{/* The ontology kinds are the ones registered as resources, so
+						    they are the ones with a preview window to open. */}
+						{onPreviewResource &&
+							["objectType", "linkType", "actionType"].includes(node.kind) && (
+								<button
+									className="btn sm"
+									style={{ width: "100%", justifyContent: "center", marginBottom: 8 }}
+									onClick={() => onPreviewResource(node)}
+								>
+									Open preview window
+								</button>
+							)}
+
+						{/* Only an Object Type node has a published view behind it, so it
+						    is the only kind whose output can become a real dataset. */}
+						{onCreateDataset && !readOnly && node.kind === "objectType" && (
+							<button
+								className="btn sm primary"
+								style={{ width: "100%", justifyContent: "center" }}
+								onClick={() => onCreateDataset(node)}
+								disabled={!node.config?.objectType}
+								title={
+									node.config?.objectType
+										? "Register this node's output as a dataset in the workspace"
+										: "Choose an object type first"
+								}
+							>
+								Create dataset from this node
+							</button>
+						)}
 					</>
 				)}
 

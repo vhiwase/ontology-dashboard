@@ -81,8 +81,15 @@ function codes(report: ReturnType<typeof validateGraph>) {
 describe("ontology agreement", () => {
 	it("accepts a node naming a published object type", () => {
 		const report = validateGraph(
-			graph([node("src", "dataSource", { connection: "postgres" }), node("ot", "objectType", { objectType: "Order" })],
-				[edge("src", "ot")]),
+			// The source names a view as well as a connection: since the execution
+			// engine landed, a source with no view has nothing to read and warns.
+			graph(
+				[
+					node("src", "dataSource", { connection: "postgres", sourceView: "v_order" }),
+					node("ot", "objectType", { objectType: "Order" }),
+				],
+				[edge("src", "ot")],
+			),
 		);
 		expect(report.errors).toHaveLength(0);
 		expect(report.status).toBe("valid");

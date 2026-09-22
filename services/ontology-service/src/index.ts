@@ -28,6 +28,7 @@ import {
 } from "./dashboards";
 import { pool, query, waitForOntology } from "./db";
 import { clearColumnCache, dimensionValues, executeKpi, resolveKpi } from "./kpi";
+import { corpus, getDocument, searchDocumentation } from "./documentation";
 import { columnLineage, fetchGraph, trace, traceKpi, traceObjectType } from "./lineage";
 import {
 	deletePipeline,
@@ -37,10 +38,32 @@ import {
 	listVersions,
 	ontologyPalette,
 	restoreVersion,
+	acceptPipeline,
+	proposePipeline,
 	runPipeline,
 	savePipeline,
 	validateGraph,
 } from "./pipelines";
+import { datasetVersions, nodeRunsFor, previewOutput } from "./execute";
+import {
+	createLinkType,
+	deleteOntologyObject,
+	editOntologyObject,
+	type EditKind,
+	listEdits,
+	undoEdit,
+} from "./builder";
+import {
+	approveFunction,
+	functionRuns,
+	getFunction,
+	listFunctions,
+	proposeFunction,
+	runFunction,
+	setFunctionStatus,
+	updateFunction,
+	validateDefinition,
+} from "./functions";
 import {
 	aggregateObjects,
 	getObject,
@@ -48,7 +71,38 @@ import {
 	searchObjects,
 	traverseLink,
 } from "./objectSet";
-import { BadRequest, getRegistry, loadRegistry, NotFound, resolveObjectType } from "./registry";
+import {
+	BadRequest,
+	currentSpace,
+	getRegistry,
+	hasOntology,
+	loadRegistry,
+	NotFound,
+	resolveObjectType,
+	spacesWithOntology,
+	withSpace,
+} from "./registry";
+import {
+	createConnection,
+	createFolder,
+	createProject,
+	createResource,
+	databaseInfo,
+	deleteFolder,
+	deleteProject,
+	deleteResource,
+	listProjects,
+	listSpaces,
+	lookupResource,
+	previewResource,
+	projectTree,
+	publishedViews,
+	registerDataset,
+	renameResource,
+	retestConnection,
+	testConnection,
+	seedSandbox,
+} from "./spaces";
 
 const app = express();
 const PORT = Number(process.env.PORT ?? 4000);
@@ -158,17 +212,39 @@ app.post("/api/auth/login", handle(login));
 
 app.use("/api", apiAuthorization());
 
+// ── the space in scope for this request ─────────────────────────────────────
+//  The ontology belongs to a space (0012): its object types, links, actions,
+//  metrics and lineage are published by a pipeline that ran in one particular
+//  space. Everything below reads it through getRegistry(), which resolves it
+//  from this context rather than from a parameter — thirty-odd call sites deep
+//  in the SQL builders would otherwise each need a space threaded through them
+//  for no purpose but to carry it.
+//
+//  Entering the context here rather than per route means a route added later
+//  is space-scoped by default, the same reasoning as the auth guard above.
+app.use("/api", (req, _res, next) => {
+	const requested = typeof req.query.space === "string" ? req.query.space.trim() : "";
+	withSpace(requested || "sandbox", next);
+});
+
 app.get("/api/auth/me", me);
 
 app.post(
 	"/api/registry/reload",
 	handle(async (_req, res) => {
 		clearColumnCache();
-		const registry = await loadRegistry();
+		await loadRegistry();
+		// Reload rebuilds EVERY space's registry, so the answer names the spaces
+		// rather than a single version id: after 0012 there is no such thing as
+		// "the" active ontology, only one per space.
+		const spaces = spacesWithOntology();
+		const registry = hasOntology(currentSpace()) ? getRegistry() : null;
 		res.json({
 			reloaded: true,
-			ontologyVersionId: registry.ontologyVersionId,
-			objectTypes: registry.objectTypes.length,
+			spaces,
+			space: currentSpace(),
+			ontologyVersionId: registry?.ontologyVersionId ?? null,
+			objectTypes: registry?.objectTypes.length ?? 0,
 		});
 	}),
 );
@@ -547,14 +623,17 @@ app.get(
 
 // ── dashboards ──────────────────────────────────────────────────────────────
 
-app.get("/api/dashboards", handle(async (_req, res) => res.json(await listDashboards())));
+app.get(
+	"/api/dashboards",
+	handle(async (req, res) => res.json(await listDashboards(req.query.space ? String(req.query.space) : undefined))),
+);
 
 // Provenance for every dashboard: which conversation built it, and how it has
 // been renamed since. Registered before /api/dashboards/:slug so "history" is
 // not read as a slug.
 app.get(
 	"/api/dashboards/history",
-	handle(async (_req, res) => res.json(await dashboardHistory())),
+	handle(async (req, res) => res.json(await dashboardHistory(req.query.space ? String(req.query.space) : undefined))),
 );
 
 // A backup the user keeps locally. The browser saves the response as a file,
@@ -566,7 +645,7 @@ app.get(
 			.split(",")
 			.map((value) => value.trim())
 			.filter(Boolean);
-		res.json(await exportDashboards(req.principal?.username ?? "unknown", slugs));
+		res.json(await exportDashboards(req.principal?.username ?? "unknown", slugs, req.query.space ? String(req.query.space) : undefined));
 	}),
 );
 
@@ -579,6 +658,7 @@ app.post(
 				body.backup ?? body,
 				req.principal?.username ?? "unknown",
 				Boolean(body.overwrite),
+				req.query.space ? String(req.query.space) : undefined,
 			),
 		);
 	}),
@@ -592,6 +672,7 @@ app.post(
 				String(req.params.slug),
 				String((req.body ?? {}).title ?? ""),
 				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
 			),
 		);
 	}),
@@ -602,14 +683,23 @@ app.get(
 	handle(async (req, res) => {
 		const resolved = String(req.query.resolve ?? "true") !== "false";
 		const slug = String(req.params.slug);
-		res.json(resolved ? await resolveDashboard(slug) : await getDashboard(slug));
+		const space = req.query.space ? String(req.query.space) : undefined;
+		res.json(resolved ? await resolveDashboard(slug, space) : await getDashboard(slug, space));
 	}),
 );
 
 app.post(
 	"/api/dashboards",
 	handle(async (req, res) => {
-		res.status(201).json(await saveDashboard(req.body ?? {}));
+		const body = req.body ?? {};
+		res.status(201).json(
+			await saveDashboard({
+				...body,
+				// The active space wins unless the body names one explicitly, so a
+				// board saved while viewing Staging lands in Staging.
+				spaceSlug: body.spaceSlug ?? (req.query.space ? String(req.query.space) : undefined),
+			}),
+		);
 	}),
 );
 
@@ -623,7 +713,7 @@ app.post(
 app.delete(
 	"/api/dashboards/:slug",
 	handle(async (req, res) => {
-		await deleteDashboard(String(req.params.slug));
+		await deleteDashboard(String(req.params.slug), req.query.space ? String(req.query.space) : undefined);
 		res.status(204).end();
 	}),
 );
@@ -735,7 +825,13 @@ app.get(
 	handle(async (_req, res) => res.json(ontologyPalette())),
 );
 
-app.get("/api/pipelines", handle(async (_req, res) => res.json(await listPipelines())));
+app.get(
+	"/api/pipelines",
+	handle(async (req, res) => {
+		const space = req.query.space ? String(req.query.space) : undefined;
+		res.json(await listPipelines(space));
+	}),
+);
 
 // Validate a graph without saving it, which is what the canvas calls as the
 // user edits.
@@ -755,20 +851,37 @@ app.post(
 
 app.get(
 	"/api/pipelines/:slug",
-	handle(async (req, res) => res.json(await getPipeline(String(req.params.slug)))),
+	handle(async (req, res) =>
+		res.json(
+			await getPipeline(
+				String(req.params.slug),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		),
+	),
 );
 
 app.delete(
 	"/api/pipelines/:slug",
 	handle(async (req, res) => {
-		await deletePipeline(String(req.params.slug));
+		await deletePipeline(
+			String(req.params.slug),
+			req.query.space ? String(req.query.space) : undefined,
+		);
 		res.status(204).end();
 	}),
 );
 
 app.get(
 	"/api/pipelines/:slug/versions",
-	handle(async (req, res) => res.json(await listVersions(String(req.params.slug)))),
+	handle(async (req, res) =>
+		res.json(
+			await listVersions(
+				String(req.params.slug),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		),
+	),
 );
 
 app.post(
@@ -779,6 +892,7 @@ app.post(
 				String(req.params.slug),
 				Number(req.params.version),
 				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
 			),
 		);
 	}),
@@ -787,14 +901,467 @@ app.post(
 app.post(
 	"/api/pipelines/:slug/run",
 	handle(async (req, res) => {
-		res.json(await runPipeline(String(req.params.slug), req.principal?.username ?? "unknown"));
+		res.json(
+			await runPipeline(
+				String(req.params.slug),
+				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
 	}),
 );
 
 app.get(
 	"/api/pipelines/:slug/runs",
 	handle(async (req, res) => {
-		res.json(await listRuns(String(req.params.slug), Number(req.query.limit ?? 20)));
+		res.json(
+			await listRuns(
+				String(req.params.slug),
+				Number(req.query.limit ?? 20),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+// ── what a run actually produced ────────────────────────────────────────────
+//  The estimator had nothing to show beyond a row count, so these are new:
+//  each node's rows, timing, materialised table and the SQL it ran.
+
+/** Record a pipeline the assistant drafted (§18). It is inert until accepted. */
+app.post(
+	"/api/pipelines/propose",
+	handle(async (req, res) => {
+		res
+			.status(201)
+			.json(await proposePipeline(req.body, req.principal?.username ?? "unknown"));
+	}),
+);
+
+/** The Accept in Accept / Edit / Reject. */
+app.post(
+	"/api/pipelines/:slug/accept",
+	handle(async (req, res) => {
+		res.json(
+			await acceptPipeline(String(req.params.slug), req.principal?.username ?? "unknown"),
+		);
+	}),
+);
+
+app.get(
+	"/api/pipelines/runs/:runId/nodes",
+	handle(async (req, res) => {
+		res.json(await nodeRunsFor(Number(req.params.runId)));
+	}),
+);
+
+/**
+ * Preview a node's materialised output.
+ *
+ * Restricted to the pipeline_out schema by previewOutput itself: a caller
+ * cannot use this to read an arbitrary table, and a warehouse relation goes
+ * through the resource preview, which checks it against the registry.
+ */
+app.get(
+	"/api/pipelines/outputs/:qualified/preview",
+	handle(async (req, res) => {
+		res.json(
+			await previewOutput(String(req.params.qualified), Number(req.query.limit ?? 50)),
+		);
+	}),
+);
+
+/** How a materialised dataset's shape has changed run over run. */
+app.get(
+	"/api/datasets/:qualified/versions",
+	handle(async (req, res) => {
+		res.json(await datasetVersions(String(req.params.qualified)));
+	}),
+);
+
+// ── the ontology builder (§7-10) ────────────────────────────────────────────
+//  Editing an ontology that a pipeline regenerates. Every change is applied to
+//  the live version AND journalled, so the next publish replays it rather than
+//  silently discarding it — see builder.ts.
+
+const EDIT_KINDS = ["objectType", "property", "linkType", "actionType"] as const;
+
+function editKind(raw: string): EditKind {
+	if (!(EDIT_KINDS as readonly string[]).includes(raw)) {
+		throw new BadRequest(
+			`'${raw}' is not an editable kind. Use one of: ${EDIT_KINDS.join(", ")}.`,
+		);
+	}
+	return raw as EditKind;
+}
+
+app.patch(
+	"/api/ontology/:kind/:rid",
+	handle(async (req, res) => {
+		const body = req.body as { fields?: Record<string, unknown>; note?: string };
+		res.json(
+			await editOntologyObject(
+				editKind(String(req.params.kind)),
+				String(req.params.rid),
+				body.fields ?? {},
+				req.principal?.username ?? "unknown",
+				body.note,
+			),
+		);
+	}),
+);
+
+/** Draw a link by hand (§9). The match ratio is measured, not assumed. */
+app.post(
+	"/api/ontology/link-types",
+	handle(async (req, res) => {
+		res.status(201).json(await createLinkType(req.body, req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.delete(
+	"/api/ontology/:kind/:rid",
+	handle(async (req, res) => {
+		const kind = editKind(String(req.params.kind));
+		if (kind !== "linkType" && kind !== "actionType") {
+			throw new BadRequest("Only link types and action types can be deleted.");
+		}
+		await deleteOntologyObject(kind, String(req.params.rid), req.principal?.username ?? "unknown");
+		res.status(204).end();
+	}),
+);
+
+/** Every change made to this space's ontology, newest first. */
+app.get(
+	"/api/ontology/edits",
+	handle(async (req, res) => res.json(await listEdits(Number(req.query.limit ?? 50)))),
+);
+
+app.post(
+	"/api/ontology/edits/:id/undo",
+	handle(async (req, res) => {
+		await undoEdit(Number(req.params.id), req.principal?.username ?? "unknown");
+		res.status(204).end();
+	}),
+);
+
+// ── functions ───────────────────────────────────────────────────────────────
+//  A function is drafted (by a person or by the assistant), reviewed, and only
+//  then approved into something that can produce numbers. The split is the
+//  feature: see functions.ts.
+
+app.get(
+	"/api/functions",
+	handle(async (req, res) => {
+		res.json(await listFunctions(req.query.status ? String(req.query.status) : undefined));
+	}),
+);
+
+app.get(
+	"/api/functions/:apiName",
+	handle(async (req, res) => res.json(await getFunction(String(req.params.apiName)))),
+);
+
+app.get(
+	"/api/functions/:apiName/runs",
+	handle(async (req, res) => {
+		res.json(await functionRuns(String(req.params.apiName), Number(req.query.limit ?? 25)));
+	}),
+);
+
+/**
+ * Check a definition without saving it.
+ *
+ * What the proposal dialog calls as the user edits, so a definition that will
+ * not run is caught while they are still looking at it rather than on submit.
+ */
+app.post(
+	"/api/functions/validate",
+	handle(async (req, res) => {
+		const body = req.body as { definition?: string; language?: string };
+		res.json(
+			await validateDefinition(String(body.definition ?? ""), String(body.language ?? "sql")),
+		);
+	}),
+);
+
+app.post(
+	"/api/functions",
+	handle(async (req, res) => {
+		res
+			.status(201)
+			.json(await proposeFunction(req.body, req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.patch(
+	"/api/functions/:apiName",
+	handle(async (req, res) => {
+		res.json(
+			await updateFunction(
+				String(req.params.apiName),
+				req.body,
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+/** The submit button in the proposal dialog. */
+app.post(
+	"/api/functions/:apiName/approve",
+	handle(async (req, res) => {
+		res.json(
+			await approveFunction(String(req.params.apiName), req.principal?.username ?? "unknown"),
+		);
+	}),
+);
+
+app.post(
+	"/api/functions/:apiName/reject",
+	handle(async (req, res) => {
+		res.json(
+			await setFunctionStatus(
+				String(req.params.apiName),
+				"rejected",
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/functions/:apiName/archive",
+	handle(async (req, res) => {
+		res.json(
+			await setFunctionStatus(
+				String(req.params.apiName),
+				"archived",
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/functions/:apiName/run",
+	handle(async (req, res) => {
+		// A proposal may be trialled from the dialog before approval, so the
+		// reviewer can see the number it produces. It still cannot be used by a
+		// dashboard until it is active.
+		res.json(
+			await runFunction(
+				String(req.params.apiName),
+				req.principal?.username ?? "unknown",
+				req.query.preview === "true",
+			),
+		);
+	}),
+);
+
+
+// ── spaces, projects, folders, resources ────────────────────────────────────
+
+app.get("/api/spaces", handle(async (_req, res) => res.json(await listSpaces())));
+
+// The database this platform is actually running against, read live.
+app.get("/api/spaces/database", handle(async (_req, res) => res.json(await databaseInfo())));
+
+// The views a dataset may be registered on, offered by the register dialog.
+app.get("/api/spaces/views", handle(async (_req, res) => res.json(publishedViews())));
+
+// Fills the sandbox on first use. Idempotent, so the UI can call it whenever
+// the sandbox is empty rather than needing a separate setup step.
+app.post(
+	"/api/spaces/sandbox/seed",
+	handle(async (req, res) => res.json(await seedSandbox(req.principal?.username ?? "unknown"))),
+);
+
+app.get(
+	"/api/spaces/:space/projects",
+	handle(async (req, res) => res.json(await listProjects(String(req.params.space)))),
+);
+
+app.post(
+	"/api/spaces/:space/projects",
+	handle(async (req, res) => {
+		const body = req.body ?? {};
+		res.json(
+			await createProject(
+				String(req.params.space),
+				String(body.name ?? ""),
+				body.description ?? null,
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.delete(
+	"/api/spaces/:space/projects/:project",
+	handle(async (req, res) => {
+		await deleteProject(String(req.params.space), String(req.params.project));
+		res.status(204).end();
+	}),
+);
+
+app.get(
+	"/api/spaces/:space/projects/:project/tree",
+	handle(async (req, res) =>
+		res.json(await projectTree(String(req.params.space), String(req.params.project))),
+	),
+);
+
+app.post(
+	"/api/spaces/:space/projects/:project/folders",
+	handle(async (req, res) => {
+		const body = req.body ?? {};
+		res.json(
+			await createFolder(
+				String(req.params.space),
+				String(req.params.project),
+				String(body.name ?? ""),
+				body.parentId === undefined || body.parentId === null ? null : Number(body.parentId),
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/spaces/:space/projects/:project/resources",
+	handle(async (req, res) => {
+		res.json(
+			await createResource(
+				String(req.params.space),
+				String(req.params.project),
+				req.body ?? {},
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+// Turn a view - typically one a pipeline node produced - into a dataset
+// resource anyone can open, share and build on.
+app.post(
+	"/api/spaces/:space/projects/:project/datasets",
+	handle(async (req, res) => {
+		res.json(
+			await registerDataset(
+				String(req.params.space),
+				String(req.params.project),
+				req.body ?? {},
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+// Try a connection WITHOUT storing it, so a wrong host or an unreadable secret
+// is found before anything is written.
+app.post(
+	"/api/spaces/connections/test",
+	handle(async (req, res) => res.json(await testConnection(req.body ?? {}))),
+);
+
+app.post(
+	"/api/spaces/:space/projects/:project/connections",
+	handle(async (req, res) => {
+		res.json(
+			await createConnection(
+				String(req.params.space),
+				String(req.params.project),
+				req.body ?? {},
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/resources/:id/test",
+	handle(async (req, res) => res.json(await retestConnection(Number(req.params.id)))),
+);
+
+// What the preview window shows: schema, sample rows, lineage and the
+// kind-specific detail.
+app.get(
+	"/api/resources/lookup",
+	handle(async (req, res) => {
+		res.json(
+			await lookupResource(
+				String(req.query.kind ?? ""),
+				String(req.query.ref ?? ""),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.get(
+	"/api/resources/:id/preview",
+	handle(async (req, res) => res.json(await previewResource(Number(req.params.id)))),
+);
+
+app.post(
+	"/api/resources/:id/rename",
+	handle(async (req, res) =>
+		res.json(await renameResource(Number(req.params.id), String((req.body ?? {}).name ?? ""))),
+	),
+);
+
+app.delete(
+	"/api/resources/:id",
+	handle(async (req, res) => {
+		await deleteResource(Number(req.params.id));
+		res.status(204).end();
+	}),
+);
+
+app.delete(
+	"/api/folders/:id",
+	handle(async (req, res) => {
+		await deleteFolder(Number(req.params.id));
+		res.status(204).end();
+	}),
+);
+
+// ── documentation ───────────────────────────────────────────────────────────
+//
+//  The corpus the assistant searches and cites. Generated from the live
+//  registry rather than stored, so a cited caveat is the caveat in force.
+
+app.get(
+	"/api/docs/search",
+	handle(async (req, res) => {
+		res.json(
+			searchDocumentation(String(req.query.q ?? ""), Number(req.query.limit ?? 6)),
+		);
+	}),
+);
+
+app.get(
+	"/api/docs",
+	handle(async (_req, res) => {
+		res.json(
+			corpus().map((doc) => ({
+				path: doc.path,
+				title: doc.title,
+				category: doc.category,
+				summary: doc.summary,
+			})),
+		);
+	}),
+);
+
+// The path carries slashes ("metric/on_time_pct"), so it is taken from the
+// wildcard rather than a single parameter.
+app.get(
+	"/api/docs/page/*",
+	handle(async (req, res) => {
+		const path = String(req.params[0] ?? "");
+		res.json(getDocument(path));
 	}),
 );
 

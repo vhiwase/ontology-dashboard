@@ -20,7 +20,8 @@ from typing import Any
 
 import psycopg
 
-from .db import upsert_many
+from .config import CONFIG
+from .db import execute, space_id, upsert_many
 
 log = logging.getLogger("pipeline.kpi")
 
@@ -542,10 +543,39 @@ def register_kpis(conn: psycopg.Connection) -> int:
             )
         )
 
+    # Each space holds its own copy of the catalogue, so publishing into
+    # staging neither overwrites nor borrows the sandbox's metrics.
+    space = space_id(conn, CONFIG.space)
+    rows = [(space, *row) for row in rows]
+
+    # A metric whose source data does not exist is not published.
+    #
+    # These read from tms_sim, which is empty unless simulation was explicitly
+    # turned on. Registering them anyway would put "Cost per km: $4.61" on a
+    # dashboard with nothing behind it - a fabricated figure wearing the same
+    # typeface as a measured one. They are removed from the catalogue instead,
+    # and re-appear automatically if the source ever starts carrying actuals.
+    if not CONFIG.simulate_execution:
+        simulated = {s["api_name"] for s in KPI_SPECS if s.get("depends_on_simulation")}
+        rows = [row for row in rows if row[2] not in simulated]
+
+        # Remove any that a previous run registered, so turning simulation off
+        # actually withdraws them rather than leaving stale definitions behind.
+        removed = execute(
+            conn,
+            "DELETE FROM platform.kpi_definition WHERE space_id = %s AND api_name = ANY(%s)",
+            (space, list(simulated)),
+        )
+        if removed:
+            log.info(
+                "Withdrew %d metric(s) that rest on data the source does not carry.", removed
+            )
+
     written = upsert_many(
         conn,
         "platform.kpi_definition",
         [
+            "space_id",
             "kpi_rid", "api_name", "label", "description", "business_question", "category",
             "source_view", "measure_column", "aggregation", "numerator_column",
             "denominator_column", "dimensions", "default_dimension", "time_column", "unit",
@@ -554,7 +584,7 @@ def register_kpis(conn: psycopg.Connection) -> int:
             "coverage_note", "display_order",
         ],
         rows,
-        ["kpi_rid"],
+        ["space_id", "kpi_rid"],
     )
     simulated = sum(1 for s in KPI_SPECS if s.get("depends_on_simulation"))
     log.info(
@@ -570,7 +600,18 @@ def validate_kpis(conn: psycopg.Connection) -> list[str]:
     A catalogue entry naming a column that was renamed is worse than no entry:
     the assistant offers the metric, builds a chart, and the query fails at the
     point a business user is looking at it.
+
+    Metrics deliberately WITHDRAWN are skipped. Their views were dropped on
+    purpose because the snapshot cannot produce the figures, so reporting them
+    as broken would bury the real problems this check exists to surface - and,
+    as the dashboard validator already proved, conflating "absent by design"
+    with "broken" is how a publish ends up failing for no good reason.
     """
+    withdrawn = (
+        {spec["api_name"] for spec in KPI_SPECS if spec.get("depends_on_simulation")}
+        if not CONFIG.simulate_execution
+        else set()
+    )
     problems: list[str] = []
     columns_by_view: dict[str, set[str]] = {}
     for row in conn.execute(
@@ -583,6 +624,8 @@ def validate_kpis(conn: psycopg.Connection) -> list[str]:
         columns_by_view.setdefault(row["view_name"], set()).add(row["column_name"])
 
     for spec in KPI_SPECS:
+        if spec["api_name"] in withdrawn:
+            continue
         view = spec["source_view"]
         available = columns_by_view.get(view)
         if available is None:

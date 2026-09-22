@@ -16,9 +16,18 @@ import {
 	type SearchResult,
 	api,
 	formatCell,
+	isMissingOntology,
 	round,
 } from "../api";
-import { DataTable, Empty, ErrorBanner, Spinner, useDebounced } from "../components/common";
+import { useSpace } from "../SpaceContext";
+import {
+	DataTable,
+	Empty,
+	ErrorBanner,
+	NoOntologyHere,
+	Spinner,
+	useDebounced,
+} from "../components/common";
 
 interface FilterRow {
 	id: number;
@@ -68,16 +77,31 @@ export function ObjectExplorer() {
 	const [error, setError] = useState<string | null>(null);
 	const [openKey, setOpenKey] = useState<string | null>(null);
 	const [showSql, setShowSql] = useState(false);
+	const [missing, setMissing] = useState(false);
+	const { spaceSlug, space } = useSpace();
 
 	const pageSize = 25;
 	const debouncedSearch = useDebounced(search, 350);
 
+	// Reloaded per space: the object types on offer are the ones this space's
+	// pipeline published. The selection falls back to whatever the new space
+	// does have, since "Order" need not exist there.
 	useEffect(() => {
+		setTypes(null);
+		setError(null);
+		setMissing(false);
 		api
 			.get<ObjectTypeSummary[]>("/api/object-types")
-			.then(setTypes)
-			.catch((exc: Error) => setError(exc.message));
-	}, []);
+			.then((rows) => {
+				setTypes(rows);
+				setTypeName((current) =>
+					rows.some((row) => row.apiName === current) ? current : (rows[0]?.apiName ?? ""),
+				);
+			})
+			.catch((exc: Error) =>
+				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
+			);
+	}, [spaceSlug]);
 
 	useEffect(() => {
 		setDetail(null);
@@ -85,6 +109,8 @@ export function ObjectExplorer() {
 		setSortProperty("");
 		setPage(0);
 		setOpenKey(null);
+		// Empty while a space with no ontology is selected, or between spaces.
+		if (!typeName) return;
 		api
 			.get<ObjectTypeDetail>(`/api/object-types/${typeName}`)
 			.then(setDetail)
@@ -151,6 +177,8 @@ export function ObjectExplorer() {
 			.finally(() => setBusy(false));
 	}, [detail, typeName, filters, debouncedSearch, sortProperty, sortDescending, page, displayColumns]);
 
+	if (missing)
+		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (!types) return <Spinner label="Loading object types" />;
 
 	return (
@@ -429,17 +457,42 @@ function ObjectDetail({
 		? String(object[type.titleProperty ?? ""] ?? objectKey)
 		: objectKey;
 
-	return (
-		<div className="card">
-			<div className="card-head">
-				<h3>
-					{type.label} · {title}
-				</h3>
-				<button className="btn sm" onClick={onClose} style={{ marginLeft: "auto" }}>
-					Close
-				</button>
-			</div>
+	// Escape closes, the way every other window in the app does.
+	useEffect(() => {
+		function onKey(event: KeyboardEvent) {
+			if (event.key === "Escape") onClose();
+		}
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
+	}, [onClose]);
 
+	return (
+		/* A window, not a panel appended under the table. Inline, it pushed the
+		   results down and left the row you clicked scrolled off the top, so
+		   reading an object meant losing your place in the list. */
+		<div
+			className="rp-backdrop"
+			onMouseDown={(event) => {
+				if (event.target === event.currentTarget) onClose();
+			}}
+		>
+			<div className="rp rp-wide" role="dialog" aria-label={`${type.label} detail`}>
+				<header className="rp-head">
+					<span className="rp-glyph" aria-hidden>
+						◈
+					</span>
+					<div className="rp-heading">
+						<div className="rp-kind">{type.label.toUpperCase()}</div>
+						<h2 className="rp-title" title={title}>
+							{title}
+						</h2>
+					</div>
+					<button className="btn sm" onClick={onClose} aria-label="Close">
+						✕
+					</button>
+				</header>
+
+				<div className="rp-body">
 			{error && <ErrorBanner error={error} />}
 			{!object ? (
 				<Spinner label="Loading object" />
@@ -533,6 +586,8 @@ function ObjectDetail({
 					)}
 				</div>
 			)}
+				</div>
+			</div>
 		</div>
 	);
 }

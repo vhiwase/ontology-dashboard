@@ -279,6 +279,95 @@ class Agent:
                     if artifact:
                         artifacts.append(artifact)
 
+                # request_clarification is terminal. Feeding its result back and
+                # continuing would mean the model answering the very question it
+                # just said it could not answer, which is the guess the tool
+                # exists to prevent. The turn ends and the question goes to the
+                # user; their reply arrives as the next turn.
+                if ok and call.name == "request_clarification":
+                    return AgentResult(
+                        content=payload.get("question", ""),
+                        tool_invocations=invocations,
+                        artifacts=[
+                            *artifacts,
+                            {
+                                "kind": "clarification",
+                                "question": payload.get("question", ""),
+                                "options": payload.get("options", []),
+                                "allowFreeText": payload.get("allowFreeText", True),
+                            },
+                        ],
+                        rounds=rounds,
+                        usage=usage,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        stopped_because="needs_clarification",
+                        provider=provider_used,
+                        model=model_used,
+                        failover_reason=failover_reason,
+                    )
+
+                # propose_pipeline is terminal too: a graph that runs writes
+                # real tables the dashboards read, so the turn ends and a
+                # person decides whether it becomes one.
+                if ok and call.name == "propose_pipeline" and payload.get("pipelineProposed"):
+                    drafted = payload.get("pipeline", {})
+                    nodes = len((drafted.get("graph") or {}).get("nodes") or [])
+                    return AgentResult(
+                        content=(
+                            f"I have drafted **{drafted.get('name')}** - a {nodes}-node "
+                            "pipeline. Every node compiles against the published views, "
+                            "but nothing has run."
+                            "\n\n"
+                            "Review the graph and accept it to make it runnable."
+                        ),
+                        tool_invocations=invocations,
+                        artifacts=[
+                            *artifacts,
+                            {
+                                "kind": "pipelineProposal",
+                                "pipeline": drafted,
+                                "compiled": payload.get("compiled", []),
+                            },
+                        ],
+                        rounds=rounds,
+                        usage=usage,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        stopped_because="awaiting_pipeline_acceptance",
+                        provider=provider_used,
+                        model=model_used,
+                        failover_reason=failover_reason,
+                    )
+
+                # propose_function is terminal for the same reason. The draft
+                # computes nothing and cannot back a dashboard, so continuing
+                # would only let the model build on a metric nobody has
+                # approved - which is precisely what the proposal step exists
+                # to prevent. The turn ends and the review dialog opens.
+                if ok and call.name == "propose_function" and payload.get("functionProposed"):
+                    proposed = payload.get("function", {})
+                    return AgentResult(
+                        content=(
+                            f"There is no published metric for that, so I have drafted one: "
+                            f"**{proposed.get('name')}**. "
+                            f"{proposed.get('description') or ''}"
+                            "\n\n"
+                            "It is saved as a proposal and computes nothing yet. Review the "
+                            "definition and approve it to start using it."
+                        ),
+                        tool_invocations=invocations,
+                        artifacts=[
+                            *artifacts,
+                            {"kind": "functionProposal", "function": proposed},
+                        ],
+                        rounds=rounds,
+                        usage=usage,
+                        latency_ms=int((time.monotonic() - started) * 1000),
+                        stopped_because="awaiting_function_approval",
+                        provider=provider_used,
+                        model=model_used,
+                        failover_reason=failover_reason,
+                    )
+
                 messages.append(
                     {
                         "role": "tool",

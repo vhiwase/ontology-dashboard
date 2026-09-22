@@ -30,7 +30,9 @@ from typing import Any
 
 import psycopg
 
-from .db import upsert_many
+from .config import CONFIG
+from .db import execute, space_id, upsert_many
+from .kpi_catalog import KPI_SPECS
 
 log = logging.getLogger("pipeline.dashboards")
 
@@ -226,10 +228,18 @@ def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
     looked absent, got seeded again, and the user was left with two of them.
     seed_key never changes, so the renamed one is recognised and left alone.
     """
+    # Scoped to the space this run publishes into. Checking globally meant a
+    # starter dashboard that exists in the sandbox counted as present in every
+    # space, so a freshly published space got none of them — and had the check
+    # passed, the insert would have failed anyway, because space_id is NOT NULL
+    # and nothing below was supplying it.
+    space = space_id(conn, CONFIG.space)
     existing = {
         row["seed_key"]
         for row in conn.execute(
-            "SELECT seed_key FROM platform.dashboard WHERE seed_key IS NOT NULL"
+            "SELECT seed_key FROM platform.dashboard "
+            "WHERE seed_key IS NOT NULL AND space_id = %s",
+            (space,),
         ).fetchall()
     }
 
@@ -237,11 +247,25 @@ def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
     # user's own dashboard, say - would collide on insert.
     taken = {
         row["slug"]: row["seed_key"]
-        for row in conn.execute("SELECT slug, seed_key FROM platform.dashboard").fetchall()
+        for row in conn.execute(
+            "SELECT slug, seed_key FROM platform.dashboard WHERE space_id = %s",
+            (space,),
+        ).fetchall()
+    }
+
+    # Which metrics actually exist in this space. A widget naming one that was
+    # withdrawn - because its source data does not exist - is dropped rather
+    # than seeded, so a dashboard never carries a tile with nothing behind it.
+    available = {
+        row["api_name"]
+        for row in conn.execute(
+            "SELECT api_name FROM platform.kpi_definition WHERE space_id = %s", (space,)
+        ).fetchall()
     }
 
     rows = []
     skipped = 0
+    dropped_widgets = 0
     for dashboard in DASHBOARDS:
         seed_key = dashboard["slug"]
         if seed_key in existing and not overwrite:
@@ -255,13 +279,32 @@ def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
             )
             skipped += 1
             continue
+        # Keep notes (which carry no metric) and widgets whose KPI is present.
+        layout = [
+            widget
+            for widget in dashboard["layout"]
+            if widget.get("type") == "note" or widget.get("kpi") in available
+        ]
+        dropped_widgets += len(dashboard["layout"]) - len(layout)
+
+        # A dashboard left with nothing but its notes has no content to show.
+        # Seeding it would present an empty board as though it were a report.
+        if not any(widget.get("type") != "note" for widget in layout):
+            log.info(
+                "Not seeding %r: every metric it charts rests on data the source does not carry.",
+                dashboard["slug"],
+            )
+            skipped += 1
+            continue
+
         rows.append(
             (
+                space,
                 seed_key,
                 dashboard["slug"],
                 dashboard["title"],
                 dashboard.get("description"),
-                json.dumps(dashboard["layout"]),
+                json.dumps(layout),
                 json.dumps(dashboard.get("filters", {})),
                 dashboard.get("audience"),
                 False,
@@ -275,11 +318,12 @@ def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
         conn,
         "platform.dashboard",
         [
+            "space_id",
             "seed_key", "slug", "title", "description", "layout", "filters",
             "audience", "is_ai_generated", "source_prompt", "created_by", "is_pinned",
         ],
         rows,
-        ["seed_key"],
+        ["space_id", "seed_key"],
         # updated_at is deliberately not in the update list so a reseed does not
         # look like a user edit in the dashboard list ordering.
         update_columns=[
@@ -287,9 +331,106 @@ def seed_dashboards(conn: psycopg.Connection, overwrite: bool = False) -> int:
         ],
     )
     log.info(
-        "Seeded %d dashboards (%d left alone because they already exist).", written, skipped
+        "Seeded %d dashboards (%d left alone or empty).", written, skipped
     )
+    if dropped_widgets:
+        log.info(
+            "    %d widget(s) omitted: their metric has no real source data.", dropped_widgets
+        )
     return written
+
+
+def prune_unavailable_widgets(conn: psycopg.Connection) -> int:
+    """Remove widgets whose metric no longer exists.
+
+    Seeding only writes dashboards that are absent, so a board created before a
+    metric was withdrawn would keep charting it. The tile cannot render
+    anything real - the metric is gone precisely because its source data does
+    not exist - so it is removed rather than left to display a blank or a
+    fabricated figure.
+
+    Touches only the widget list. Titles, descriptions, notes and every widget
+    that still resolves are left exactly as they were.
+    """
+    space = space_id(conn, CONFIG.space)
+    available = {
+        row["api_name"]
+        for row in conn.execute(
+            "SELECT api_name FROM platform.kpi_definition WHERE space_id = %s", (space,)
+        ).fetchall()
+    }
+
+    boards = conn.execute(
+        "SELECT dashboard_id, slug, layout FROM platform.dashboard WHERE space_id = %s",
+        (space,),
+    ).fetchall()
+
+    # What each starter board was specified to chart, so a board pruned on an
+    # EARLIER run is still explained. Comparing against the spec rather than
+    # against this run's removals makes the reconciliation idempotent.
+    specified: dict[str, set[str]] = {
+        spec["slug"]: {
+            w["kpi"] for w in spec["layout"] if w.get("type") != "note" and w.get("kpi")
+        }
+        for spec in DASHBOARDS
+    }
+
+    pruned = 0
+    for board in boards:
+        layout = board["layout"] or []
+        kept = [
+            widget
+            for widget in layout
+            if widget.get("type") == "note" or widget.get("kpi") in available
+        ]
+        removed_now = len(layout) - len(kept)
+
+        # Figures this board was meant to show that no longer have a source,
+        # whether they were stripped just now or on a previous run.
+        missing = specified.get(board["slug"], set()) - available
+        if removed_now == 0 and not missing:
+            continue
+
+        removed = removed_now or len(missing)
+        pruned += removed_now
+
+        # Say why the board is thinner than it was. A dashboard titled
+        # "Freight Spend and Margin" showing a single unrelated tile reads as
+        # broken; the same board saying which figures were withdrawn and why
+        # is doing its job. The note replaces any earlier one so repeated runs
+        # do not stack them up.
+        kept = [w for w in kept if w.get("id") != "coverage-note"]
+        kept.insert(
+            0,
+            {
+                "id": "coverage-note",
+                "type": "note",
+                "width": 4,
+                "title": f"{removed} figure(s) removed",
+                "body": (
+                    "These charts were withdrawn because the captured snapshot carries no "
+                    "data for them - no carrier assignment, no execution actuals, no leg "
+                    "distance and no arrivals. They were previously drawn from generated "
+                    "values. Nothing shown here is simulated; what remains is measured."
+                ),
+            },
+        )
+
+        execute(
+            conn,
+            "UPDATE platform.dashboard SET layout = %s, updated_at = now() WHERE dashboard_id = %s",
+            (json.dumps(kept), board["dashboard_id"]),
+        )
+        if removed_now:
+            log.info(
+                "    %s: removed %d widget(s) with no real source data.",
+                board["slug"], removed_now,
+            )
+
+    conn.commit()
+    if pruned:
+        log.info("Pruned %d dashboard widget(s) that had no measurable metric behind them.", pruned)
+    return pruned
 
 
 def validate_dashboards(conn: psycopg.Connection) -> list[str]:
@@ -297,15 +438,36 @@ def validate_dashboards(conn: psycopg.Connection) -> list[str]:
     catalogue = {
         row["api_name"]: (row["dimensions"] or [])
         for row in conn.execute(
-            "SELECT api_name, dimensions FROM platform.kpi_definition"
+            "SELECT k.api_name, k.dimensions FROM platform.kpi_definition k "
+            "JOIN platform.space s ON s.space_id = k.space_id WHERE s.slug = %s",
+            (CONFIG.space,),
         ).fetchall()
     }
+    # Metrics deliberately withdrawn because the source carries no data for
+    # them. A widget naming one is not a defect in the spec - it is a chart the
+    # platform correctly declines to draw - so it is reported as an omission
+    # and not as a problem that should stop a publish.
+    #
+    # This distinction matters: conflating the two took the whole ontology
+    # down. validate_dashboards raised before the widgets could be pruned, the
+    # publish rolled back, and the database was left with no active ontology at
+    # all because seventeen metrics were legitimately absent.
+    withdrawn = {
+        spec["api_name"]
+        for spec in KPI_SPECS
+        if spec.get("depends_on_simulation")
+    } if not CONFIG.simulate_execution else set()
+
     problems: list[str] = []
+    omitted = 0
     for dashboard in DASHBOARDS:
         for index, widget in enumerate(dashboard["layout"]):
             if widget["type"] == "note":
                 continue
             kpi = widget.get("kpi")
+            if kpi in withdrawn:
+                omitted += 1
+                continue
             if kpi not in catalogue:
                 problems.append(f"{dashboard['slug']}[{index}]: unknown KPI {kpi!r}")
                 continue
@@ -315,6 +477,10 @@ def validate_dashboards(conn: psycopg.Connection) -> list[str]:
                     f"{dashboard['slug']}[{index}]: KPI {kpi} cannot be grouped by "
                     f"{dimension!r} (allowed: {', '.join(catalogue[kpi])})"
                 )
+    if omitted:
+        log.info(
+            "%d dashboard widget(s) omitted: their metric has no real source data.", omitted
+        )
     for problem in problems:
         log.error("Dashboard seed: %s", problem)
     return problems

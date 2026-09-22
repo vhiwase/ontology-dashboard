@@ -32,7 +32,8 @@ import psycopg
 
 from .actions import ACTIONS, ROLES, action_types_for_ontology, register_actions
 from .config import CONFIG
-from .db import execute, query, query_one, upsert_many
+from .db import execute, query, query_one, space_id, upsert_many
+from .replay import replay_edits
 from .introspect import PropertyInfo, ViewInfo, camel_case, humanize, pluralize
 from .relationships import DiscoveryResult, LinkCandidate
 
@@ -818,21 +819,30 @@ def persist(
     """Write the ontology document and its shredded form in one transaction."""
     objects = builder.objects
 
+    space = space_id(conn, CONFIG.space)
+
     # A new version supersedes the old one rather than overwriting it, so an
-    # ontology change is reviewable and revertible.
-    execute(conn, "UPDATE platform.ontology_version SET is_active = false WHERE is_active")
+    # ontology change is reviewable and revertible. Scoped to this space: a
+    # publish into the sandbox must not deactivate production's ontology.
+    execute(
+        conn,
+        "UPDATE platform.ontology_version SET is_active = false "
+        "WHERE is_active AND space_id = %s",
+        (space,),
+    )
 
     row = query_one(
         conn,
         """
         INSERT INTO platform.ontology_version
-            (version, ontology_id, label, description, definition, validation,
+            (space_id, version, ontology_id, label, description, definition, validation,
              object_type_count, link_type_count, action_type_count,
              generated_from_run, is_active, created_by)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'pipeline')
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'pipeline')
         RETURNING ontology_version_id
         """,
         (
+            space,
             CONFIG.ontology_version,
             CONFIG.ontology_id,
             ontology["label"]["en"],
@@ -908,18 +918,22 @@ def persist(
             "icon", "color", "group_name", "row_count", "display_order",
         ],
         type_rows,
-        ["object_type_rid"],
+        # Keyed by version (0013): conflicting on the RID alone would update
+        # another version's row and move it onto this one, which is how
+        # publishing into a second space used to empty the first.
+        ["ontology_version_id", "object_type_rid"],
     )
     upsert_many(
         conn,
         "platform.object_property",
         [
+            "ontology_version_id",
             "object_property_rid", "object_type_rid", "api_name", "label", "description",
             "datatype", "sql_column", "sql_type", "is_identity", "is_title", "is_nullable",
             "is_foreign_key", "semantic_role", "default_aggregation", "unit", "display_order",
         ],
-        property_rows,
-        ["object_property_rid"],
+        [(version_id, *row) for row in property_rows],
+        ["ontology_version_id", "object_property_rid"],
     )
 
     # Link types.
@@ -956,7 +970,7 @@ def persist(
             "match_ratio", "matched_rows", "candidate_rows", "is_verified",
         ],
         link_rows,
-        ["link_type_rid"],
+        ["ontology_version_id", "link_type_rid"],
     )
 
     register_actions(conn, version_id)
@@ -992,6 +1006,12 @@ def generate(
     version_id = persist(
         conn, ontology, views, discovery, builder, generated_from_run, validation
     )
+
+    # Anything a person changed by hand is re-applied to the version just
+    # written. Without this the generated ontology would quietly overwrite
+    # every corrected label and every hand-drawn link on each run.
+    replay_edits(conn, version_id)
+
     return version_id, ontology, builder
 
 

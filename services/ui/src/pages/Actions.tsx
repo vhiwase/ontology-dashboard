@@ -13,8 +13,15 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { type ActionSummary, api, formatCell } from "../api";
-import { DataTable, Empty, ErrorBanner, Spinner } from "../components/common";
+import { type ActionSummary, api, formatCell, isMissingOntology } from "../api";
+import { useSpace } from "../SpaceContext";
+import {
+	DataTable,
+	Empty,
+	ErrorBanner,
+	NoOntologyHere,
+	Spinner,
+} from "../components/common";
 
 interface ActionOutcome {
 	action: string;
@@ -52,6 +59,8 @@ export function Actions() {
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [audit, setAudit] = useState<Array<Record<string, unknown>> | null>(null);
+	const [missing, setMissing] = useState(false);
+	const { spaceSlug, space } = useSpace();
 
 	const loadAudit = () => {
 		api
@@ -60,7 +69,13 @@ export function Actions() {
 			.catch(() => setAudit([]));
 	};
 
+	// Action types are part of the ontology, so they belong to a space and are
+	// reloaded when it changes.
 	useEffect(() => {
+		setActions(null);
+		setSelected(null);
+		setError(null);
+		setMissing(false);
 		Promise.all([
 			api.get<ActionSummary[]>("/api/action-types"),
 			api.get<Role[]>("/api/roles"),
@@ -70,9 +85,11 @@ export function Actions() {
 				setRoles(roleRows);
 				setSelected((current) => current ?? actionRows.find((a) => a.isReadOnly)?.apiName ?? null);
 			})
-			.catch((exc: Error) => setError(exc.message));
+			.catch((exc: Error) =>
+				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
+			);
 		loadAudit();
-	}, []);
+	}, [spaceSlug]);
 
 	const action = actions?.find((entry) => entry.apiName === selected) ?? null;
 
@@ -138,6 +155,8 @@ export function Actions() {
 		}
 	};
 
+	if (missing)
+		return <NoOntologyHere what="action types" spaceName={space?.name ?? spaceSlug} />;
 	if (error && !actions) return <ErrorBanner error={error} />;
 	if (!actions) return <Spinner label="Loading actions" />;
 

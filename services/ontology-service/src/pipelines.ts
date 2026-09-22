@@ -15,7 +15,14 @@
  */
 
 import { query, queryOne } from "./db";
-import { BadRequest, NotFound, getRegistry } from "./registry";
+import { compileNode, isExecutable, whyNotExecutable } from "./compile";
+import {
+	type ExecutionResult,
+	executeGraph,
+	recordDatasetVersions,
+	recordNodeRuns,
+} from "./execute";
+import { BadRequest, currentSpace, getRegistry, hasOntology, NotFound } from "./registry";
 
 // ── the node model ──────────────────────────────────────────────────────────
 
@@ -118,6 +125,8 @@ export interface PipelineRecord {
 	slug: string;
 	name: string;
 	description: string | null;
+	/** The space this pipeline lives in; the environment is derived from it. */
+	spaceSlug: string;
 	environment: string;
 	graph: PipelineGraph;
 	validation: ValidationReport;
@@ -126,6 +135,13 @@ export interface PipelineRecord {
 	createdAt: string;
 	updatedBy: string | null;
 	updatedAt: string;
+	/** Set where the assistant drafted this rather than a person building it. */
+	proposedBy: string | null;
+	/** The request that produced it, so a strange graph can be traced back. */
+	proposedFrom: string | null;
+	/** NULL while this is an unreviewed proposal. A proposal cannot be run. */
+	acceptedBy: string | null;
+	acceptedAt: string | null;
 }
 
 interface PipelineRow {
@@ -133,6 +149,7 @@ interface PipelineRow {
 	slug: string;
 	name: string;
 	description: string | null;
+	space_slug: string;
 	environment: string;
 	graph: PipelineGraph;
 	validation: ValidationReport;
@@ -141,6 +158,10 @@ interface PipelineRow {
 	created_at: Date;
 	updated_by: string | null;
 	updated_at: Date;
+	proposed_by: string | null;
+	proposed_from: string | null;
+	accepted_by: string | null;
+	accepted_at: Date | null;
 }
 
 function toRecord(row: PipelineRow): PipelineRecord {
@@ -149,6 +170,7 @@ function toRecord(row: PipelineRow): PipelineRecord {
 		slug: row.slug,
 		name: row.name,
 		description: row.description,
+		spaceSlug: row.space_slug,
 		environment: row.environment,
 		graph: row.graph ?? { nodes: [], edges: [] },
 		validation: row.validation,
@@ -157,6 +179,10 @@ function toRecord(row: PipelineRow): PipelineRecord {
 		createdAt: row.created_at.toISOString(),
 		updatedBy: row.updated_by,
 		updatedAt: row.updated_at.toISOString(),
+		proposedBy: row.proposed_by,
+		proposedFrom: row.proposed_from,
+		acceptedBy: row.accepted_by,
+		acceptedAt: row.accepted_at?.toISOString() ?? null,
 	};
 }
 
@@ -361,9 +387,40 @@ export function validateGraph(graph: PipelineGraph): ValidationReport {
 				}
 				break;
 			}
-			case "dataSource": {
-				if (!String(config.connection ?? "").trim()) {
-					add("warning", node.id, "unconfigured", `${node.name} names no connection.`);
+			case "dataSource":
+			case "dataset": {
+				// A source needs something it can actually read. The view is what
+				// the execution engine opens; the connection is metadata about
+				// where the data originally came from. Naming neither used to be a
+				// warning, back when a run only estimated: now it is the reason the
+				// run would fail, so it is an error and says which to set.
+				const view = String(config.sourceView ?? config.view ?? "").trim();
+				const connection = String(config.connection ?? "").trim();
+				const hasUpstream = incoming.length > 0;
+
+				if (!view && !hasUpstream) {
+					// A warning rather than an error, deliberately. Blocking the whole
+					// run would stop every other branch of a graph someone is halfway
+					// through building — and the engine already handles this precisely:
+					// this node fails with "no view selected", its downstream nodes are
+					// marked skipped, and the rest of the graph still executes.
+					add(
+						"warning",
+						node.id,
+						"unconfigured",
+						`${node.name} names no source view, so it has nothing to read. ` +
+							`Pick one in the inspector.`,
+					);
+				} else if (view && !connection) {
+					// A warning, not an error: warnings do not block a run, and this
+					// one does not stop it working — it only means the lineage cannot
+					// say which system the rows originally came from.
+					add(
+						"warning",
+						node.id,
+						"no_connection",
+						`${node.name} reads ${view} directly. Naming a connection records where that data came from.`,
+					);
 				}
 				break;
 			}
@@ -461,19 +518,41 @@ export function topologicalOrder(graph: PipelineGraph): PipelineNode[] {
 
 // ── persistence ─────────────────────────────────────────────────────────────
 
-export async function listPipelines(): Promise<PipelineRecord[]> {
+export async function listPipelines(spaceSlug?: string): Promise<PipelineRecord[]> {
 	const rows = await query<PipelineRow>(
-		"SELECT * FROM platform.pipeline ORDER BY updated_at DESC",
+		`SELECT p.*, s.slug AS space_slug
+		   FROM platform.pipeline p JOIN platform.space s ON s.space_id = p.space_id
+		  WHERE ($1::text IS NULL OR s.slug = $1)
+		  ORDER BY p.updated_at DESC`,
+		[spaceSlug ?? null],
 	);
 	return rows.map(toRecord);
 }
 
-export async function getPipeline(slug: string): Promise<PipelineRecord> {
+/**
+ * A pipeline by slug, within a space.
+ *
+ * The slug is unique per space rather than globally, so the same pipeline
+ * promoted from sandbox to production keeps its name in both. Without the
+ * space, "tms-kpi-pipeline" is ambiguous once it has been promoted.
+ */
+export async function getPipeline(
+	slug: string,
+	spaceSlug?: string,
+): Promise<PipelineRecord> {
 	const row = await queryOne<PipelineRow>(
-		"SELECT * FROM platform.pipeline WHERE slug = $1",
-		[slug],
+		`SELECT p.*, s.slug AS space_slug
+		   FROM platform.pipeline p JOIN platform.space s ON s.space_id = p.space_id
+		  WHERE p.slug = $1 AND ($2::text IS NULL OR s.slug = $2)
+		  ORDER BY (s.slug = 'sandbox') DESC
+		  LIMIT 1`,
+		[slug, spaceSlug ?? null],
 	);
-	if (!row) throw new NotFound(`No pipeline '${slug}'.`);
+	if (!row) {
+		throw new NotFound(
+			spaceSlug ? `No pipeline '${slug}' in space '${spaceSlug}'.` : `No pipeline '${slug}'.`,
+		);
+	}
 	return toRecord(row);
 }
 
@@ -535,7 +614,8 @@ export interface SavePipelineRequest {
 	slug?: string;
 	name: string;
 	description?: string | null;
-	environment?: string;
+	/** Which space it belongs to. The environment follows from it. */
+	spaceSlug?: string;
 	graph: unknown;
 	note?: string | null;
 }
@@ -550,11 +630,22 @@ export async function savePipeline(
 	const graph = coerceGraph(request.graph);
 	const validation = validateGraph(graph);
 	const slug = request.slug?.trim() || slugifyName(name);
-	const environment = request.environment ?? "development";
+
+	// Work that has not been deliberately promoted belongs in the sandbox, so
+	// that is the default rather than "development".
+	const spaceSlug = request.spaceSlug?.trim() || "sandbox";
+	const space = await queryOne<{ space_id: number; environment: string }>(
+		"SELECT space_id, environment FROM platform.space WHERE slug = $1",
+		[spaceSlug],
+	);
+	if (!space) throw new BadRequest(`No space '${spaceSlug}'.`);
+	const environment = space.environment;
 
 	const existing = await queryOne<PipelineRow>(
-		"SELECT * FROM platform.pipeline WHERE slug = $1",
-		[slug],
+		`SELECT p.*, s.slug AS space_slug
+		   FROM platform.pipeline p JOIN platform.space s ON s.space_id = p.space_id
+		  WHERE p.slug = $1 AND s.slug = $2`,
+		[slug, spaceSlug],
 	);
 
 	const row = existing
@@ -564,7 +655,7 @@ export async function savePipeline(
 				        validation = $5, version = version + 1,
 				        updated_by = $6, updated_at = now()
 				  WHERE pipeline_id = $7
-				RETURNING *`,
+				RETURNING *, $8::text AS space_slug`,
 				[
 					name,
 					request.description ?? null,
@@ -573,21 +664,25 @@ export async function savePipeline(
 					JSON.stringify(validation),
 					savedBy,
 					existing.pipeline_id,
+					spaceSlug,
 				],
 			)
 		: await queryOne<PipelineRow>(
 				`INSERT INTO platform.pipeline
-				   (slug, name, description, environment, graph, validation, created_by, updated_by)
-				 VALUES ($1,$2,$3,$4,$5,$6,$7,$7)
-				 RETURNING *`,
+				   (slug, name, description, environment, space_id, graph, validation,
+				    created_by, updated_by)
+				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+				 RETURNING *, $9::text AS space_slug`,
 				[
 					slug,
 					name,
 					request.description ?? null,
 					environment,
+					space.space_id,
 					JSON.stringify(graph),
 					JSON.stringify(validation),
 					savedBy,
+					spaceSlug,
 				],
 			);
 
@@ -606,10 +701,11 @@ export async function savePipeline(
 	return toRecord(row);
 }
 
-export async function deletePipeline(slug: string): Promise<void> {
+export async function deletePipeline(slug: string, spaceSlug?: string): Promise<void> {
+	const pipeline = await getPipeline(slug, spaceSlug);
 	const row = await queryOne<{ pipeline_id: number }>(
-		"DELETE FROM platform.pipeline WHERE slug = $1 RETURNING pipeline_id",
-		[slug],
+		"DELETE FROM platform.pipeline WHERE pipeline_id = $1 RETURNING pipeline_id",
+		[pipeline.id],
 	);
 	if (!row) throw new NotFound(`No pipeline '${slug}'.`);
 }
@@ -623,8 +719,11 @@ export interface PipelineVersionSummary {
 	edgeCount: number;
 }
 
-export async function listVersions(slug: string): Promise<PipelineVersionSummary[]> {
-	const pipeline = await getPipeline(slug);
+export async function listVersions(
+	slug: string,
+	spaceSlug?: string,
+): Promise<PipelineVersionSummary[]> {
+	const pipeline = await getPipeline(slug, spaceSlug);
 	const rows = await query<{
 		version: number;
 		note: string | null;
@@ -652,8 +751,9 @@ export async function restoreVersion(
 	slug: string,
 	version: number,
 	restoredBy: string,
+	spaceSlug?: string,
 ): Promise<PipelineRecord> {
-	const pipeline = await getPipeline(slug);
+	const pipeline = await getPipeline(slug, spaceSlug);
 	const row = await queryOne<{ graph: PipelineGraph }>(
 		"SELECT graph FROM platform.pipeline_version WHERE pipeline_id = $1 AND version = $2",
 		[pipeline.id, version],
@@ -665,7 +765,7 @@ export async function restoreVersion(
 			slug,
 			name: pipeline.name,
 			description: pipeline.description,
-			environment: pipeline.environment,
+			spaceSlug: pipeline.spaceSlug,
 			graph: row.graph,
 			note: `Restored from version ${version}.`,
 		},
@@ -703,62 +803,24 @@ export interface RunRecord {
 	triggeredBy: string;
 }
 
-/**
- * How many rows a node kind is taken to emit.
- *
- * An object-type node reports the real row count from the registry, because
- * that number exists and is true. The rest are derived from their input, which
- * is the honest thing to do for a platform with no execution engine: the run
- * exercises the graph's SHAPE and dependency order, and every row it writes is
- * marked is_simulated so nobody mistakes it for a real load.
- */
-function projectedRecords(node: PipelineNode, upstream: number | null): number | null {
-	const registry = getRegistry();
-	switch (node.kind) {
-		case "objectType": {
-			// The one node kind with a real number behind it: the registry knows
-			// how many rows this object type actually has.
-			const apiName = String(node.config?.objectType ?? "");
-			const type = registry.objectTypes.find((t) => t.apiName === apiName);
-			return type?.rowCount ?? upstream;
-		}
-		case "dataSource":
-		case "dataset": {
-			const declared = Number(node.config?.rowCount ?? 0);
-			if (Number.isFinite(declared) && declared > 0) return declared;
-			// null, not 0: a source with no declared row count and nothing
-			// upstream has an UNKNOWN size, and reporting 0 would read as "this
-			// source is empty" - which is a different and wrong claim.
-			return upstream;
-		}
-		case "filter": {
-			if (upstream === null) return null;
-			const ratio = Number(node.config?.selectivity ?? 0.6);
-			return Math.round(upstream * (Number.isFinite(ratio) ? ratio : 0.6));
-		}
-		case "aggregate":
-			// An aggregate collapses its input; the exact factor is unknowable
-			// without running it, so this is explicitly an estimate.
-			return upstream === null ? null : Math.max(1, Math.round(upstream / 50));
-		case "join":
-			return upstream;
-		case "linkType": {
-			if (upstream === null) return null;
-			const apiName = String(node.config?.linkType ?? "");
-			const link = registry.linkTypes.find((l) => l.apiName === apiName);
-			return link ? Math.round(upstream * (link.matchRatio || 1)) : upstream;
-		}
-		case "dashboard":
-		case "validation":
-		case "actionType":
-			return upstream;
-		default:
-			return upstream;
-	}
-}
+export async function runPipeline(
+	slug: string,
+	triggeredBy: string,
+	spaceSlug?: string,
+): Promise<RunRecord> {
+	const pipeline = await getPipeline(slug, spaceSlug);
 
-export async function runPipeline(slug: string, triggeredBy: string): Promise<RunRecord> {
-	const pipeline = await getPipeline(slug);
+	// An unaccepted proposal does not run. Running writes real tables into
+	// pipeline_out that dashboards and the assistant go on to read, so a graph
+	// nobody has reviewed must not be able to become a dataset by being
+	// triggered - which is the entire reason proposals are inert.
+	if (pipeline.proposedBy && !pipeline.acceptedBy) {
+		throw new BadRequest(
+			`'${pipeline.name}' was drafted by ${pipeline.proposedBy} and has not been ` +
+				`accepted yet. Review the graph and accept it before running it.`,
+		);
+	}
+
 	const validation = validateGraph(pipeline.graph);
 
 	if (validation.status === "invalid") {
@@ -768,124 +830,109 @@ export async function runPipeline(slug: string, triggeredBy: string): Promise<Ru
 		);
 	}
 
-	const ordered = topologicalOrder(pipeline.graph);
-	const incoming = new Map<string, string[]>();
-	for (const edge of pipeline.graph.edges ?? []) {
-		const list = incoming.get(edge.target) ?? [];
-		list.push(edge.source);
-		incoming.set(edge.target, list);
-	}
+	// The run row is written BEFORE execution and updated after, so a run that
+	// crashes the process still leaves a record saying it was running rather
+	// than vanishing. A pipeline that silently never ran is the worst outcome.
+	const opened = await queryOne<{ pipeline_run_id: number; started_at: Date }>(
+		`INSERT INTO platform.pipeline_run
+		   (pipeline_id, version, status, records, errors, warnings, node_results, log,
+		    is_simulated, execution_mode, triggered_by)
+		 VALUES ($1,$2,'running',0,0,$3,'[]'::jsonb,'[]'::jsonb,false,'executed',$4)
+		 RETURNING pipeline_run_id, started_at`,
+		[pipeline.id, pipeline.version, validation.warnings.length, triggeredBy],
+	);
+	const runId = opened?.pipeline_run_id ?? 0;
 
-	const started = Date.now();
-	const recordsByNode = new Map<string, number | null>();
-	const nodeResults: NodeResult[] = [];
-	const log: RunRecord["log"] = [
-		{
-			at: new Date().toISOString(),
-			level: "info",
-			message: `Run started for ${pipeline.name} v${pipeline.version} (${ordered.length} nodes).`,
-		},
-	];
-
-	for (const node of ordered) {
-		const sources = incoming.get(node.id) ?? [];
-		const upstreamValues = sources.map((id) => recordsByNode.get(id) ?? null);
-		// Unknown is contagious: if any input size is unknown, so is the output.
-		const upstream =
-			sources.length === 0
-				? null
-				: upstreamValues.some((value) => value === null)
-					? null
-					: upstreamValues.reduce((sum: number, value) => sum + (value ?? 0), 0);
-
-		const records = projectedRecords(node, upstream);
-		recordsByNode.set(node.id, records);
-
-		// Deterministic from the node id, not random: two runs of an unchanged
-		// pipeline should report the same shape, or the panel is noise.
-		const durationMs = 40 + (hashString(node.id) % 800);
-
-		const size =
-			records === null ? "an unknown number of" : records.toLocaleString("en-US");
-		nodeResults.push({
-			nodeId: node.id,
-			name: node.name,
-			kind: node.kind,
-			// "skipped" rather than "success" when the size is unknown: the node
-			// was reached, but nothing about its output was established.
-			status: records === null ? "skipped" : "success",
-			durationMs,
-			records,
-			message:
-				records === null
-					? `${node.kind} ran, but its row count is not known without a real execution. Set a row count on the source to estimate it.`
-					: `${node.kind} produced ${size} records.`,
-		});
-		log.push({
-			at: new Date().toISOString(),
-			level: records === null ? "warn" : "info",
-			message: `${node.name}: ${size} records in ${durationMs}ms.`,
-		});
+	let result: ExecutionResult;
+	try {
+		result = await executeGraph(pipeline.graph, slug);
+	} catch (error) {
+		// A failure here is the engine itself giving up — a cyclic graph, a
+		// name collision — rather than one node's SQL. The run is closed as
+		// failed so it does not sit at "running" forever.
+		const message = (error as Error).message;
+		await query(
+			`UPDATE platform.pipeline_run
+			    SET status = 'failed', finished_at = now(),
+			        duration_ms = 0, errors = 1,
+			        log = $2::jsonb
+			  WHERE pipeline_run_id = $1`,
+			[
+				runId,
+				JSON.stringify([
+					{ at: new Date().toISOString(), level: "error", message },
+				]),
+			],
+		);
+		throw error;
 	}
 
 	for (const warning of validation.warnings) {
-		log.push({ at: new Date().toISOString(), level: "warn", message: warning.message });
+		result.log.push({ at: new Date().toISOString(), level: "warn", message: warning.message });
 	}
 
-	const durationMs = Date.now() - started;
-	const totalRecords = nodeResults.reduce((max, r) => Math.max(max, r.records ?? 0), 0);
+	// The shape the UI already renders, built from what actually ran.
+	const nodeResults: NodeResult[] = result.nodes.map((node) => ({
+		nodeId: node.nodeId,
+		name: node.name,
+		kind: node.kind,
+		status: node.status,
+		durationMs: node.durationMs,
+		records: node.rowsOut,
+		message: node.message,
+	}));
 
-	const row = await queryOne<{
-		pipeline_run_id: number;
-		started_at: Date;
-		finished_at: Date;
-	}>(
-		`INSERT INTO platform.pipeline_run
-		   (pipeline_id, version, status, finished_at, duration_ms, records, errors,
-		    warnings, node_results, log, is_simulated, triggered_by)
-		 VALUES ($1,$2,'success', now(), $3, $4, 0, $5, $6, $7, true, $8)
-		 RETURNING pipeline_run_id, started_at, finished_at`,
+	const errors = result.nodes.filter((n) => n.status === "failed").length;
+
+	await query(
+		`UPDATE platform.pipeline_run
+		    SET status = $2, finished_at = now(), duration_ms = $3, records = $4,
+		        errors = $5, warnings = $6, node_results = $7::jsonb, log = $8::jsonb,
+		        rows_read = $9, rows_written = $10
+		  WHERE pipeline_run_id = $1`,
 		[
-			pipeline.id,
-			pipeline.version,
-			durationMs,
-			totalRecords,
+			runId,
+			result.status,
+			result.durationMs,
+			result.rowsWritten,
+			errors,
 			validation.warnings.length,
 			JSON.stringify(nodeResults),
-			JSON.stringify(log),
-			triggeredBy,
+			JSON.stringify(result.log),
+			result.rowsRead,
+			result.rowsWritten,
 		],
 	);
 
+	await recordNodeRuns(runId, result.nodes);
+	await recordDatasetVersions(runId, result.nodes, triggeredBy);
+
 	return {
-		id: row?.pipeline_run_id ?? 0,
+		id: runId,
 		pipelineSlug: slug,
 		version: pipeline.version,
-		status: "success",
-		startedAt: row?.started_at.toISOString() ?? new Date(started).toISOString(),
-		finishedAt: row?.finished_at.toISOString() ?? new Date().toISOString(),
-		durationMs,
-		records: totalRecords,
-		errors: 0,
+		status: result.status,
+		startedAt: opened?.started_at.toISOString() ?? new Date().toISOString(),
+		finishedAt: new Date().toISOString(),
+		durationMs: result.durationMs,
+		records: result.rowsWritten,
+		errors,
 		warnings: validation.warnings.length,
 		nodeResults,
-		log,
-		isSimulated: true,
+		log: result.log,
+		// The engine ran SQL. Nothing here is projected, so the banner that
+		// warned every run was simulated must no longer appear.
+		isSimulated: false,
 		triggeredBy,
 	};
 }
 
-/** Stable small hash, so a node's simulated duration does not change per run. */
-function hashString(value: string): number {
-	let hash = 0;
-	for (let index = 0; index < value.length; index += 1) {
-		hash = (hash * 31 + value.charCodeAt(index)) | 0;
-	}
-	return Math.abs(hash);
-}
-
-export async function listRuns(slug: string, limit = 20): Promise<RunRecord[]> {
-	const pipeline = await getPipeline(slug);
+export async function listRuns(
+	slug: string,
+	limit = 20,
+	spaceSlug?: string,
+): Promise<RunRecord[]> {
+	const pipeline = await getPipeline(slug, spaceSlug);
 	const bounded = Math.min(Math.max(1, Number.isFinite(Number(limit)) ? Number(limit) : 20), 100);
 	const rows = await query<{
 		pipeline_run_id: number;
@@ -933,6 +980,14 @@ export async function listRuns(slug: string, limit = 20): Promise<RunRecord[]> {
  * than against a placeholder.
  */
 export function ontologyPalette(): Record<string, unknown> {
+	// Empty rather than a 409 where the space has no ontology. This is the
+	// bootstrap case and it matters: the Pipeline Builder is how an ontology
+	// gets published in the first place, so refusing to open it until one
+	// exists would make a fresh space impossible to start work in. The data
+	// nodes still work; there are simply no ontology nodes to offer yet.
+	if (!hasOntology(currentSpace())) {
+		return { objectTypes: [], linkTypes: [], actionTypes: [], kpis: [], views: [] };
+	}
 	const registry = getRegistry();
 	return {
 		objectTypes: registry.objectTypes.map((type) => ({
@@ -965,4 +1020,188 @@ export function ontologyPalette(): Record<string, unknown> {
 			dependsOnSimulation: kpi.dependsOnSimulation,
 		})),
 	};
+}
+
+// ── AI-proposed pipelines (§18) ─────────────────────────────────────────────
+
+export interface ProposePipelineRequest {
+	name: string;
+	description?: string;
+	graph: unknown;
+	proposedFrom?: string;
+}
+
+/**
+ * Record a pipeline the assistant drafted.
+ *
+ * Saved so it can be looked at, and inert until it is. A graph that runs
+ * writes real tables into pipeline_out which dashboards and the assistant then
+ * read, so "generate and run" would let a sentence quietly become a dataset.
+ *
+ * Every node is COMPILED here, not merely shape-checked. The graph validator
+ * catches a missing input or an unknown object type; it does not catch a
+ * filter on a column the view has never had. Compiling does, and it does so
+ * while the author can still fix it — the same lesson the function proposals
+ * taught when the assistant confidently used camelCase api names as SQL
+ * columns.
+ */
+export async function proposePipeline(
+	request: ProposePipelineRequest,
+	proposedBy: string,
+): Promise<{ pipeline: PipelineRecord; compiled: Array<{ node: string; ok: boolean; detail: string }> }> {
+	const name = String(request.name ?? "").trim();
+	if (!name) throw new BadRequest("A pipeline needs a name.");
+
+	const graph = coerceGraph(request.graph);
+	if ((graph.nodes ?? []).length === 0) {
+		throw new BadRequest("A pipeline needs at least one node.");
+	}
+
+	const validation = validateGraph(graph);
+	if (validation.status === "invalid") {
+		throw new BadRequest(
+			`This graph has ${validation.errors.length} error(s). ` +
+				`First: ${validation.errors[0]?.message}`,
+		);
+	}
+
+	// Dry-compile each node against what its inputs really produce.
+	const compiled = await dryCompile(graph);
+	const broken = compiled.filter((entry) => !entry.ok);
+	if (broken.length > 0) {
+		throw new BadRequest(
+			`${broken.length} node(s) will not run. First: ${broken[0]!.node} — ${broken[0]!.detail}`,
+		);
+	}
+
+	const slug = slugifyName(name);
+	const record = await savePipeline(
+		{ slug, name, description: request.description, graph, spaceSlug: currentSpace() },
+		proposedBy,
+	);
+
+	// Marked as a proposal AFTER saving, because savePipeline is the one place
+	// that knows how to write a graph and its version history.
+	await query(
+		`UPDATE platform.pipeline
+		    SET proposed_by = $2, proposed_from = $3, accepted_by = NULL, accepted_at = NULL
+		  WHERE pipeline_id = $1`,
+		[record.id, proposedBy, request.proposedFrom ?? null],
+	);
+
+	return { pipeline: await getPipeline(record.slug, currentSpace()), compiled };
+}
+
+/**
+ * Compile every node without running anything.
+ *
+ * Inputs are described from the ontology rather than from materialised tables,
+ * because nothing has run yet. A source node's columns come from its view's
+ * catalogue entry; a transform's from what the compiler says its input emits.
+ */
+async function dryCompile(
+	graph: PipelineGraph,
+): Promise<Array<{ node: string; ok: boolean; detail: string }>> {
+	const results: Array<{ node: string; ok: boolean; detail: string }> = [];
+	const emitted = new Map<string, string[]>();
+
+	const incoming = new Map<string, string[]>();
+	for (const edge of graph.edges ?? []) {
+		incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source]);
+	}
+
+	for (const node of orderNodes(graph)) {
+		if (!isExecutable(node.kind)) {
+			results.push({ node: node.name, ok: true, detail: whyNotExecutable(node.kind) });
+			continue;
+		}
+
+		const inputs = (incoming.get(node.id) ?? [])
+			.filter((id) => emitted.has(id))
+			.map((id) => ({
+				relation: `"pipeline_out"."${id}"`,
+				columns: emitted.get(id) ?? [],
+				nodeId: id,
+				name: id,
+				rowCount: 0,
+			}));
+
+		try {
+			const result = compileNode(node, inputs);
+			// A source compiles to SELECT * over a view, so its real columns come
+			// from the catalogue rather than from the compiler.
+			const columns = result.columns.length
+				? result.columns
+				: await viewColumns(String(node.config?.sourceView ?? node.config?.view ?? ""));
+			emitted.set(node.id, columns);
+
+			// An aggregate that only groups computes nothing: it returns the
+			// distinct group keys. That is valid SQL and almost never what was
+			// asked for, so the reviewer is told rather than left to notice a
+			// one-column result.
+			const measures = Array.isArray(node.config?.measures) ? node.config.measures : [];
+			const computesNothing = node.kind === "aggregate" && measures.length === 0;
+
+			results.push({
+				node: node.name,
+				ok: true,
+				detail: computesNothing
+					? `${columns.length} column(s) - groups but computes nothing; add a measure`
+					: `${columns.length} columns`,
+			});
+		} catch (error) {
+			results.push({ node: node.name, ok: false, detail: (error as Error).message });
+			emitted.set(node.id, []);
+		}
+	}
+	return results;
+}
+
+/** Column names of a published view, for dry-compiling a source node. */
+async function viewColumns(qualified: string): Promise<string[]> {
+	const [schema, table] = qualified.split(".");
+	if (!schema || !table) return [];
+	const rows = await query<{ column_name: string }>(
+		`SELECT column_name FROM information_schema.columns
+		  WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`,
+		[schema, table],
+	);
+	return rows.map((row) => row.column_name);
+}
+
+/** Dependency order, reused by the dry compile. */
+function orderNodes(graph: PipelineGraph): PipelineNode[] {
+	const nodes = graph.nodes ?? [];
+	const indegree = new Map<string, number>(nodes.map((n) => [n.id, 0]));
+	const next = new Map<string, string[]>();
+	for (const edge of graph.edges ?? []) {
+		if (!indegree.has(edge.source) || !indegree.has(edge.target)) continue;
+		indegree.set(edge.target, (indegree.get(edge.target) ?? 0) + 1);
+		next.set(edge.source, [...(next.get(edge.source) ?? []), edge.target]);
+	}
+	const byId = new Map(nodes.map((n) => [n.id, n]));
+	const queue = nodes.filter((n) => (indegree.get(n.id) ?? 0) === 0);
+	const ordered: PipelineNode[] = [];
+	while (queue.length) {
+		const node = queue.shift()!;
+		ordered.push(node);
+		for (const id of next.get(node.id) ?? []) {
+			const remaining = (indegree.get(id) ?? 0) - 1;
+			indegree.set(id, remaining);
+			if (remaining === 0) queue.push(byId.get(id)!);
+		}
+	}
+	return ordered;
+}
+
+/** Accept a proposal, making it runnable. */
+export async function acceptPipeline(slug: string, acceptedBy: string): Promise<PipelineRecord> {
+	const pipeline = await getPipeline(slug, currentSpace());
+	if (pipeline.acceptedBy) return pipeline;
+
+	await query(
+		`UPDATE platform.pipeline SET accepted_by = $2, accepted_at = now() WHERE pipeline_id = $1`,
+		[pipeline.id, acceptedBy],
+	);
+	return getPipeline(slug, currentSpace());
 }

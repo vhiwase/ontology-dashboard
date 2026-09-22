@@ -2,9 +2,15 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { type LinkTypeRow, type ObjectTypeSummary, api, round } from "../api";
+import { type LinkTypeRow, type ObjectTypeSummary, api, isMissingOntology, round } from "../api";
+import { useSpace } from "../SpaceContext";
 import { GraphCanvas, type GraphLink, type GraphNode } from "../components/GraphCanvas";
-import { DataTable, ErrorBanner, Spinner } from "../components/common";
+import {
+	DataTable,
+	ErrorBanner,
+	NoOntologyHere,
+	Spinner,
+} from "../components/common";
 
 export function GraphView() {
 	const [types, setTypes] = useState<ObjectTypeSummary[] | null>(null);
@@ -14,8 +20,17 @@ export function GraphView() {
 	const [onlyComplete, setOnlyComplete] = useState(false);
 	const [exportFormat, setExportFormat] = useState("mermaid");
 	const [exported, setExported] = useState<string | null>(null);
+	const [missing, setMissing] = useState(false);
+	const { spaceSlug, space } = useSpace();
 
+	// The graph is the ontology drawn out, so it is per-space like the ontology.
 	useEffect(() => {
+		setTypes(null);
+		setLinks(null);
+		setSelected(null);
+		setExported(null);
+		setError(null);
+		setMissing(false);
 		Promise.all([
 			api.get<ObjectTypeSummary[]>("/api/object-types"),
 			api.get<LinkTypeRow[]>("/api/link-types"),
@@ -24,8 +39,10 @@ export function GraphView() {
 				setTypes(typeRows);
 				setLinks(linkRows);
 			})
-			.catch((exc: Error) => setError(exc.message));
-	}, []);
+			.catch((exc: Error) =>
+				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
+			);
+	}, [spaceSlug]);
 
 	const nodes = useMemo<GraphNode[]>(
 		() =>
@@ -70,6 +87,8 @@ export function GraphView() {
 			.catch((exc: Error) => setError(exc.message));
 	};
 
+	if (missing)
+		return <NoOntologyHere what="object graph" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
 	if (!types || !links) return <Spinner label="Loading ontology graph" />;
 

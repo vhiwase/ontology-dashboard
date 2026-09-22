@@ -48,6 +48,8 @@ export interface DashboardRecord {
 	isPinned: boolean;
 	/** The conversation that produced it, for an AI-built dashboard. */
 	chatSessionId: number | null;
+	/** The space it lives in. Dashboards are per-space, like pipelines. */
+	spaceSlug: string;
 }
 
 interface DashboardRow {
@@ -65,6 +67,7 @@ interface DashboardRow {
 	updated_at: Date;
 	is_pinned: boolean;
 	chat_session_id: number | null;
+	space_slug: string;
 }
 
 function toRecord(row: DashboardRow): DashboardRecord {
@@ -83,21 +86,42 @@ function toRecord(row: DashboardRow): DashboardRecord {
 		updatedAt: row.updated_at.toISOString(),
 		isPinned: row.is_pinned,
 		chatSessionId: row.chat_session_id ?? null,
+		spaceSlug: row.space_slug,
 	};
 }
 
-export async function listDashboards(): Promise<DashboardRecord[]> {
+/** The space id for a slug, so a write lands in the right place. */
+async function spaceIdFor(spaceSlug: string): Promise<number> {
+	const row = await queryOne<{ space_id: number }>(
+		"SELECT space_id FROM platform.space WHERE slug = $1",
+		[spaceSlug],
+	);
+	if (!row) throw new BadRequest(`No space '${spaceSlug}'.`);
+	return row.space_id;
+}
+
+export async function listDashboards(spaceSlug?: string): Promise<DashboardRecord[]> {
 	const rows = await query<DashboardRow>(
-		`SELECT * FROM platform.dashboard
-		  ORDER BY is_pinned DESC, updated_at DESC`,
+		`SELECT d.*, s.slug AS space_slug
+		   FROM platform.dashboard d JOIN platform.space s ON s.space_id = d.space_id
+		  WHERE ($1::text IS NULL OR s.slug = $1)
+		  ORDER BY d.is_pinned DESC, d.updated_at DESC`,
+		[spaceSlug ?? null],
 	);
 	return rows.map(toRecord);
 }
 
-export async function getDashboard(slug: string): Promise<DashboardRecord> {
+export async function getDashboard(
+	slug: string,
+	spaceSlug?: string,
+): Promise<DashboardRecord> {
 	const row = await queryOne<DashboardRow>(
-		"SELECT * FROM platform.dashboard WHERE slug = $1",
-		[slug],
+		`SELECT d.*, s.slug AS space_slug
+		   FROM platform.dashboard d JOIN platform.space s ON s.space_id = d.space_id
+		  WHERE d.slug = $1 AND ($2::text IS NULL OR s.slug = $2)
+		  ORDER BY (s.slug = 'sandbox') DESC
+		  LIMIT 1`,
+		[slug, spaceSlug ?? null],
 	);
 	if (!row) throw new NotFound(`No dashboard '${slug}'.`);
 	return toRecord(row);
@@ -124,8 +148,11 @@ export interface ResolvedDashboard extends DashboardRecord {
  * fine, and the error belongs on the tile where someone can see which metric
  * broke.
  */
-export async function resolveDashboard(slug: string): Promise<ResolvedDashboard> {
-	const dashboard = await getDashboard(slug);
+export async function resolveDashboard(
+	slug: string,
+	spaceSlug?: string,
+): Promise<ResolvedDashboard> {
+	const dashboard = await getDashboard(slug, spaceSlug);
 
 	const widgets = await Promise.all(
 		dashboard.layout.map(async (widget, index): Promise<ResolvedWidget> => {
@@ -175,6 +202,7 @@ export interface SaveDashboardRequest {
 	createdBy?: string;
 	isPinned?: boolean;
 	chatSessionId?: number | null;
+	spaceSlug?: string;
 }
 
 export function slugify(title: string): string {
@@ -348,13 +376,16 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 	}
 
 	const slug = request.slug?.trim() || slugify(request.title);
+	// Work that has not been deliberately promoted belongs in the sandbox.
+	const spaceSlug = request.spaceSlug?.trim() || "sandbox";
+	const spaceId = await spaceIdFor(spaceSlug);
 
 	const row = await queryOne<DashboardRow>(
 		`INSERT INTO platform.dashboard
 		   (slug, title, description, layout, filters, audience, is_ai_generated,
-		    source_prompt, created_by, is_pinned, chat_session_id, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
-		 ON CONFLICT (slug) DO UPDATE SET
+		    source_prompt, created_by, is_pinned, chat_session_id, space_id, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
+		 ON CONFLICT (space_id, slug) DO UPDATE SET
 		   title = EXCLUDED.title,
 		   description = EXCLUDED.description,
 		   layout = EXCLUDED.layout,
@@ -367,7 +398,7 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 		   -- conversation it originally came from.
 		   chat_session_id = COALESCE(EXCLUDED.chat_session_id, platform.dashboard.chat_session_id),
 		   updated_at = now()
-		 RETURNING *`,
+		 RETURNING *, $13::text AS space_slug`,
 		[
 			slug,
 			request.title.trim(),
@@ -380,13 +411,15 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 			request.createdBy ?? "user",
 			request.isPinned ?? false,
 			request.chatSessionId ?? null,
+			spaceId,
+			spaceSlug,
 		],
 	);
 	if (!row) throw new Error("Dashboard save returned no row.");
 	return toRecord(row);
 }
 
-export async function deleteDashboard(slug: string): Promise<void> {
+export async function deleteDashboard(slug: string, spaceSlug?: string): Promise<void> {
 	const result = await query<{ slug: string }>(
 		"DELETE FROM platform.dashboard WHERE slug = $1 RETURNING slug",
 		[slug],
@@ -431,7 +464,9 @@ export interface DashboardHistoryEntry extends DashboardRecord {
  * null for a dashboard whose conversation has aged out, and the view reports
  * that rather than implying it never had one.
  */
-export async function dashboardHistory(): Promise<DashboardHistoryEntry[]> {
+export async function dashboardHistory(
+	spaceSlug?: string,
+): Promise<DashboardHistoryEntry[]> {
 	const rows = await query<
 		DashboardRow & {
 			session_title: string | null;
@@ -440,15 +475,18 @@ export async function dashboardHistory(): Promise<DashboardHistoryEntry[]> {
 			session_created: Date | null;
 		}
 	>(
-		`SELECT d.*,
+		`SELECT d.*, sp.slug AS space_slug,
 		        s.title          AS session_title,
 		        s.user_id        AS session_user,
 		        s.message_count  AS session_messages,
 		        s.created_at     AS session_created
 		   FROM platform.dashboard d
+		   JOIN platform.space sp ON sp.space_id = d.space_id
 		   LEFT JOIN platform.chat_session s
 		          ON s.chat_session_id = d.chat_session_id
+		  WHERE ($1::text IS NULL OR sp.slug = $1)
 		  ORDER BY d.updated_at DESC`,
+		[spaceSlug ?? null],
 	);
 
 	const renames = await query<{
@@ -504,22 +542,28 @@ export async function renameDashboard(
 	slug: string,
 	newTitle: string,
 	renamedBy: string,
+	spaceSlug?: string,
 ): Promise<DashboardRecord> {
 	const title = String(newTitle ?? "").trim();
 	if (!title) throw new BadRequest("A dashboard needs a title.");
 	if (title.length > 120) throw new BadRequest("Title must be 120 characters or fewer.");
 
 	const existing = await queryOne<DashboardRow>(
-		"SELECT * FROM platform.dashboard WHERE slug = $1",
-		[slug],
+		`SELECT d.*, s.slug AS space_slug
+		   FROM platform.dashboard d JOIN platform.space s ON s.space_id = d.space_id
+		  WHERE d.slug = $1 AND ($2::text IS NULL OR s.slug = $2) LIMIT 1`,
+		[slug, spaceSlug ?? null],
 	);
 	if (!existing) throw new NotFound(`No dashboard '${slug}'.`);
 
 	const newSlug = slugify(title);
 	if (newSlug !== existing.slug) {
+		// Unique per space, so the same name may exist in another environment.
 		const clash = await queryOne<{ slug: string }>(
-			"SELECT slug FROM platform.dashboard WHERE slug = $1",
-			[newSlug],
+			`SELECT d.slug FROM platform.dashboard d
+			  WHERE d.slug = $1 AND d.space_id = (
+			        SELECT space_id FROM platform.space WHERE slug = $2)`,
+			[newSlug, existing.space_slug],
 		);
 		if (clash) {
 			throw new BadRequest(
@@ -532,8 +576,8 @@ export async function renameDashboard(
 		`UPDATE platform.dashboard
 		    SET title = $1, slug = $2, updated_at = now()
 		  WHERE dashboard_id = $3
-		RETURNING *`,
-		[title, newSlug, existing.dashboard_id],
+		RETURNING *, $4::text AS space_slug`,
+		[title, newSlug, existing.dashboard_id, existing.space_slug],
 	);
 	if (!updated) throw new NotFound(`No dashboard '${slug}'.`);
 
@@ -563,8 +607,9 @@ export interface DashboardBackup {
 export async function exportDashboards(
 	exportedBy: string,
 	slugs?: string[],
+	spaceSlug?: string,
 ): Promise<DashboardBackup> {
-	const all = await listDashboards();
+	const all = await listDashboards(spaceSlug);
 	const selected =
 		slugs && slugs.length > 0 ? all.filter((d) => slugs.includes(d.slug)) : all;
 	return {
@@ -596,6 +641,7 @@ export async function importDashboards(
 	backup: unknown,
 	importedBy: string,
 	overwrite: boolean,
+	spaceSlug?: string,
 ): Promise<ImportOutcome> {
 	const parsed = backup as Partial<DashboardBackup>;
 	if (!parsed || parsed.kind !== "tms-ontology-dashboards") {
@@ -607,7 +653,7 @@ export async function importDashboards(
 		throw new BadRequest("The export contains no dashboards array.");
 	}
 
-	const existing = new Set((await listDashboards()).map((d) => d.slug));
+	const existing = new Set((await listDashboards(spaceSlug)).map((d) => d.slug));
 	const outcome: ImportOutcome = { imported: [], skipped: [] };
 
 	for (const candidate of parsed.dashboards) {
@@ -646,6 +692,7 @@ export async function importDashboards(
 			createdBy: candidate.createdBy ?? importedBy,
 			isPinned: candidate.isPinned ?? false,
 			chatSessionId: null,
+			spaceSlug,
 		});
 		outcome.imported.push(slug);
 	}

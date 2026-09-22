@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { type DashboardSummary, type KpiMeta, type ResolvedDashboard, api, formatValue } from "../api";
 import { Chart, type ChartKind } from "../components/Chart";
+import { ResourcePreview } from "../components/spaces/ResourcePreview";
+import { useSpace } from "../SpaceContext";
 import {
 	CoverageBanner,
 	DataTable,
@@ -19,20 +21,34 @@ export function DashboardList() {
 	const [kpis, setKpis] = useState<KpiMeta[]>([]);
 	const [error, setError] = useState<string | null>(null);
 	const [query, setQuery] = useState("");
+	const { spaceSlug } = useSpace();
 
 	const load = () => {
-		Promise.all([
-			api.get<DashboardSummary[]>("/api/dashboards"),
-			api.get<KpiMeta[]>("/api/kpis"),
-		])
-			.then(([boards, kpiRows]) => {
-				setDashboards(boards);
-				setKpis(kpiRows);
-			})
+		setError(null);
+		setDashboards(null);
+
+		// Dashboards are per-space and exist independently of the ontology, so
+		// the list is what this page is FOR and must load on its own.
+		api
+			.get<DashboardSummary[]>(`/api/dashboards?space=${spaceSlug}`)
+			.then(setDashboards)
 			.catch((exc: Error) => setError(exc.message));
+
+		// The metric catalogue is only needed to OFFER new charts. A space with
+		// no published ontology genuinely has no metrics, and that used to fail
+		// the whole page with "No ontology has been published" - hiding the
+		// dashboards the space really does have behind an error about something
+		// else. An empty list is the honest answer here.
+		api
+			.get<KpiMeta[]>("/api/kpis")
+			.then(setKpis)
+			.catch(() => setKpis([]));
 	};
 
-	useEffect(load, []);
+	// Keyed on the space: changing it must re-fetch, or the page keeps showing
+	// the previous space's boards while the switcher says otherwise.
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	useEffect(load, [spaceSlug]);
 
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
 	if (!dashboards) return <Spinner label="Loading dashboards" />;
@@ -154,18 +170,36 @@ export function DashboardList() {
 export function DashboardDetail() {
 	const { slug } = useParams<{ slug: string }>();
 	const navigate = useNavigate();
+	const { spaceSlug } = useSpace();
 	const [dashboard, setDashboard] = useState<ResolvedDashboard | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	const [lineageId, setLineageId] = useState<number | null>(null);
+
+	/** Open this board's provenance: which metrics, from which views. */
+	async function showLineage(slug: string) {
+		try {
+			const found = await api.get<{ id: number } | null>(
+				`/api/resources/lookup?kind=dashboard&ref=${encodeURIComponent(slug)}&space=${spaceSlug}`,
+			);
+			if (found?.id) setLineageId(found.id);
+			else
+				setError(
+					"This dashboard is not registered as a workspace resource yet. Open Spaces and fill the sandbox from the ontology.",
+				);
+		} catch {
+			setError("Could not load the lineage.");
+		}
+	}
 
 	useEffect(() => {
 		if (!slug) return;
 		setDashboard(null);
 		setError(null);
 		api
-			.get<ResolvedDashboard>(`/api/dashboards/${slug}`)
+			.get<ResolvedDashboard>(`/api/dashboards/${slug}?space=${spaceSlug}`)
 			.then(setDashboard)
 			.catch((exc: Error) => setError(exc.message));
-	}, [slug]);
+	}, [slug, spaceSlug]);
 
 	if (error) return <ErrorBanner error={error} />;
 	if (!dashboard) return <Spinner label="Running dashboard metrics" />;
@@ -173,7 +207,7 @@ export function DashboardDetail() {
 	const remove = async () => {
 		if (!window.confirm(`Delete the dashboard "${dashboard.title}"? This cannot be undone.`)) return;
 		try {
-			await api.del(`/api/dashboards/${dashboard.slug}`);
+			await api.del(`/api/dashboards/${dashboard.slug}?space=${spaceSlug}`);
 			navigate("/dashboards");
 		} catch (exc) {
 			setError((exc as Error).message);
@@ -205,6 +239,11 @@ export function DashboardDetail() {
 					<Link className="btn sm" to="/dashboards">
 						All dashboards
 					</Link>
+					{/* Where these numbers come from: the metrics on this board and
+					    the views they are computed from. */}
+					<button className="btn sm" onClick={() => showLineage(dashboard.slug)}>
+						Lineage
+					</button>
 					{dashboard.isAiGenerated && (
 						<button className="btn sm" onClick={remove}>
 							Delete
@@ -222,6 +261,10 @@ export function DashboardDetail() {
 					</div>
 				))}
 			</div>
+
+			{/* Provenance for this board: the metrics on it and the views they
+			    are computed from. */}
+			<ResourcePreview resourceId={lineageId} onClose={() => setLineageId(null)} />
 		</div>
 	);
 }

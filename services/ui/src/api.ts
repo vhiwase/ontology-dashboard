@@ -13,6 +13,23 @@ export interface ApiErrorShape {
 	requestId?: string;
 }
 
+/** Thrown when a request was deliberately cancelled, so callers can stay quiet. */
+export function isAbort(error: unknown): boolean {
+	return error instanceof DOMException && error.name === "AbortError";
+}
+
+/**
+ * True when the server is saying this space has no published ontology.
+ *
+ * A 409 rather than a 404: the endpoint exists and the request was well formed,
+ * it is the state of the space that makes it unanswerable. Pages render an
+ * empty state for it instead of an error, because an empty environment is
+ * normal and a red banner would suggest something is broken.
+ */
+export function isMissingOntology(error: unknown): boolean {
+	return error instanceof ApiError && error.status === 409;
+}
+
 export class ApiError extends Error {
 	constructor(
 		message: string,
@@ -85,6 +102,39 @@ export const session = {
 	},
 };
 
+// ── the active space ────────────────────────────────────────────────────────
+
+/**
+ * The space every request is made in.
+ *
+ * The ontology belongs to a space, so a request that does not name one gets
+ * the sandbox's — which is how object types, links, actions and lineage came
+ * to look identical in every space. Holding it here rather than passing it
+ * from each page means a call added later is scoped by default: the same
+ * reasoning as AsyncLocalStorage on the server, and the mirror image of it.
+ *
+ * SpaceProvider owns the value; this is only where the client reads it.
+ */
+let activeSpace = "sandbox";
+
+export function setActiveSpace(slug: string): void {
+	activeSpace = slug || "sandbox";
+}
+
+/**
+ * Add ?space= to a relative path, unless the caller already set one.
+ *
+ * Auth is deliberately exempt: logging in has no space, and it happens before
+ * one is known.
+ */
+function withSpace(path: string): string {
+	if (path.startsWith("/api/auth/")) return path;
+	const [base, query = ""] = path.split("?");
+	const params = new URLSearchParams(query);
+	if (!params.has("space")) params.set("space", activeSpace);
+	return `${base}?${params.toString()}`;
+}
+
 /** Notified when the server rejects our token, so the app can show the login. */
 type UnauthorizedHandler = () => void;
 let onUnauthorized: UnauthorizedHandler = () => {};
@@ -94,7 +144,7 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler): void {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
 	const token = session.token();
-	const response = await fetch(path, {
+	const response = await fetch(withSpace(path), {
 		...init,
 		headers: {
 			"content-type": "application/json",
@@ -134,8 +184,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
 	get: <T>(path: string) => request<T>(path),
-	post: <T>(path: string, body?: unknown) =>
-		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}) }),
+	post: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
+		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}), signal }),
+	patch: <T>(path: string, body?: unknown) =>
+		request<T>(path, { method: "PATCH", body: JSON.stringify(body ?? {}) }),
 	del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
 
 	async login(username: string, password: string): Promise<SessionUser> {
@@ -423,8 +475,45 @@ export interface ChatToolCall {
 	preview: string;
 }
 
+/** Mirrors the server's ResourceKind union, so grouping stays exhaustive. */
+export type ResourceKind =
+	| "dataset"
+	| "objectType"
+	| "actionType"
+	| "linkType"
+	| "pipeline"
+	| "dashboard"
+	| "connection"
+	| "kpi";
+
+export interface ResourceRecord {
+	id: number;
+	projectId: number;
+	folderId: number | null;
+	kind: ResourceKind;
+	name: string;
+	description: string | null;
+	targetRef: string | null;
+	/** The relation this is read from, e.g. tms_views.v_kpi_mode_mix. */
+	backingView: string | null;
+	properties: Record<string, unknown>;
+	createdBy: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
 export interface ChatArtifact {
-	kind: "chart" | "dashboard" | "table" | "action" | "lineage";
+	kind:
+		| "chart"
+		| "dashboard"
+		| "table"
+		| "action"
+		| "lineage"
+		| "clarification"
+		/** A metric the assistant drafted, awaiting a person's approval. */
+		| "functionProposal"
+		/** A pipeline graph the assistant drafted, awaiting acceptance (§18). */
+		| "pipelineProposal";
 	[key: string]: unknown;
 }
 
@@ -440,6 +529,16 @@ export interface ChatResponse {
 	provider: string;
 	model: string;
 	failoverReason?: string | null;
+	/** What the turn cost. `priced` is false when the provider has no rate. */
+	cost?: {
+		usd: number;
+		priced: boolean;
+		promptTokens: number;
+		completionTokens: number;
+		totalTokens: number;
+		rateInputPerM: number;
+		rateOutputPerM: number;
+	} | null;
 }
 
 export interface ProviderHealth {
@@ -574,4 +673,71 @@ export function statusFor(
 	if (warningThreshold !== null && value > warningThreshold) return "warning";
 	if (target !== null && value <= target) return "good";
 	return null;
+}
+
+
+// ── functions ───────────────────────────────────────────────────────────────
+
+export interface FunctionParameter {
+	name: string;
+	type: string;
+	description?: string | null;
+	required?: boolean;
+}
+
+export interface FunctionRecord {
+	id: number;
+	/** Permanent. Never editable — dashboards reference the function by it. */
+	rid: string;
+	/** Permanent, for the same reason. */
+	apiName: string;
+	name: string;
+	description: string | null;
+	businessQuestion: string | null;
+	language: "sql" | "python" | "typescript";
+	definition: string;
+	returns: "scalar" | "table";
+	returnType: string | null;
+	unit: string | null;
+	valueFormat: string;
+	parameters: FunctionParameter[];
+	readsViews: string[];
+	readsObjectTypes: string[];
+	status: "proposed" | "active" | "rejected" | "archived";
+	proposedBy: string;
+	proposedFrom: string | null;
+	approvedBy: string | null;
+	approvedAt: string | null;
+	version: number;
+	createdAt: string;
+	createdBy: string;
+	updatedAt: string;
+	spaceSlug: string;
+	isExecutable: boolean;
+	notExecutableReason: string | null;
+}
+
+export interface FunctionResult {
+	apiName: string;
+	status: "success" | "failed";
+	returns: "scalar" | "table";
+	value: unknown;
+	rows: Array<Record<string, unknown>>;
+	rowCount: number;
+	durationMs: number;
+	sql: string | null;
+	error: string | null;
+	runId: number | null;
+}
+
+export interface FunctionRun {
+	id: number;
+	version: number;
+	status: string;
+	startedAt: string;
+	durationMs: number | null;
+	rowCount: number | null;
+	result: unknown;
+	error: string | null;
+	triggeredBy: string;
 }

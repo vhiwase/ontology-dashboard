@@ -12,6 +12,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, api, session } from "../api";
 import { Empty, ErrorBanner, Spinner } from "../components/common";
+import { useSpace } from "../SpaceContext";
 
 interface RenameEntry {
 	previousTitle: string;
@@ -77,6 +78,7 @@ export function DashboardHistory() {
 	const [outcome, setOutcome] = useState<ImportOutcome | null>(null);
 	const fileRef = useRef<HTMLInputElement>(null);
 
+	const { spaceSlug } = useSpace();
 	const role = session.user()?.role ?? "viewer";
 	// Renaming and importing are writes; a viewer sees the history but cannot
 	// change it, so the controls are hidden rather than shown and then rejected.
@@ -85,10 +87,10 @@ export function DashboardHistory() {
 	const load = useCallback(() => {
 		setError(null);
 		api
-			.get<HistoryEntry[]>("/api/dashboards/history")
+			.get<HistoryEntry[]>(`/api/dashboards/history?space=${spaceSlug}`)
 			.then(setEntries)
 			.catch((exc: Error) => setError(exc.message));
-	}, []);
+	}, [spaceSlug]);
 
 	useEffect(load, [load]);
 
@@ -123,7 +125,7 @@ export function DashboardHistory() {
 		setNotice(null);
 		try {
 			const updated = await api.post<{ slug: string; title: string }>(
-				`/api/dashboards/${slug}/rename`,
+				`/api/dashboards/${slug}/rename?space=${spaceSlug}`,
 				{ title },
 			);
 			setRenaming(null);
@@ -140,7 +142,7 @@ export function DashboardHistory() {
 		setBusy(true);
 		setNotice(null);
 		try {
-			const backup = await api.get<unknown>("/api/dashboards/export");
+			const backup = await api.get<unknown>(`/api/dashboards/export?space=${spaceSlug}`);
 			// Saved by the browser to wherever downloads go, so the copy lives on
 			// the user's machine and survives the database being rebuilt.
 			const blob = new Blob([JSON.stringify(backup, null, 2)], {
@@ -166,10 +168,10 @@ export function DashboardHistory() {
 		setOutcome(null);
 		try {
 			const backup = JSON.parse(await file.text());
-			const result = await api.post<ImportOutcome>("/api/dashboards/import", {
-				backup,
-				overwrite,
-			});
+			const result = await api.post<ImportOutcome>(
+				`/api/dashboards/import?space=${spaceSlug}`,
+				{ backup, overwrite },
+			);
 			setOutcome(result);
 			setNotice(
 				`Restored ${result.imported.length}, skipped ${result.skipped.length}.`,

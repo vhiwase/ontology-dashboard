@@ -264,3 +264,6 @@ backups/
 
 # Generated secret files mounted at /run/secrets. Never commit these.
 secrets/
+
+# Stray dashboard exports from manual testing.
+backup-test*.json
