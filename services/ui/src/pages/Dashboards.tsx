@@ -132,8 +132,7 @@ export function DashboardList() {
 				<div className="card-head">
 					<h3>KPI catalogue</h3>
 					<span className="sub">
-						{kpis.length} defined metrics · {kpis.filter((kpi) => kpi.dependsOnSimulation).length}{" "}
-						rest on simulated data
+						{kpis.length} metrics, every one measured from the captured snapshot
 					</span>
 				</div>
 				<p className="secondary" style={{ margin: "0 0 12px", fontSize: 12.5, maxWidth: 800 }}>

@@ -1221,7 +1221,10 @@ export async function seedSandbox(
 	const ontology = await ensureFolder("Ontology", null);
 	const objectTypes = await ensureFolder("Object types", ontology.id);
 	const links = await ensureFolder("Links", ontology.id);
-	const actions = await ensureFolder("Actions", ontology.id);
+	// "Action Types", matching the navigation and migration 0023. Kept in step
+	// with that migration: seeding matches by path, so this name and the
+	// renamed folder's path must agree or a reseed makes a duplicate.
+	const actions = await ensureFolder("Action Types", ontology.id);
 	// Metrics were missing entirely, so a :resource[kpi:…] chip in an assistant
 	// reply had nothing to open.
 	const metrics = await ensureFolder("Metrics", ontology.id);

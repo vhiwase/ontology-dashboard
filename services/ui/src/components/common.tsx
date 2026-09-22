@@ -448,7 +448,11 @@ export function CoverageBanner({ notes }: { notes: string[] }) {
 	if (notes.length === 0) return null;
 	return (
 		<div className="banner">
-			<strong>Some figures here are simulated, not measured.</strong>{" "}
+			{/* Worded as a caveat, not as "simulated". Nothing on this platform is
+			    generated any more, so a coverage note now means the source is thin
+			    for that figure - saying "simulated" would be a false statement the
+			    moment a real metric carried a note. */}
+			<strong>Read these caveats before quoting a figure.</strong>{" "}
 			{notes.length === 1 ? notes[0] : `${notes.length} metrics on this board carry caveats:`}
 			{notes.length > 1 && (
 				<ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>

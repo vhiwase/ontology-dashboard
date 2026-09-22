@@ -82,7 +82,7 @@ export function Overview() {
 				<Tile
 					label="Measured metric areas"
 					value={`${measuredAreas} of ${stats.dataCoverage.length}`}
-					foot="the rest rest on simulation"
+					foot="the rest are absent from the source, not estimated"
 				/>
 			</div>
 
@@ -94,10 +94,11 @@ export function Overview() {
 					</div>
 					<Chart kind="hbar" points={coverage} format="percent" />
 					<p className="muted" style={{ fontSize: 11.5, marginBottom: 0, marginTop: 10 }}>
-						The captured snapshot is a planning snapshot: it contains no arrivals, no
-						distances and no carrier assignments. Those are generated into a separate
-						schema so the metrics are demonstrable, and every affected figure is
-						labelled. See <Link to="/dashboards/data-trust">Data Trust</Link>.
+						The captured snapshot is a planning snapshot: it records what was intended,
+						not what happened. It carries no arrivals, no distances and no carrier
+						assignments, so the metrics that would need them are not published - an
+						area at 0% is absent at source, not filled in. See{" "}
+						<Link to="/dashboards/data-trust">Data Trust</Link>.
 					</p>
 				</div>
 

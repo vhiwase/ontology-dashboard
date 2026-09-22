@@ -14,7 +14,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError, api, session } from "../api";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
-import { WorkspacePanel } from "../components/spaces/WorkspacePanel";
 import { RESOURCE_SPECS, type ResourceKind } from "../components/spaces/resourceKinds";
 import { ErrorBanner, Spinner } from "../components/common";
 import { useSpace } from "../SpaceContext";
@@ -89,11 +88,7 @@ export function Spaces() {
 
 	const role = session.user()?.role ?? "viewer";
 	const canWrite = role === "analyst" || role === "admin";
-	// By kind or by folder. Kind is the default because it answers the question
-	// people actually arrive with - "which object types are there", "what is
-	// this metric read from" - whereas folders answer where it was filed.
-	const [browse, setBrowse] = useState<"kind" | "folders">("kind");
-	const [deletingId, setDeletingId] = useState<number | null>(null);
+
 
 	const loadProjects = useCallback(
 		async (slug: string) => {
@@ -171,7 +166,7 @@ export function Spaces() {
 			// decides what is shown - but only while browsing BY FOLDER. In the
 			// by-kind panel there is no selected folder, so filtering by one left
 			// the list showing a single row beside a panel listing 136.
-			if (!needle && browse === "folders" && resource.folderId !== folderId) return false;
+			if (!needle && resource.folderId !== folderId) return false;
 			if (!needle) return true;
 			return [
 				resource.name,
@@ -184,7 +179,7 @@ export function Spaces() {
 				.toLowerCase()
 				.includes(needle);
 		});
-	}, [tree, folderId, query, browse]);
+	}, [tree, folderId, query]);
 
 	const currentFolder = tree?.folders.find((f) => f.id === folderId) ?? null;
 
@@ -314,49 +309,15 @@ export function Spaces() {
 			{/* ── the tree ─────────────────────────────────────────────────── */}
 			{tree && (
 				<div className="explorer">
-					{browse === "kind" ? (
-						<div className="wsp-shell">
-							<div className="explorer-tree-head">
-								<span>{tree.project.name}</span>
-								<span className="wsp-toggle">
-									<button className="active" onClick={() => setBrowse("kind")}>
-										Kind
-									</button>
-									<button onClick={() => setBrowse("folders")}>Folders</button>
-								</span>
-							</div>
-							<WorkspacePanel
-								resources={tree.resources}
-								selectedId={previewId}
-								onSelect={(resource) => setPreviewId(resource.id)}
-								busyId={deletingId}
-								onDelete={async (resource) => {
-									setDeletingId(resource.id);
-									try {
-										await api.del(`/api/resources/${resource.id}`);
-										// Close the preview if it was showing what just went.
-										setPreviewId((current) =>
-											current === resource.id ? null : current,
-										);
-										await loadTree();
-									} catch (exc) {
-										setError(exc instanceof ApiError ? exc.message : String(exc));
-									} finally {
-										setDeletingId(null);
-									}
-								}}
-							/>
-						</div>
-					) : (
+					{/* The kind-grouped panel lives in the nav rail now, beside the
+					    ontology it lists, so it is reachable from every page rather
+					    than only this one. What remains here is the folder tree,
+					    which is about where things were FILED - the question this
+					    page exists to answer. */}
 					<aside className="explorer-tree">
 						<div className="explorer-tree-head">
 							<span>{tree.project.name}</span>
-							<span className="wsp-toggle">
-								<button onClick={() => setBrowse("kind")}>Kind</button>
-								<button className="active" onClick={() => setBrowse("folders")}>
-									Folders
-								</button>
-							</span>
+
 							{canWrite && (
 								<button
 									className="btn sm"
@@ -384,7 +345,6 @@ export function Spaces() {
 						</button>
 						{childFolders(null).map((folder) => renderFolder(folder, 1))}
 					</aside>
-					)}
 
 					<section className="explorer-main">
 						<div className="explorer-bar">

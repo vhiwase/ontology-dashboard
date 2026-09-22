@@ -14,8 +14,8 @@
  * platform.
  */
 
-import { query, queryOne } from "./db";
-import { compileNode, isExecutable, whyNotExecutable } from "./compile";
+import { pool, query, queryOne } from "./db";
+import { compileNode, isExecutable, outputTableName, whyNotExecutable } from "./compile";
 import {
 	type ExecutionResult,
 	executeGraph,
@@ -701,13 +701,216 @@ export async function savePipeline(
 	return toRecord(row);
 }
 
-export async function deletePipeline(slug: string, spaceSlug?: string): Promise<void> {
+// ── outputs, and deleting a pipeline with them ──────────────────────────────
+
+export interface PipelineOutput {
+	/** schema.table, always in pipeline_out. */
+	table: string;
+	nodeId: string | null;
+	nodeName: string | null;
+	nodeKind: string | null;
+	rowCount: number | null;
+	size: string | null;
+	lastBuiltAt: string | null;
+	/** Workspace resources that point at this table and would be left dangling. */
+	referencedBy: string[];
+}
+
+/**
+ * The tables this pipeline has materialised, and what each one is.
+ *
+ * Found two ways, because either alone misses something:
+ *
+ *   * the run records, which name every table the engine wrote - but are
+ *     deleted along with the pipeline, and can be pruned;
+ *   * the naming convention outputTableName() uses, which finds a table whose
+ *     run record is gone.
+ *
+ * A table recorded against a DIFFERENT pipeline's runs is excluded even if its
+ * name happens to share the prefix. Two slugs that agree in their first thirty
+ * characters produce the same prefix, and offering to drop another pipeline's
+ * output because of that would be exactly the wrong kind of mistake.
+ */
+export async function pipelineOutputs(slug: string, spaceSlug?: string): Promise<PipelineOutput[]> {
 	const pipeline = await getPipeline(slug, spaceSlug);
-	const row = await queryOne<{ pipeline_id: number }>(
-		"DELETE FROM platform.pipeline WHERE pipeline_id = $1 RETURNING pipeline_id",
-		[pipeline.id],
+	// outputTableName(slug, "x") is prefix + "x"; dropping the "x" leaves the
+	// prefix exactly as the engine builds it, sanitising and truncation included.
+	const prefix = outputTableName(slug, "x").slice(0, -1);
+
+	const rows = await query<{
+		table_name: string;
+		node_id: string | null;
+		node_name: string | null;
+		node_kind: string | null;
+		finished_at: Date | null;
+	}>(
+		`WITH recorded AS (
+		    SELECT DISTINCT ON (nr.output_table)
+		           split_part(nr.output_table, '.', 2) AS table_name,
+		           nr.node_id, nr.node_name, nr.node_kind, nr.finished_at
+		      FROM platform.pipeline_node_run nr
+		      JOIN platform.pipeline_run r ON r.pipeline_run_id = nr.pipeline_run_id
+		     WHERE r.pipeline_id = $1 AND nr.output_table LIKE 'pipeline_out.%'
+		     ORDER BY nr.output_table, nr.pipeline_node_run_id DESC
+		 ),
+		 claimed_elsewhere AS (
+		    SELECT DISTINCT split_part(nr.output_table, '.', 2) AS table_name
+		      FROM platform.pipeline_node_run nr
+		      JOIN platform.pipeline_run r ON r.pipeline_run_id = nr.pipeline_run_id
+		     WHERE r.pipeline_id <> $1 AND nr.output_table LIKE 'pipeline_out.%'
+		 ),
+		 by_name AS (
+		    -- left(...) = prefix rather than LIKE: the prefix contains
+		    -- underscores, which LIKE would treat as wildcards.
+		    SELECT t.table_name
+		      FROM information_schema.tables t
+		     WHERE t.table_schema = 'pipeline_out'
+		       AND left(t.table_name, length($2)) = $2
+		       AND t.table_name NOT IN (SELECT table_name FROM claimed_elsewhere)
+		 )
+		 SELECT t.table_name, rec.node_id, rec.node_name, rec.node_kind, rec.finished_at
+		   FROM information_schema.tables t
+		   LEFT JOIN recorded rec ON rec.table_name = t.table_name
+		  WHERE t.table_schema = 'pipeline_out'
+		    AND (t.table_name IN (SELECT table_name FROM recorded)
+		         OR t.table_name IN (SELECT table_name FROM by_name))
+		  ORDER BY rec.finished_at DESC NULLS LAST, t.table_name`,
+		[pipeline.id, prefix],
 	);
-	if (!row) throw new NotFound(`No pipeline '${slug}'.`);
+
+	const outputs: PipelineOutput[] = [];
+	for (const row of rows) {
+		const qualified = `pipeline_out.${row.table_name}`;
+		const relation = `${quoteIdent("pipeline_out")}.${quoteIdent(row.table_name)}`;
+
+		// Exact counts: these tables are pipeline outputs, small by construction,
+		// and the dialog is where someone decides whether to destroy them - an
+		// estimate is the wrong number to show at that moment.
+		const stats = await queryOne<{ n: string; size: string }>(
+			`SELECT (SELECT count(*) FROM ${relation})::text AS n,
+			        pg_size_pretty(pg_total_relation_size($1::regclass)) AS size`,
+			[qualified],
+		);
+		const references = await query<{ name: string; kind: string }>(
+			`SELECT r.name, r.kind FROM platform.resource r
+			  WHERE r.target_ref = $1 OR r.properties->>'sourceView' = $1`,
+			[qualified],
+		);
+
+		outputs.push({
+			table: qualified,
+			nodeId: row.node_id,
+			nodeName: row.node_name,
+			nodeKind: row.node_kind,
+			rowCount: stats ? Number(stats.n) : null,
+			size: stats?.size ?? null,
+			lastBuiltAt: row.finished_at?.toISOString() ?? null,
+			referencedBy: references.map((ref) => `${ref.kind} ${ref.name}`),
+		});
+	}
+	return outputs;
+}
+
+/** Quote an identifier that came from the catalogue, refusing anything odd. */
+function quoteIdent(identifier: string): string {
+	if (!/^[a-z_][a-z0-9_]*$/.test(identifier)) {
+		throw new BadRequest(`Refusing to use '${identifier}' as a table name.`);
+	}
+	return `"${identifier}"`;
+}
+
+export interface DeletePipelineResult {
+	deleted: string;
+	droppedOutputs: string[];
+	keptOutputs: string[];
+}
+
+/**
+ * Delete a pipeline, and exactly the outputs the caller selected.
+ *
+ * Tables are dropped ONLY when named in `dropOutputs`. There is no "and
+ * everything it made" default: dropping data is the consequential part of
+ * this, so it happens when a person has seen the list and ticked it, which is
+ * what the confirmation dialog is for. A caller that sends no list deletes the
+ * pipeline and leaves its tables, and is told which ones were kept.
+ *
+ * Every requested table must be one of THIS pipeline's outputs, re-derived on
+ * the server. A request cannot use this route to drop an arbitrary table by
+ * naming it.
+ *
+ * One transaction: Postgres DDL is transactional, so the pipeline row, its
+ * tables, their build history and its workspace card go together or not at
+ * all. A half-done delete - pipeline gone, tables still there - is the orphan
+ * problem this exists to stop creating.
+ */
+export async function deletePipeline(
+	slug: string,
+	spaceSlug?: string,
+	dropOutputs: string[] = [],
+): Promise<DeletePipelineResult> {
+	const pipeline = await getPipeline(slug, spaceSlug);
+	const outputs = await pipelineOutputs(slug, spaceSlug);
+	const owned = new Set(outputs.map((output) => output.table));
+
+	const requested = [...new Set(dropOutputs.map((name) => String(name).trim()).filter(Boolean))];
+	const foreign = requested.filter((name) => !owned.has(name));
+	if (foreign.length > 0) {
+		throw new BadRequest(
+			`${foreign.join(", ")} ${foreign.length === 1 ? "is" : "are"} not an output of ` +
+				`'${pipeline.name}', so this request cannot drop ${foreign.length === 1 ? "it" : "them"}.`,
+		);
+	}
+
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+
+		const removed = await client.query(
+			"DELETE FROM platform.pipeline WHERE pipeline_id = $1 RETURNING pipeline_id",
+			[pipeline.id],
+		);
+		if (removed.rowCount === 0) throw new NotFound(`No pipeline '${slug}'.`);
+
+		for (const qualified of requested) {
+			const [schema, table] = qualified.split(".");
+			if (schema !== "pipeline_out" || !table) {
+				throw new BadRequest(`Refusing to drop '${qualified}': not a pipeline output.`);
+			}
+			await client.query(`DROP TABLE IF EXISTS ${quoteIdent(schema)}.${quoteIdent(table)}`);
+		}
+
+		if (requested.length > 0) {
+			// The build history of a dataset that no longer exists would otherwise
+			// keep answering "how has this changed" about nothing.
+			await client.query(
+				"DELETE FROM platform.dataset_version WHERE qualified_name = ANY($1::text[])",
+				[requested],
+			);
+		}
+
+		// Its workspace card points at a pipeline that is gone; left behind it
+		// would open onto a 404.
+		await client.query(
+			`DELETE FROM platform.resource r
+			  USING platform.project p, platform.space s
+			  WHERE r.project_id = p.project_id AND p.space_id = s.space_id
+			    AND r.kind = 'pipeline' AND r.target_ref = $1 AND s.slug = $2`,
+			[slug, pipeline.spaceSlug],
+		);
+
+		await client.query("COMMIT");
+	} catch (error) {
+		await client.query("ROLLBACK");
+		throw error;
+	} finally {
+		client.release();
+	}
+
+	return {
+		deleted: pipeline.name,
+		droppedOutputs: requested,
+		keptOutputs: [...owned].filter((name) => !requested.includes(name)),
+	};
 }
 
 export interface PipelineVersionSummary {

@@ -243,7 +243,7 @@ services:
       # Bounds on the paid path: requests per user, and tokens per user per day.
       CHAT_RATE_PER_MINUTE: ${CHAT_RATE_PER_MINUTE:-10}
       CHAT_RATE_BURST: ${CHAT_RATE_BURST:-5}
-      CHAT_DAILY_TOKEN_BUDGET: ${CHAT_DAILY_TOKEN_BUDGET:-200000}
+      CHAT_DAILY_TOKEN_BUDGET: ${CHAT_DAILY_TOKEN_BUDGET:-0}
       # auto resolves from whether Ollama has GPU offload; see .env.example.
       LLM_PROVIDER: ${LLM_PROVIDER:-auto}
       LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}

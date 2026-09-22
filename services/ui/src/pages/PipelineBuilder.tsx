@@ -46,6 +46,8 @@ import {
 import { NODE_SPECS, type NodeKind } from "../components/pipeline/nodeTypes";
 import { ErrorBanner, Spinner } from "../components/common";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
+import { DeletePipelineDialog } from "../components/pipeline/DeletePipelineDialog";
+import { useResources } from "../ResourceContext";
 import type { ResourceKind } from "../components/spaces/resourceKinds";
 import { envTone, useSpace } from "../SpaceContext";
 
@@ -150,6 +152,9 @@ function PipelineBuilderInner() {
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
+	// The pipeline being deleted, which opens the confirmation dialog.
+	const [deleting, setDeleting] = useState<string | null>(null);
+	const { refresh: refreshResources } = useResources();
 
 	const { fitView, setCenter } = useReactFlow();
 	const { space, spaceSlug } = useSpace();
@@ -752,6 +757,19 @@ function PipelineBuilderInner() {
 					+ New
 				</button>
 
+				{/* Only for a saved pipeline, and only for admins - the server
+				    refuses anyone else, so offering the button would just be a way
+				    to be told no. */}
+				{slug && role === "admin" && (
+					<button
+						className="btn sm ghost danger"
+						onClick={() => setDeleting(slug)}
+						title="Delete this pipeline and choose which of its output tables go with it"
+					>
+						Delete
+					</button>
+				)}
+
 				{/* Not a separate control any more. The environment is a property of
 				    the space, which is chosen once in the top bar — having both meant
 				    a pipeline could say "Development" while the workspace said
@@ -925,6 +943,24 @@ function PipelineBuilderInner() {
 			<CommandMenu open={menuOpen} onPick={addNode} onClose={() => setMenuOpen(false)} />
 
 			<ResourcePreview resourceId={previewId} onClose={() => setPreviewId(null)} />
+
+			<DeletePipelineDialog
+				slug={deleting}
+				name={name}
+				onClose={() => setDeleting(null)}
+				onDeleted={async (result) => {
+					setDeleting(null);
+					newPipeline();
+					setPipelines(await api.get<PipelineRecord[]>(`/api/pipelines?space=${spaceSlug}`));
+					// The nav badges count pipelines too.
+					void refreshResources();
+					setNotice(
+						result.droppedOutputs.length > 0
+							? `Deleted ${result.deleted} and dropped ${result.droppedOutputs.length} output table${result.droppedOutputs.length === 1 ? "" : "s"}.`
+							: `Deleted ${result.deleted}.${result.keptOutputs.length > 0 ? ` ${result.keptOutputs.length} output table(s) kept in pipeline_out.` : ""}`,
+					);
+				}}
+			/>
 
 		</div>
 	);

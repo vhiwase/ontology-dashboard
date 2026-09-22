@@ -33,6 +33,7 @@ import { columnLineage, fetchGraph, trace, traceKpi, traceObjectType } from "./l
 import {
 	deletePipeline,
 	getPipeline,
+	pipelineOutputs,
 	listPipelines,
 	listRuns,
 	listVersions,
@@ -45,6 +46,7 @@ import {
 	validateGraph,
 } from "./pipelines";
 import { datasetVersions, nodeRunsFor, previewOutput } from "./execute";
+import { resourceData } from "./resourceData";
 import {
 	createLinkType,
 	deleteOntologyObject,
@@ -861,14 +863,35 @@ app.get(
 	),
 );
 
+/** What deleting this pipeline could drop - the confirmation dialog reads it. */
+app.get(
+	"/api/pipelines/:slug/outputs",
+	handle(async (req, res) => {
+		res.json(
+			await pipelineOutputs(
+				String(req.params.slug),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+/**
+ * Delete a pipeline. Its tables are dropped only when listed in the body's
+ * `outputs`; see deletePipeline for why there is no drop-everything default.
+ */
 app.delete(
 	"/api/pipelines/:slug",
 	handle(async (req, res) => {
-		await deletePipeline(
-			String(req.params.slug),
-			req.query.space ? String(req.query.space) : undefined,
+		const body = (req.body ?? {}) as { outputs?: unknown };
+		const outputs = Array.isArray(body.outputs) ? body.outputs.map(String) : [];
+		res.json(
+			await deletePipeline(
+				String(req.params.slug),
+				req.query.space ? String(req.query.space) : undefined,
+				outputs,
+			),
 		);
-		res.status(204).end();
 	}),
 );
 
@@ -1302,6 +1325,25 @@ app.get(
 app.get(
 	"/api/resources/:id/preview",
 	handle(async (req, res) => res.json(await previewResource(Number(req.params.id)))),
+);
+
+/**
+ * The data behind any resource, a page at a time - what the full-grid view and
+ * every preview read. See resourceData.ts for what each kind returns.
+ */
+app.get(
+	"/api/resources/:id/data",
+	handle(async (req, res) => {
+		res.json(
+			await resourceData(Number(req.params.id), {
+				offset: Number(req.query.offset ?? 0),
+				limit: Number(req.query.limit ?? 100),
+				sort: req.query.sort ? String(req.query.sort) : undefined,
+				dir: req.query.dir ? String(req.query.dir) : undefined,
+				q: req.query.q ? String(req.query.q) : undefined,
+			}),
+		);
+	}),
 );
 
 app.post(

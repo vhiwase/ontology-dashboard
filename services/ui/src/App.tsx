@@ -10,7 +10,9 @@ import {
 import { useDebounced } from "./components/common";
 import { Actions } from "./pages/Actions";
 import { Functions } from "./pages/Functions";
-import { RailWorkspace } from "./components/spaces/RailWorkspace";
+import { BROWSE_KINDS, RESOURCE_SPECS } from "./components/spaces/resourceKinds";
+import { ResourceProvider, useResources } from "./ResourceContext";
+import { ResourceBrowser } from "./pages/ResourceBrowser";
 import { Login } from "./pages/Login";
 import { Assistant } from "./pages/Assistant";
 import { CostAnalysis } from "./pages/CostAnalysis";
@@ -42,6 +44,11 @@ const NAV = [
 	{ to: "/graph", label: "Graph", glyph: "◉" },
 	{ to: "/lineage", label: "Lineage", glyph: "⑃" },
 	{ to: "/pipeline", label: "Pipeline builder", glyph: "⑄" },
+	// One entry per resource kind, each opening a list-and-data page like
+	// Object Explorer. These used to be an inline panel that expanded every
+	// kind under the navigation, which buried it; a kind's name is not the
+	// useful part, its data is.
+	{ panel: "browse" as const },
 	{ section: "Work" },
 	{ to: "/explorer", label: "Object explorer", glyph: "▤" },
 	{ to: "/dashboards", label: "Dashboards", glyph: "▦" },
@@ -143,6 +150,38 @@ function RailCount({
 	);
 }
 
+/**
+ * The resource kinds in the nav, each with a count for the current space.
+ *
+ * The count is omitted while loading rather than shown as 0: a badge reading
+ * "Datasets 0" for half a second reads as "you have no datasets".
+ */
+function RailBrowse() {
+	const { counts, projectName } = useResources();
+	return (
+		<>
+			<div className="rail-subsection" title="The resources registered in this space">
+				{projectName ?? "Workspace"}
+			</div>
+			{BROWSE_KINDS.map((item) => (
+				<NavLink
+					key={item.slug}
+					to={`/browse/${item.slug}`}
+					className={({ isActive }) => `rail-link rail-link-sub ${isActive ? "active" : ""}`}
+				>
+					<span className="glyph" aria-hidden style={{ color: RESOURCE_SPECS[item.kind].accent }}>
+						{RESOURCE_SPECS[item.kind].glyph}
+					</span>
+					<span>{item.label}</span>
+					{counts && (counts[item.kind] ?? 0) > 0 && (
+						<span className="count">{counts[item.kind]}</span>
+					)}
+				</NavLink>
+			))}
+		</>
+	);
+}
+
 function AppShell() {
 	const location = useLocation();
 	const [user, setUser] = useState<SessionUser | null>(() =>
@@ -189,19 +228,26 @@ function AppShell() {
 	if (!user) return <Login onSignedIn={setUser} />;
 	// From here on there is a token, so the space provider can load.
 
+	const browseKind = location.pathname.startsWith("/browse/")
+		? BROWSE_KINDS.find((item) => item.slug === location.pathname.slice("/browse/".length))
+		: undefined;
 	const title =
 		TITLES[location.pathname] ??
+		browseKind?.label ??
 		(location.pathname.startsWith("/dashboards/") ? "Dashboard" : "TMS Ontology");
 
 	return (
 		<SpaceProvider>
+		<ResourceProvider>
 		<div className="shell">
 			<nav className="rail">
 				<RailBrand connected={health !== null} />
 
 				<div className="rail-nav">
 					{NAV.map((entry, index) =>
-						"section" in entry ? (
+						"panel" in entry ? (
+							<RailBrowse key={`panel-${index}`} />
+						) : "section" in entry ? (
 							<div className="rail-section" key={`section-${index}`}>
 								{entry.section}
 							</div>
@@ -225,11 +271,6 @@ function AppShell() {
 						),
 					)}
 				</div>
-
-				{/* What the platform actually holds, under the navigation rather
-				    than buried on one page: "what is this metric read from" is a
-				    question asked while looking at something else. */}
-				<RailWorkspace />
 
 				<div className="rail-foot">
 					<div className="row" style={{ gap: 6 }}>
@@ -308,6 +349,7 @@ function AppShell() {
 							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
 							<Route path="/actions" element={<Actions />} />
 							<Route path="/functions" element={<Functions />} />
+							<Route path="/browse/:kind" element={<ResourceBrowser />} />
 							<Route path="/assistant" element={<Assistant />} />
 							{/* Before nothing else, but listed after /assistant so the exact
 							    match on the nav link does not highlight both. */}
@@ -318,6 +360,7 @@ function AppShell() {
 				</div>
 			</div>
 		</div>
+		</ResourceProvider>
 		</SpaceProvider>
 	);
 }

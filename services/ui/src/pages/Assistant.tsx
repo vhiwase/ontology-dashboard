@@ -265,8 +265,8 @@ export function Assistant() {
 							<Link to="/ontology">object types</Link>, their links, the{" "}
 							<Link to="/dashboards">KPI catalogue</Link> and the action layer. Ask me a
 							question about the freight book, or tell me what dashboard you need and I
-							will build it. I will tell you which figures are measured and which rest on
-							simulated execution data.
+							will build it. Every figure I show is measured from your TMS snapshot; where
+							the snapshot does not carry something, I will say so rather than estimate it.
 						</p>
 						<div className="starters">
 							{starters.map((starter) => (

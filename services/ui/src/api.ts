@@ -188,7 +188,12 @@ export const api = {
 		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}), signal }),
 	patch: <T>(path: string, body?: unknown) =>
 		request<T>(path, { method: "PATCH", body: JSON.stringify(body ?? {}) }),
-	del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
+	/** A body is optional: deleting a pipeline sends the outputs chosen to drop. */
+	del: <T>(path: string, body?: unknown) =>
+		request<T>(
+			path,
+			body === undefined ? { method: "DELETE" } : { method: "DELETE", body: JSON.stringify(body) },
+		),
 
 	async login(username: string, password: string): Promise<SessionUser> {
 		const result = await request<{

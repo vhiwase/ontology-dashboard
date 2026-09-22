@@ -7,7 +7,7 @@
  * partial join is visibly partial rather than looking like a clean arrow.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
 	type LinkTypeRow,
 	type ObjectTypeDetail,
@@ -17,6 +17,12 @@ import {
 	round,
 } from "../api";
 import { useSpace } from "../SpaceContext";
+import { ObjectTypeEditor } from "../components/ontology/OntologyEditor";
+import {
+	EditJournal,
+	LinkBuilder,
+	type OntologyEdit,
+} from "../components/ontology/LinkBuilder";
 import {
 	DataTable,
 	Empty,
@@ -37,6 +43,31 @@ export function OntologyManager() {
 	const [error, setError] = useState<string | null>(null);
 	const [missing, setMissing] = useState(false);
 	const { spaceSlug, space } = useSpace();
+	const [editing, setEditing] = useState(false);
+	const [drawingLink, setDrawingLink] = useState(false);
+	const [edits, setEdits] = useState<OntologyEdit[]>([]);
+	const [undoing, setUndoing] = useState<number | null>(null);
+
+	/**
+	 * Reload after an edit.
+	 *
+	 * The registry is rebuilt server-side by the edit itself, so this refetches
+	 * rather than patching local state - a label change can alter grouping and
+	 * ordering, and reconciling that by hand would drift.
+	 */
+	const reloadAfterEdit = useCallback(async () => {
+		const [typeRows, linkRows, journal] = await Promise.all([
+			api.get<ObjectTypeSummary[]>("/api/object-types"),
+			api.get<LinkTypeRow[]>("/api/link-types"),
+			api.get<OntologyEdit[]>("/api/ontology/edits"),
+		]);
+		setTypes(typeRows);
+		setAllLinks(linkRows);
+		setEdits(journal);
+		if (selected) {
+			setDetail(await api.get<ObjectTypeDetail>(`/api/object-types/${selected}`));
+		}
+	}, [selected]);
 
 	// Keyed on the space: the ontology belongs to one, so switching has to
 	// reload rather than leave the previous space's types on screen. The
@@ -52,10 +83,14 @@ export function OntologyManager() {
 		Promise.all([
 			api.get<ObjectTypeSummary[]>("/api/object-types"),
 			api.get<LinkTypeRow[]>("/api/link-types"),
+			// Tolerated separately: the journal is context, and failing to load
+			// it should not hide the ontology itself.
+			api.get<OntologyEdit[]>("/api/ontology/edits").catch(() => [] as OntologyEdit[]),
 		])
-			.then(([typeRows, linkRows]) => {
+			.then(([typeRows, linkRows, journal]) => {
 				setTypes(typeRows);
 				setAllLinks(linkRows);
+				setEdits(journal);
 				setSelected((current) => current ?? typeRows[0]?.apiName ?? null);
 			})
 			.catch((exc: Error) =>
@@ -149,6 +184,13 @@ export function OntologyManager() {
 								<h3 style={{ fontSize: 15 }}>{detail.label}</h3>
 								<span className="chip mono">{detail.rid}</span>
 								<span className="sub">{detail.rowCount.toLocaleString()} objects</span>
+								<button
+									className="btn sm"
+									style={{ marginLeft: "auto" }}
+									onClick={() => setEditing(true)}
+								>
+									Edit
+								</button>
 							</div>
 							<p className="secondary" style={{ margin: "0 0 10px" }}>
 								{detail.description}
@@ -289,6 +331,13 @@ export function OntologyManager() {
 					<div className="card">
 						<div className="card-head">
 							<h3>Every link type</h3>
+							<button
+								className="btn sm"
+								style={{ marginLeft: "auto" }}
+								onClick={() => setDrawingLink(true)}
+							>
+								+ Draw a link
+							</button>
 							<span className="sub">
 								{allLinks.filter((link) => link.isVerified).length} of {allLinks.length} resolve
 								every reference
@@ -313,6 +362,42 @@ export function OntologyManager() {
 					</div>
 				)}
 			</div>
+			<div className="card">
+				<div className="card-head">
+					<h3>Edit journal</h3>
+					<span className="sub">
+						replayed onto every ontology the pipeline publishes afterwards
+					</span>
+				</div>
+				<EditJournal
+					edits={edits}
+					busyId={undoing}
+					onUndo={async (edit) => {
+						setUndoing(edit.id);
+						try {
+							await api.post(`/api/ontology/edits/${edit.id}/undo`);
+							await reloadAfterEdit();
+						} catch (exc) {
+							setError((exc as Error).message);
+						} finally {
+							setUndoing(null);
+						}
+					}}
+				/>
+			</div>
+
+			<ObjectTypeEditor
+				detail={editing ? detail : null}
+				onClose={() => setEditing(false)}
+				onSaved={() => void reloadAfterEdit()}
+			/>
+
+			<LinkBuilder
+				open={drawingLink}
+				types={types ?? []}
+				onClose={() => setDrawingLink(false)}
+				onCreated={() => void reloadAfterEdit()}
+			/>
 		</div>
 	);
 }

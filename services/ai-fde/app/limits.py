@@ -30,8 +30,10 @@ RATE_PER_MINUTE = float(os.environ.get("CHAT_RATE_PER_MINUTE", "10"))
 RATE_BURST = float(os.environ.get("CHAT_RATE_BURST", "5"))
 
 # Spend: total LLM tokens one user may consume in a rolling 24 hours.
-# 0 disables the budget.
-DAILY_TOKEN_BUDGET = int(os.environ.get("CHAT_DAILY_TOKEN_BUDGET", "200000"))
+# 0 disables the budget, and 0 is the default: turns are not refused for
+# volume. Spend is still recorded per turn and reported on the Cost analysis
+# page, so removing the cap removes a refusal, not the measurement.
+DAILY_TOKEN_BUDGET = int(os.environ.get("CHAT_DAILY_TOKEN_BUDGET", "0"))
 BUDGET_WINDOW_SECONDS = 24 * 60 * 60
 
 REPLICA_WARNING = (
