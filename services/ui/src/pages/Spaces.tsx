@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError, api, session } from "../api";
+import { ConnectionDialog } from "../components/spaces/ConnectionDialog";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { RESOURCE_SPECS, type ResourceKind } from "../components/spaces/resourceKinds";
 import { ErrorBanner, Spinner } from "../components/common";
@@ -426,7 +427,23 @@ export function Spaces() {
 				}}
 			/>
 
-			{dialog && (
+			{/* A connection has its own dialog, shared with the Connections page:
+			    it has two connectors and a form that changes with the choice, and
+			    two copies of that would drift the moment a third connector lands. */}
+			{dialog === "connection" ? (
+				<ConnectionDialog
+					spaceSlug={spaceSlug}
+					projectSlug={projectSlug}
+					folderId={folderId}
+					onClose={() => setDialog(null)}
+					onDone={async (message) => {
+						setDialog(null);
+						setNotice(message);
+						await loadProjects(spaceSlug);
+						await loadTree();
+					}}
+				/>
+			) : dialog ? (
 				<CreateDialog
 					kind={dialog}
 					spaceSlug={spaceSlug}
@@ -440,7 +457,7 @@ export function Spaces() {
 						await loadTree();
 					}}
 				/>
-			)}
+			) : null}
 		</div>
 	);
 }

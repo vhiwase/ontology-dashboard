@@ -188,6 +188,9 @@ export const api = {
 		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}), signal }),
 	patch: <T>(path: string, body?: unknown) =>
 		request<T>(path, { method: "PATCH", body: JSON.stringify(body ?? {}) }),
+	/** Saving a repository file: the path identifies it, so writing one is a PUT. */
+	put: <T>(path: string, body?: unknown) =>
+		request<T>(path, { method: "PUT", body: JSON.stringify(body ?? {}) }),
 	/** A body is optional: deleting a pipeline sends the outputs chosen to drop. */
 	del: <T>(path: string, body?: unknown) =>
 		request<T>(
@@ -489,7 +492,161 @@ export type ResourceKind =
 	| "pipeline"
 	| "dashboard"
 	| "connection"
+	| "codeRepo"
 	| "kpi";
+
+// ── connections: what comes through one ─────────────────────────────────────
+
+/** One relation on the far side of a connection, as its catalogue reports it. */
+export interface RemoteRelation {
+	schema: string;
+	name: string;
+	kind: string;
+	estimatedRows: number | null;
+	size: string | null;
+}
+
+export type ConnectorKind = "postgresql" | "rest";
+
+export interface ConnectionCatalog {
+	connection: string;
+	isPlatformDatabase: boolean;
+	connector: ConnectorKind;
+	relations: RemoteRelation[];
+	/** Why the list looks the way it does — a REST source has no catalogue. */
+	note: string | null;
+}
+
+export interface SyncRun {
+	id: number;
+	syncId: number;
+	status: "running" | "success" | "failed";
+	mode: "snapshot" | "incremental";
+	startedAt: string;
+	finishedAt: string | null;
+	durationMs: number | null;
+	rowsRead: number | null;
+	rowsWritten: number | null;
+	rowsBefore: number | null;
+	rowsAfter: number | null;
+	cursorFrom: string | null;
+	cursorTo: string | null;
+	/** True when the read stopped at the row limit, so this is a prefix. */
+	truncated: boolean;
+	errorMessage: string | null;
+	triggeredBy: string;
+}
+
+export interface SyncRecord {
+	id: number;
+	resourceId: number;
+	connectionName: string;
+	name: string;
+	description: string | null;
+	sourceSchema: string;
+	sourceTable: string;
+	/** REST only: the path on the source, and where its records sit. */
+	sourcePath: string | null;
+	recordsPath: string | null;
+	mode: "snapshot" | "incremental";
+	cursorColumn: string | null;
+	lastCursorValue: string | null;
+	targetTable: string;
+	targetRelation: string;
+	rowLimit: number;
+	datasetResourceId: number | null;
+	enabled: boolean;
+	createdBy: string;
+	createdAt: string;
+	updatedAt: string;
+	lastRun: SyncRun | null;
+}
+
+export interface SyncOutcome {
+	run: SyncRun;
+	sync: SyncRecord;
+	/** Columns with no local type equivalent, which landed as text. */
+	widenedColumns: string[];
+	datasetResourceId: number | null;
+}
+
+// ── code repositories ───────────────────────────────────────────────────────
+
+export type RepoKind = "transforms" | "python" | "functions";
+
+export interface BuildArtifact {
+	path: string;
+	kind: "sync" | "transform" | "function" | "ignored";
+	status: "created" | "updated" | "unchanged" | "skipped" | "failed";
+	message: string;
+	produced: string | null;
+	rows: number | null;
+	durationMs: number;
+}
+
+export interface BuildRecord {
+	id: number;
+	repoId: number;
+	commitId: number | null;
+	commitSequence: number | null;
+	status: "running" | "success" | "failed";
+	startedAt: string;
+	finishedAt: string | null;
+	durationMs: number | null;
+	artifacts: BuildArtifact[];
+	errorMessage: string | null;
+	triggeredBy: string;
+}
+
+export interface RepoRecord {
+	id: number;
+	spaceSlug: string;
+	slug: string;
+	name: string;
+	description: string | null;
+	kind: RepoKind;
+	defaultBranch: string;
+	fileCount: number;
+	commitCount: number;
+	lastCommitAt: string | null;
+	lastBuild: BuildRecord | null;
+	createdBy: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export interface RepoFile {
+	id: number;
+	repoId: number;
+	path: string;
+	content: string;
+	language: string;
+	updatedBy: string;
+	updatedAt: string;
+}
+
+export interface RepoCommit {
+	id: number;
+	repoId: number;
+	sequence: number;
+	message: string;
+	author: string;
+	createdAt: string;
+	fileCount: number;
+}
+
+/** Everything the repository page needs, in one request. */
+export interface RepoDetail {
+	repo: RepoRecord;
+	files: RepoFile[];
+	commits: RepoCommit[];
+	builds: BuildRecord[];
+	outputs: {
+		datasets: Array<{ name: string; relation: string; rows: number | null }>;
+		functions: Array<{ apiName: string; name: string; status: string }>;
+		syncs: Array<{ name: string; connection: string; relation: string }>;
+	};
+}
 
 export interface ResourceRecord {
 	id: number;

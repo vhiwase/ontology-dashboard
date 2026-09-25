@@ -22,6 +22,7 @@ import { useSpace } from "../SpaceContext";
 import { DataGrid, type DataPage } from "../components/data/DataGrid";
 import { DeletePipelineDialog } from "../components/pipeline/DeletePipelineDialog";
 import { BROWSE_KINDS, RESOURCE_SPECS } from "../components/spaces/resourceKinds";
+import { ConnectionDialog } from "../components/spaces/ConnectionDialog";
 import { Empty, ErrorBanner, Spinner } from "../components/common";
 
 interface LineageEntry {
@@ -53,7 +54,10 @@ export function ResourceBrowser() {
 	const [gridOpen, setGridOpen] = useState(false);
 	const [deletingPipeline, setDeletingPipeline] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
-	const isAdmin = session.user()?.role === "admin";
+	const [creating, setCreating] = useState(false);
+	const role = session.user()?.role;
+	const isAdmin = role === "admin";
+	const canWrite = role === "admin" || role === "analyst";
 
 	const items = useMemo(() => {
 		const needle = filter.trim().toLowerCase();
@@ -114,6 +118,23 @@ export function ResourceBrowser() {
 					value={filter}
 					onChange={(event) => setFilter(event.target.value)}
 				/>
+				{/* Creating a connection used to exist only inside /spaces, three
+				    clicks into a project — so the page named "Connections" was the
+				    one place you could not make one. */}
+				{entry.kind === "connection" && canWrite && (
+					<button
+						className="btn sm"
+						style={{ margin: "0 8px 8px" }}
+						onClick={() => setCreating(true)}
+					>
+						New connection
+					</button>
+				)}
+				{entry.kind === "codeRepo" && canWrite && (
+					<a className="btn sm" style={{ margin: "0 8px 8px" }} href="/repos">
+						Open repositories
+					</a>
+				)}
 				<ul className="rb-items">
 					{loading && items.length === 0 && (
 						<li className="muted rb-empty">Loading…</li>
@@ -188,6 +209,23 @@ export function ResourceBrowser() {
 					</div>
 				)}
 			</section>
+
+			{creating && (
+				<div className="rb-dialog-backdrop">
+					<div className="rb-dialog">
+						<ConnectionDialog
+							spaceSlug={spaceSlug}
+							projectSlug={null}
+							onClose={() => setCreating(false)}
+							onDone={(message) => {
+								setCreating(false);
+								setNotice(message);
+								void refresh();
+							}}
+						/>
+					</div>
+				</div>
+			)}
 
 			<DeletePipelineDialog
 				slug={deletingPipeline}

@@ -479,6 +479,30 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "POST", pattern: /^\/spaces\/connections\/test$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/connections$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/resources\/[^/]+\/test$/, role: "analyst" },
+
+	// Reading a source's catalogue dials another host with a credential this
+	// service can see, so it sits with testing rather than with the reads.
+	// Listing the syncs already defined is local metadata and stays at viewer.
+	{ method: "GET", pattern: /^\/resources\/[^/]+\/catalog$/, role: "analyst" },
+	// Defining a sync, and running one, write into connection_raw and are what
+	// brings outside data onto this platform.
+	{ method: "POST", pattern: /^\/resources\/[^/]+\/syncs$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/syncs\/[^/]+\/run$/, role: "analyst" },
+	// Deleting one takes away the thing that rebuilds a dataset other people
+	// are reading.
+	{ method: "DELETE", pattern: /^\/syncs\/[^/]+$/, role: "admin" },
+
+	// Code repositories. Writing a file and committing it are authoring acts.
+	// BUILDING is the one that reaches outside the repository - it runs syncs,
+	// replaces tables in repo_out and publishes into the function catalogue -
+	// so it sits with running a pipeline, at analyst. It still cannot approve
+	// a function: that stays admin, on its own route.
+	{ method: "POST", pattern: /^\/repos$/, role: "analyst" },
+	{ method: "PUT", pattern: /^\/repos\/[^/]+\/files$/, role: "analyst" },
+	{ method: "DELETE", pattern: /^\/repos\/[^/]+\/files$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/repos\/[^/]+\/commit$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/repos\/[^/]+\/build$/, role: "analyst" },
+	{ method: "DELETE", pattern: /^\/repos\/[^/]+$/, role: "admin" },
 	// Deleting removes something other people may be building on.
 	{ method: "DELETE", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+$/, role: "admin" },
 	{ method: "DELETE", pattern: /^\/resources\/[^/]+$/, role: "admin" },

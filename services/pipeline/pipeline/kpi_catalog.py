@@ -586,10 +586,19 @@ def register_kpis(conn: psycopg.Connection) -> int:
         rows,
         ["space_id", "kpi_rid"],
     )
-    simulated = sum(1 for s in KPI_SPECS if s.get("depends_on_simulation"))
+    # Counted over the rows actually WRITTEN, not over KPI_SPECS. Counting the
+    # specs read as "14 registered, 17 of them simulated", which is not a
+    # sentence that can be true: the simulated ones are filtered out above.
+    withheld = sum(1 for s in KPI_SPECS if s.get("depends_on_simulation"))
     log.info(
-        "Registered %d KPI definitions across %d categories (%d flagged as resting on simulated data).",
-        written, len({s.get("category") for s in KPI_SPECS}), simulated,
+        "Registered %d KPI definitions across %d categories.%s",
+        written,
+        # rows are (space_id, kpi_rid, api_name, label, description,
+        # business_question, category, ...) after the space is prepended above.
+        len({row[6] for row in rows}),
+        ""
+        if CONFIG.simulate_execution
+        else f" {withheld} withheld: the source carries no data behind them.",
     )
     return written
 

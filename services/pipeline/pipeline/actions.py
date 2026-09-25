@@ -96,7 +96,6 @@ ROLES: list[dict[str, Any]] = [
             {"resource": "actionType", "resourceRef": f"{NS}:AssignCarrierToTransport", "permissions": ["view", "execute"]},
             {"resource": "actionType", "resourceRef": f"{NS}:RescheduleStopAppointment", "permissions": ["view", "execute"]},
             {"resource": "actionType", "resourceRef": f"{NS}:PlanOrder", "permissions": ["view", "execute"]},
-            {"resource": "actionType", "resourceRef": f"{NS}:RecalculateTransportCost", "permissions": ["view", "execute"]},
         ],
     },
     {
@@ -110,7 +109,6 @@ ROLES: list[dict[str, Any]] = [
             {"resource": "actionType", "resourceRef": f"{NS}:RateShipment", "permissions": ["view", "execute"]},
             {"resource": "actionType", "resourceRef": f"{NS}:GenerateShipmentInvoice", "permissions": ["view", "execute"]},
             {"resource": "actionType", "resourceRef": f"{NS}:ApproveAccessorialCharge", "permissions": ["view", "execute"]},
-            {"resource": "actionType", "resourceRef": f"{NS}:SimulateRateChange", "permissions": ["view", "execute"]},
         ],
     },
     {
@@ -127,9 +125,10 @@ ROLES: list[dict[str, Any]] = [
         "rules": [
             {"resource": "objectType", "resourceRef": "*", "permissions": ["view", "export"]},
             {"resource": "view", "resourceRef": "*", "permissions": ["view"]},
-            {"resource": "actionType", "resourceRef": f"{NS}:SimulateRateChange", "permissions": ["view", "execute"]},
-            {"resource": "actionType", "resourceRef": f"{NS}:ProjectOnTimeImpact", "permissions": ["view", "execute"]},
-            {"resource": "actionType", "resourceRef": f"{NS}:RecalculateTransportCost", "permissions": ["view", "execute"]},
+            # No actionType rule, and that is now the whole point of the role:
+            # every action left in the catalogue mutates, and the three
+            # read-only ones it could execute were withdrawn with tms_sim. The
+            # assistant runs as this role and can therefore execute nothing.
         ],
     },
 ]
@@ -367,78 +366,20 @@ ACTIONS: list[dict[str, Any]] = [
         "tags": ["finance", "accessorial"],
     },
 
-    # ── Read-only analysis: safe for the assistant to run unattended ───────
-    {
-        "@id": f"{NS}:SimulateRateChange",
-        "label": {"en": "Simulate Rate Change"},
-        "description": {
-            "en": (
-                "What-if: reprice a lane or carrier by a percentage and report the "
-                "effect on cost, revenue and margin. Changes nothing."
-            )
-        },
-        "targetTypes": [f"{NS}:Transport", f"{NS}:Shipment"],
-        "parameters": [
-            _param("scope", "Scope", "string", True, enum=["lane", "carrier", "account", "mode"]),
-            _param("scopeValue", "Scope Value", "string", True, "The lane, carrier, account or mode to reprice."),
-            _param("ratePctChange", "Rate Change %", "float", True, "Positive raises the rate, negative cuts it."),
-        ],
-        "sideEffects": [],
-        "approvalPolicy": {"required": False},
-        "auditConfig": {"enabled": True, "logLevel": "minimal", "retentionDays": 90},
-        "permissions": {"allowedRoles": [
-            f"{NS}:AnalystRole", f"{NS}:FinanceRole", f"{NS}:OperationsManagerRole", f"{NS}:AdminRole"
-        ]},
-        "is_read_only": True,
-        "tags": ["analysis", "what-if", "read-only"],
-    },
-    {
-        "@id": f"{NS}:ProjectOnTimeImpact",
-        "label": {"en": "Project On-Time Impact"},
-        "description": {
-            "en": (
-                "What-if: estimate the on-time percentage if volume moved from one "
-                "carrier to another, using each carrier's observed reliability."
-            )
-        },
-        "targetTypes": [f"{NS}:Carrier", f"{NS}:Transport"],
-        "parameters": [
-            _param("fromCarrierKey", "Move Volume From", "string", True),
-            _param("toCarrierKey", "Move Volume To", "string", True),
-            _param("sharePctToMove", "Share to Move %", "float", True, default=50.0),
-        ],
-        "sideEffects": [],
-        "approvalPolicy": {"required": False},
-        "auditConfig": {"enabled": True, "logLevel": "minimal", "retentionDays": 90},
-        "permissions": {"allowedRoles": [
-            f"{NS}:AnalystRole", f"{NS}:OperationsManagerRole", f"{NS}:AdminRole"
-        ]},
-        "is_read_only": True,
-        "tags": ["analysis", "what-if", "read-only", "service"],
-    },
-    {
-        "@id": f"{NS}:RecalculateTransportCost",
-        "label": {"en": "Recalculate Transport Cost"},
-        "description": {
-            "en": (
-                "Recompute a transport's cost from its current distance and rate "
-                "basis, and report the difference. Reports only; writes nothing."
-            )
-        },
-        "targetTypes": [f"{NS}:Transport"],
-        "parameters": [
-            _param("transportKey", "Transport", "string", True),
-            _param("ratePerKm", "Rate per km", "decimal", False, "Defaults to the mode's standard rate."),
-        ],
-        "sideEffects": [],
-        "approvalPolicy": {"required": False},
-        "auditConfig": {"enabled": True, "logLevel": "minimal", "retentionDays": 90},
-        "permissions": {"allowedRoles": [
-            f"{NS}:AnalystRole", f"{NS}:DispatcherRole", f"{NS}:FinanceRole", f"{NS}:AdminRole"
-        ]},
-        "is_read_only": True,
-        "tags": ["analysis", "cost", "read-only"],
-    },
+    # ── Read-only analysis ─────────────────────────────────────────────────
+    #
+    #  There is none left. Simulate Rate Change, Project On-Time Impact and
+    #  Recalculate Transport Cost lived here, and every number all three
+    #  produced came from the generated execution data in tms_sim - a cost
+    #  the snapshot does not carry, a carrier assignment it does not carry,
+    #  a distance recorded as 0 m on every leg. Migration 0018 dropped that
+    #  schema and the views they read, so they answered 409 and nothing
+    #  else; they are withdrawn rather than left as three menu entries that
+    #  can only fail.
+    #
+    #  The machinery for a read-only action is intact in the ontology
+    #  service. One becomes possible again the moment the TMS starts
+    #  sending actuals.
 ]
 
 

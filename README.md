@@ -46,21 +46,33 @@ The captured snapshot is a **planning** snapshot. Verified against
 - 14 of 61 shipments with a charge
 
 So on-time performance, transit time, dwell, distance, cost per kilometre,
-carrier scorecards and margin **cannot be computed from it**. Rather than ship a
-platform where half the KPI catalogue reads zero, the pipeline generates execution
-actuals deterministically into a **separate `tms_sim` schema**, and:
+carrier scorecards and margin **cannot be computed from it**.
 
-- every view that surfaces them reports `data_origin = 'simulated'`
-- every KPI built on them carries `depends_on_simulation` and a coverage note
-- the assistant is required by its system prompt to say so when it quotes one
-- a **Data Trust** dashboard breaks the split down metric by metric
+They were, once. The pipeline generated execution actuals into a separate
+`tms_sim` schema so the KPI catalogue had something to display, and 17 of 31
+KPIs -- every cost-per-kilometre and on-time figure on the dashboards -- rested
+on invented numbers while looking authoritative. That is gone. Migration 0018
+dropped the generated columns, the three KPI views composed wholly of them and
+the `tms_sim` schema itself, and the pipeline's second stage now **reports the
+coverage gaps instead of filling them**:
+
+```
+Coverage of the captured snapshot:
+    Carrier assignment   0 of 61  from source   no carrierId anywhere in the payload
+    Execution actuals    0 of 61  from source   no actualStart / actualEnd
+    Leg distance         0 of 61  from source   every captured leg reports 0 m
+```
+
+Columns that could become real are kept and read NULL -- `actual_start_at`,
+`total_distance_km` and `charge_per_kg` fill themselves the day the TMS starts
+sending actuals. Columns that could only ever have been invented are gone.
+`PIPELINE_SIMULATE_EXECUTION=true` now **refuses loudly** rather than
+regenerating: the schema has to be restored and the views re-pointed on
+purpose, which is the point of dropping it.
 
 Measured, with no caveat needed: order volume and weight, the party and location
 master, planning rate, the shipment status funnel, accessorial counts, and every
 exception count.
-
-Turn the simulation off with `PIPELINE_SIMULATE_EXECUTION=false`; the execution
-KPIs then honestly read as no data.
 
 ---
 
@@ -204,7 +216,10 @@ model at all.
           │
           ▼  services/pipeline  (Python)
   tms_raw.*                            landing tables, faithful to the payload
-  tms_sim.*                            generated execution actuals, flagged
+          │
+          │  services/ontology-service  (on demand, not on a schedule)
+  connection_raw.*                     tables pulled through a registered source
+  repo_out.*                           tables a code repository built
           │
           ▼  db/init/04,05_*.sql
   tms_views.v_*                        20 semantic object views + 11 metric views
@@ -248,17 +263,21 @@ model at all.
      with its **match ratio**, because a 90 % join is a real modelling fact and
      hiding it behind a clean arrow is how a lossy join gets mistaken for a
      complete one
-4. **Attributes are shared when they agree.** 482 properties collapse to 252
+4. **Attributes are shared when they agree.** 462 properties collapse to 238
    attribute definitions; a name is type-qualified only where two views genuinely
    disagree on its datatype.
 5. **Actions, roles, constraints and KPIs are authored**, not derived — a business
    rule is not discoverable from a schema.
 
-Current output: **20 object types, 482 properties, 41 link types, 82 relation
-types** (each link plus its inverse), 252 attributes, 9 value types, 8
-constraints, 3 interfaces, 3 logic rules, 12 actions, 5 roles, 31 KPIs, and a
-168-node lineage graph. It validates against ontograph's own `OntologyValidator`
-with **0 errors and 0 warnings**, and generates 23 SHACL shapes.
+Current output: **20 object types, 462 properties, 40 link types, 80 relation
+types** (each link plus its inverse), 238 attributes, 9 value types, 8
+constraints, 3 interfaces, 3 logic rules, 9 actions, 5 roles, 14 KPIs, and a
+140-node lineage graph. It validates against ontograph's own `OntologyValidator`
+with **0 errors and 0 warnings**, and generates 37 SHACL shapes.
+
+The KPI count was 31 and the action count 12 before migration 0018: 17 metrics
+and 3 read-only actions rested on generated execution data and were withdrawn
+with it.
 
 Five references are honestly reported as **unresolved** rather than dropped:
 `service_level_key`, `shipment_type_key`, `payment_term_key` and `nmfc_key` point
@@ -303,13 +322,25 @@ Pick a role, fill the form, run it. The role decides what is permitted, through
 ontograph's `AccessController` with **default-deny** (its own default is allow,
 which for an action layer is the wrong reading of "no rule").
 
-Read-only actions — rate what-ifs, on-time projections, cost recalculation —
-genuinely execute and return computed results. Mutating actions return
-**`staged`**: validated, permission-checked, recorded in the audit trail with the
-exact payload that would be sent to the TMS, but **not sent**, because this
-platform reads the TMS through a captured snapshot and has no write-back endpoint.
-A dashboard that says a shipment was held when nothing was held is worse than one
-that says the request was staged.
+All nine actions return **`staged`**: validated, permission-checked, recorded in
+the audit trail with the exact payload that would be sent to the TMS, but **not
+sent**, because this platform reads the TMS through a captured snapshot and has
+no write-back endpoint. A dashboard that says a shipment was held when nothing
+was held is worse than one that says the request was staged.
+
+There were three **read-only** actions that genuinely executed and returned a
+number — a rate what-if, an on-time projection and a cost recalculation. Every
+figure all three produced came from the generated execution data in `tms_sim`:
+a cost the snapshot does not carry, a carrier it does not name, a distance
+recorded as 0 m on every leg. Migration 0018 dropped that schema, so they could
+only answer 409, and they have been withdrawn rather than left as three menu
+entries that can only fail. The machinery for a read-only action is intact —
+declare one, register its implementation, and it executes — which is what
+should happen the day the TMS starts sending actuals.
+
+This is also why the Business Analyst role, which the assistant runs as, now
+carries **no action permission at all**: everything left in the catalogue
+mutates, and the assistant may not run any of it.
 
 ### The AI-FDE assistant (`/assistant`)
 
@@ -327,7 +358,7 @@ Try:
   with them?"*
 - *"Build a freight finance dashboard showing revenue, cost, margin and anything
   still unbilled."*
-- *"Which of these metrics are measured and which are simulated?"*
+- *"Which parts of this snapshot are measured, and what is missing at source?"*
 - *"What happens to cost and margin if we cut rates on the BMW account by 8 %?"*
 - *"Trace where the shipped weight figure comes from, back to the source API."*
 
@@ -349,8 +380,8 @@ docker compose run --rm pipeline python -m pipeline.run --force
 # Regenerate only the ontology layers, leaving tms_raw alone
 docker compose run --rm pipeline python -m pipeline.run --skip-ingest
 
-# Measured data only: no simulated execution
-docker compose run --rm pipeline python -m pipeline.run --no-simulate
+# Regenerate the ontology without re-landing the snapshot
+docker compose run --rm pipeline python -m pipeline.run --skip-ingest
 
 # See what would happen, write nothing
 docker compose run --rm pipeline python -m pipeline.run --dry-run
@@ -431,15 +462,17 @@ a namespace with the sandbox copy someone is experimenting on. Each space card
 carries an environment tone, so acting on the wrong one is harder to do by
 accident.
 
-A **resource** is the addressable unit. Seven kinds:
+A **resource** is the addressable unit. Nine kinds:
 
 | Kind | Points at | Preview shows |
 |---|---|---|
-| Connection | the live database | version, size, connections, schema breakdown |
-| Dataset | a published view | schema, live sample rows, row count, lineage |
+| Connection | a PostgreSQL host or a REST API | what the source reports about itself, and its syncs |
+| Repository | a code repository | kind, branch, files, commits, last build |
+| Dataset | a view, or a table a sync or a build wrote | schema, live sample rows, row count, lineage |
 | Object Type | an ontology type | properties, links, actions, row count |
 | Link Type | a discovered link | cardinality, key mapping, match ratio |
 | Action Type | an ontology action | parameters, permissions, targets |
+| Metric | a KPI in the catalogue | category, unit, the view it reads |
 | Pipeline | a pipeline slug | version, node/edge count, validation status |
 | Dashboard | a dashboard slug | widget count, provenance |
 
@@ -456,10 +489,17 @@ curl -X POST -H "authorization: Bearer $TOKEN" .../api/spaces/sandbox/seed
 ```
 
 or press **Fill from the ontology** in the UI. It creates a *TMS Platform*
-project with `/Connections`, `/Datasets`, `/Ontology/{Object types,Links,
-Actions}` and `/Outputs`, then registers a resource for the live connection,
-one dataset per source view, and every object type, link, action, dashboard
-and pipeline — about 100 resources, all pointing at something real.
+project with `/Connections`, `/Code`, `/Datasets`, `/Ontology/{Object types,
+Links,Action Types,Metrics}` and `/Outputs`, then registers a resource for the
+live connection, one for each code repository, one dataset per source view, and
+every object type, link, action, metric, dashboard and pipeline — about 100
+resources, all pointing at something real.
+
+The connection it registers is a usable one: it carries the host, port,
+database and user parsed from the DSN the service is already running against,
+plus the *path* of the Docker secret holding the password. It can be tested and
+synced through, rather than being a card describing a database it has no way to
+reach.
 
 ### Datasets
 
@@ -472,6 +512,81 @@ canvas — select an Object Type node in the pipeline builder and press **Create
 dataset from this node**. Either way the backing view is checked against the
 published ontology first, so a dataset always points at something real; a view
 the ontology does not expose is refused with the reason.
+
+### Connections, and getting data through one
+
+A connection used to be a business card. You could register a PostgreSQL
+source, press **Test connection**, be told it answered — and that was the whole
+of it. Nothing could come through it, and the panel that claimed to list "every
+table this connection can read" was querying the *platform's own* `pg_class`
+over three hardcoded schemas, so a source on another host was described with
+this platform's tables. Both are fixed.
+
+The model is Foundry's:
+
+```
+connection resource  ──▶  sync  ──▶  connection_raw.<table>  ──▶  dataset
+        (host, credential      (one table,        (landed here)     (a card you
+         REFERENCE)             re-runnable)                         can open)
+```
+
+**Two connectors.** Create one from **Connections** in the nav, or from inside a
+project in `/spaces` — both open the same dialog.
+
+| Connector | A sync names | Notes |
+|---|---|---|
+| **PostgreSQL** | a schema and a table | the source's catalogue is listed for you, so a sync cannot name a table its user cannot read |
+| **REST API** | a path, and where the records sit in the response | every payload this platform was built from came from one of these |
+
+A REST source has no catalogue to list — there is no standard way to ask an
+HTTP API what it exposes — so the path is typed and checked by fetching it
+before the sync is stored. Its **records path** matters more than it looks:
+
+```
+POST a sync on /api/tags with no records path
+→ The response is an object, not a list of records. Its records look like
+  they are at 'models' — set the records path to one of those. Without it
+  this would land the whole document as a single row.
+```
+
+Guessing which key holds the rows is how a sync lands one row containing the
+whole document and reports a clean run, so it refuses and says where the
+records appear to be. JSON keys are normalised to column names (`orderNumber`
+→ `order_number`) and every rename is reported; two keys that normalise the
+same way both survive, suffixed, because dropping one silently is worse.
+
+A **sync** is a named pull from one table on the source. Two modes:
+
+| Mode | What it does | When it is wrong |
+|---|---|---|
+| `snapshot` | drops the landing table and rebuilds it | never, but it re-reads everything each run |
+| `incremental` | appends rows past the last cursor value | if the source edits rows in place without moving the cursor |
+
+An incremental sync without a cursor column is refused — by the service *and*
+by a `CHECK` constraint — because without one every run would re-read the whole
+table and append it, silently doubling the dataset.
+
+Declare one from the connection's preview window, or commit a `*.sync.json`
+file to a transforms repository. Either way the source table is checked against
+the far side's catalogue first, so a sync cannot name a table the connection's
+user cannot read.
+
+**What a run reports.** Rows read, rows before, rows after, the cursor it moved
+to, and `truncated` when it stopped at the row limit — because a partial table
+reported as complete is the failure mode worth designing against. Columns whose
+remote type has no local equivalent (an enum, a domain, PostGIS geometry) land
+as `text` and are listed by name, so a number arriving as text is explained
+rather than discovered.
+
+**What is never stored.** The password. A connection records the *name* of an
+environment variable or the *path* of a Docker secret, resolved at the moment of
+use. A credential in `platform.resource` would be readable by anyone who can
+read the workspace and would land in every backup.
+
+**On the reader being bounded.** A run reads up to `rowLimit` rows into memory
+and then writes them, in batches sized from the column count so a statement
+never exceeds PostgreSQL's parameter limit. That bound is why the limit exists
+and why reaching it is reported rather than hidden.
 
 ### Stale references
 
@@ -492,6 +607,152 @@ open. Tables Postgres has never analysed are shown as `+N?` rather than folded
 into the total — `reltuples` is `-1` for those, and summing them produced
 negative row counts.
 
+## Code repositories
+
+`/repos`. Before this there was nowhere to keep work: a pipeline was a canvas, a
+function was one definition pasted into a dialog, and neither had a file, a
+history, or a way to publish several related changes as one reviewed act.
+
+Three kinds, because the three jobs produce different things:
+
+| Kind | Files it acts on | Building produces |
+|---|---|---|
+| **python** | `transforms/*.py` | runs them; each must write a dataset in `repo_out` |
+| **transforms** | `*.sync.json`, `transforms/*.sql` | syncs that run, and tables in `repo_out` |
+| **functions** | `functions/*.sql`, `.py`, `.ts` | entries in the function catalogue, as **proposed** |
+
+Three are seeded in the sandbox, and all three build:
+
+```
+TMS Python Transforms  transforms/order_exception_scores.py  90 rows in repo_out
+TMS Data Ingestion     syncs/orders.sync.json                90 rows through the connection
+                       transforms/order_volume_by_lane.sql   67 lanes in repo_out
+TMS Functions          functions/avg_weight_per_piece.sql    averageWeightPerPiece
+                       functions/orders_by_mode.sql          ordersByTransportationMode
+```
+
+### Python transforms
+
+Foundry's shape, and they really run:
+
+```python
+from transforms.api import transform, Input, Output
+
+
+@transform(
+    output=Output("repo_out.order_exception_scores"),
+    orders=Input("tms_views.v_order"),
+)
+def compute(orders, output):
+    scored = []
+    for order in orders:
+        reasons = []
+        if order["is_unplanned"]:
+            reasons.append("no route planned")
+        if order["has_implausible_weight"]:
+            reasons.append("implausible weight")
+        scored.append({"order_number": order["order_number"],
+                       "reasons": "; ".join(reasons) or None})
+    output.write(scored)
+```
+
+`Input` arrives as a list of dicts; `output.write(rows)` takes a list of dicts
+back. Column types are inferred from the values — a column is only given a
+narrow type when every non-null value in it fits, so one string among the
+numbers makes the whole column `text` rather than failing. Numbers arrive as
+numbers: `bigint` and `numeric` cross the driver as strings, and they are
+converted back **using the column's real type**, so a text column that happens
+to hold digits is not silently turned into one.
+
+**A transform must produce a dataset.** This is the rule that makes the kind
+coherent, and it is enforced two ways:
+
+```
+transforms/no_output_at_all.py -> failed
+  declares no Output, so it can produce no dataset.
+  Add one: @transform(output=Output("repo_out.<table>"), ...).
+
+transforms/forgot_to_write.py -> failed
+  compute() never wrote to its Output. Call output.write(rows) with a list
+  of dicts, or return the rows from the function.
+```
+
+The build is marked **failed** and names both files — while the working
+transform in the same build still produced its 90 rows, because a broken file
+should not hide three working ones.
+
+**Where the code runs.** A `python3` subprocess inside the ontology service,
+with an empty environment, a 60-second limit, row caps in and out, and **no
+database handle**: the relations it declared are read by the service, against
+the same allow-list a dataset is checked against, and handed over as data. A
+transform may read `tms_views.*` and the schemas the platform writes itself,
+and may write only into `repo_out` — the view layer is the contract the
+ontology is generated from and is not a build's to overwrite.
+
+It is **not** a sandbox against a determined adversary. It shares a container
+with the service, so anyone who can commit and press Build can run code there.
+That is the same trust as writing a SQL node and it is gated at the same role,
+but it is a larger surface, and pretending otherwise would be the dishonest
+half of the feature.
+
+### What a SQL or function file declares
+
+A header of `key: value` comment lines, in whichever comment syntax the
+language uses. A decorator would be closer to Foundry, but a decorator is code,
+and nothing here executes code.
+
+```sql
+-- @output repo_out.order_volume_by_lane
+SELECT lane, count(*) AS orders FROM connection_raw.… GROUP BY lane
+```
+
+```sql
+-- name: Average Weight Per Piece
+-- businessQuestion: How heavy is an average piece of freight we move?
+-- returns: scalar
+-- unit: kg
+SELECT round(avg(gross_weight_kg / nullif(piece_count, 0))::numeric, 2) …
+```
+
+### What a build will not do
+
+- **SQL never becomes arbitrary code.** A SQL transform goes through the same
+  compiler a pipeline node does — one statement, `SELECT` or `WITH` only — and
+  is materialised by `CREATE TABLE … AS SELECT * FROM (<sql>)`. Wrapping it in a
+  subquery is what makes "read-only" structural rather than merely checked: a
+  non-SELECT is a syntax error in that position, and PostgreSQL rejects a
+  data-modifying CTE anywhere but the top level. (A **python** repository is the
+  deliberate exception, described above.)
+- **It will not write outside `repo_out`.** The view layer is the contract the
+  ontology is generated from; a build that could replace a view could silently
+  change every object type built on it.
+- **It will not approve a function.** Publishing puts a definition in the
+  catalogue as `proposed`, which computes nothing and which no dashboard may
+  use. Approving is a separate admin act on `/functions` — the whole point of
+  the proposed/active split is that the two are not the same click.
+- **It will not replace an active definition.** That file is reported as
+  `skipped`, with what to do instead. An active function is what a dashboard
+  already renders, and a build is not a review.
+- **A Python or TypeScript file under `functions/` is published, not run.**
+  A function is something a dashboard calls, which is a different contract from
+  a transform that runs once at build time: the catalogue executes SQL, and the
+  other two languages are stored, reviewable, and reported as not executable.
+
+### Editing
+
+`/repos/<slug>` is a file tree, an editor and a toolbar. **New file** starts
+from a template for the repository's kind rather than an empty buffer, Tab
+indents, Ctrl+S saves, and **Commit** snapshots the tree with a message.
+Deleting a file removes it from the working tree; the last commit still has it.
+
+### Builds build a commit
+
+Not the editor. A build of uncommitted edits would produce a number nobody
+could reproduce, and reproducing a number is most of what a repository is for.
+One artifact is recorded per file, so a build that half worked says exactly
+which half: a failing transform does not hide three working ones, and the run
+is marked failed with every file named.
+
 ## Pipeline builder
 
 `/pipeline` is a canvas where a pipeline is drawn — sources, transforms, the
@@ -502,7 +763,7 @@ It is not a drawing tool that resembles a data platform. Every node is
 validated against the **published ontology**: an Object Type node naming a type
 the registry does not have is an error, and a Link node whose cardinality
 contradicts the one the pipeline discovered in the data is an error too. The
-palette is the real ontology — 20 object types, 41 links, 12 actions, 31 KPIs —
+palette is the real ontology — 20 object types, 40 links, 9 actions, 14 KPIs —
 so a node is configured by choosing something that exists rather than by typing
 a name.
 
@@ -523,13 +784,13 @@ meaningless, "this node has no description" only makes it rude. Every issue
 carries the node it belongs to, so clicking one in the bottom panel focuses
 that card.
 
-**Runs** exercise the graph's shape and dependency order. They do **not** move
-data: this platform reads a captured snapshot and has no execution engine, so
-every run is stored with `is_simulated = true` and the panel says so. Row
-counts are honest about what is known — an Object Type node reports the real
-count from the registry, a source with no configured row count reports
-*unknown* rather than zero, and unknown propagates downstream instead of
-silently becoming zero.
+**Runs** really run (migration 0014). Each node compiles to one SELECT and is
+materialised as a table in `pipeline_out`, so every row count, duration and
+error the panel shows comes from the database having done the work rather than
+from a ratio. Before that a run estimated — a filter was assumed to keep 60 %,
+an aggregate to collapse 50:1 — and every run was stored with
+`is_simulated = true`; runs now record `is_simulated = false` and name the
+table each node wrote.
 
 **Versions** are kept on every save (`platform.pipeline_version`), and
 restoring an old one creates a new version rather than rewriting history.
@@ -657,14 +918,15 @@ rounds, so two limits apply per user: a request rate
 
 ### Simulated data
 
-The pipeline synthesises execution data into `tms_sim`, which is what makes the
-service and cost KPIs answerable from a snapshot with no execution history. 17
-of the 31 KPIs depend on it.
+There is none. The `tms_sim` schema and every metric that rested on it were
+removed in migration 0018, and `PIPELINE_SIMULATE_EXECUTION=true` refuses
+rather than regenerating. 14 KPIs remain, each computable from the captured
+payload.
 
-Set `ALLOW_SIMULATED_DATA=false` in production. Those KPIs, the dashboard
-widgets built on them and the three simulation-backed actions then return
-**409** with an explanation instead of a number, so an invented figure cannot
-be quoted as a measured one. `/api/stats` reports which mode is active.
+`ALLOW_SIMULATED_DATA=false` stays in the compose file as a second lock: it
+refuses any KPI, widget or action still flagged `depends_on_simulation` with a
+**409** and an explanation. Nothing carries that flag today, so it currently
+gates nothing — which is the state it is meant to be in.
 
 ### Retention
 
@@ -713,9 +975,14 @@ coerced. `.github/workflows/ci.yml` runs all of it plus a typecheck, an
 ```
 db/init/              01 raw schema · 02 reference data · 03 simulation schema
                       04 semantic views · 05 KPI views · 06 platform · 07 verify
-services/pipeline/    ingest · simulate · introspect · relationships
-                      ontology_gen · kpi_catalog · actions · lineage_gen · dashboards
+                      (03 replays on a fresh volume and is dropped again by
+                       migration 0018; nothing reads the schema it creates)
+db/migrations/        NNNN_name.sql, applied once each by pipeline.migrate
+services/pipeline/    ingest · simulate (coverage report only) · introspect
+                      relationships · ontology_gen · kpi_catalog · actions
+                      lineage_gen · dashboards
 services/ontology-service/  registry · objectSet · kpi · actions · lineage · dashboards
+                      connections (sources, syncs) · repos (files, commits, builds)
 services/ai-fde/      llm (providers + failover) · tools · agent · prompts · store
 services/ui/          pages: Overview, OntologyManager, ObjectExplorer, GraphView,
                       LineagePage, Dashboards, Actions, Assistant
@@ -771,10 +1038,10 @@ Things found in the captured data that shape the model:
 - **The demo coordinates are not geographically coherent.** Great-circle distance
   between origin and destination has a median of 5,594 km and a maximum of
   18,948 km, against planned transit windows of 0.06 to 3.4 days; only 28 of 61
-  transports fall in a plausible road range. Simulated road distance is therefore
-  derived from the planned transit window — which *is* real data — and the
-  great-circle figure is still stored in `tms_sim.leg_distance.haversine_km` so
-  the discrepancy stays visible.
+  transports fall in a plausible road range. Road distance was once derived from
+  the planned transit window to work around this; that derivation went with
+  `tms_sim` in migration 0018, and `total_distance_km` now reads NULL — which is
+  what the snapshot actually supports.
 - **Shipment status reaches 11 and transport status reaches 8**, beyond the enums
   documented in `../scripts/tms_models.py`. Labels for the undocumented codes are
   inferred from conventional TMS lifecycle naming and carry `is_inferred = true`

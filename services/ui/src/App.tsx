@@ -9,6 +9,7 @@ import {
 } from "./api";
 import { useDebounced } from "./components/common";
 import { Actions } from "./pages/Actions";
+import { RepoDetail, RepoList } from "./pages/CodeRepos";
 import { Functions } from "./pages/Functions";
 import { BROWSE_KINDS, RESOURCE_SPECS } from "./components/spaces/resourceKinds";
 import { ResourceProvider, useResources } from "./ResourceContext";
@@ -44,6 +45,9 @@ const NAV = [
 	{ to: "/graph", label: "Graph", glyph: "◉" },
 	{ to: "/lineage", label: "Lineage", glyph: "⑃" },
 	{ to: "/pipeline", label: "Pipeline builder", glyph: "⑄" },
+	// Beside the pipeline builder, because it is the other way of describing
+	// how data becomes an ontology: one is drawn, the other is written down.
+	{ to: "/repos", label: "Repositories", glyph: "⌥" },
 	// One entry per resource kind, each opening a list-and-data page like
 	// Object Explorer. These used to be an inline panel that expanded every
 	// kind under the navigation, which buried it; a kind's name is not the
@@ -66,6 +70,7 @@ const TITLES: Record<string, string> = {
 	"/graph": "Ontology graph",
 	"/lineage": "Data lineage",
 	"/pipeline": "Pipeline builder",
+	"/repos": "Code repositories",
 	"/explorer": "Object explorer",
 	"/dashboards": "Dashboards",
 	"/dashboards/history": "Dashboard history",
@@ -349,6 +354,8 @@ function AppShell() {
 							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
 							<Route path="/actions" element={<Actions />} />
 							<Route path="/functions" element={<Functions />} />
+							<Route path="/repos" element={<RepoList />} />
+							<Route path="/repos/:slug" element={<RepoDetail />} />
 							<Route path="/browse/:kind" element={<ResourceBrowser />} />
 							<Route path="/assistant" element={<Assistant />} />
 							{/* Before nothing else, but listed after /assistant so the exact

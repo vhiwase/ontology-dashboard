@@ -251,15 +251,16 @@ Rules that will otherwise cost you a retry:
 (shares of a whole). Use hbar for anything with long category names like lanes and \
 carriers.
 - Widths are grid columns out of 4 and should add up to whole rows.
-- Add a {"type":"note","body":"..."} widget when the board carries simulated \
-metrics, saying which.
+- No metric in this catalogue is simulated; if one ever carries \
+dependsOnSimulation, add a {"type":"note","body":"..."} widget saying which and why.
 
 # Actions
-Read-only actions (rate what-ifs, on-time projections, cost recalculation) you may \
-run yourself with apply_action. Mutating actions - holding a shipment, assigning a \
-carrier, cancelling an order - you must NOT run. Describe what the action would do \
-and with which parameters, and tell the user they can run it from the object's \
-Actions panel. This is a hard boundary, not a preference.
+Every action in this catalogue mutates - holding a shipment, assigning a carrier, \
+cancelling an order - and you must NOT run any of them. There are no read-only \
+actions left: the three what-ifs that existed computed from generated execution \
+data and were withdrawn with it. Describe what an action would do and with which \
+parameters, and tell the user they can run it from the object's Actions panel. \
+This is a hard boundary, not a preference.
 
 # Style
 Be direct and brief. Lead with the answer. Round sensibly: 68.9%, not \
@@ -329,23 +330,23 @@ STARTER_PROMPTS = [
         "prompt": "Which carriers have the worst on-time performance, and how much do we spend with them?",
     },
     {
-        "label": "Which lanes cost us the most?",
-        "prompt": "Show me the most expensive lanes per kilometre and how much volume runs on them.",
+        "label": "Which lanes carry the most freight?",
+        "prompt": "Show me the busiest lanes by order count and shipped weight.",
     },
     {
         "label": "Can I trust these numbers?",
-        "prompt": "Which of these metrics are measured and which are simulated? Be specific.",
+        "prompt": "What does this snapshot actually measure, and which questions can it not answer? Be specific.",
     },
     {
-        "label": "What if we cut BMW's rates 8%?",
-        "prompt": "Run a what-if: what happens to cost and margin if we cut rates on the BMW account by 8%?",
+        "label": "What is still unplanned?",
+        "prompt": "How many orders have no route yet, and how much weight is sitting in them?",
     },
     {
         "label": "Where does shipment weight come from?",
         "prompt": "Trace where the shipped weight figure comes from, back to the source API.",
     },
     {
-        "label": "Build a finance dashboard",
-        "prompt": "Build a freight finance dashboard showing revenue, cost, margin and anything unbilled.",
+        "label": "Build a demand dashboard",
+        "prompt": "Build a dashboard showing order volume, shipped weight, planning rate and anything still unrated.",
     },
 ]

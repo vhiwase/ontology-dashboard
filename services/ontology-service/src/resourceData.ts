@@ -27,6 +27,7 @@
  */
 
 import { pool, query, queryOne } from "./db";
+import { connectionCatalog, isPlatformWrittenRelation } from "./connections";
 import {
 	BadRequest,
 	currentSpace,
@@ -243,29 +244,178 @@ async function actionRelation(apiName: string): Promise<Relation> {
 	};
 }
 
-function connectionRelation(): Relation {
+/**
+ * A page built from rows already in hand, rather than from a SQL relation.
+ *
+ * Needed where the rows do not come from this database at all — a connection's
+ * catalogue is read from the host it points at — so the sort, the search and
+ * the paging happen here instead of in a query. The sets are small: a
+ * catalogue is hundreds of rows, a repository is tens of files.
+ */
+function pageFromRows(
+	rows: Array<Record<string, unknown>>,
+	columns: DataColumn[],
+	relation: Omit<Relation, "sql" | "params">,
+	request: DataQuery,
+): DataPage {
+	const limit = Math.min(Math.max(1, Math.floor(Number(request.limit) || 100)), MAX_LIMIT);
+	const offset = Math.max(0, Math.floor(Number(request.offset) || 0));
+
+	const needle = String(request.q ?? "").trim().toLowerCase();
+	let matched = needle
+		? rows.filter((row) =>
+				Object.values(row).some((value) =>
+					String(value ?? "").toLowerCase().includes(needle),
+				),
+			)
+		: rows;
+
+	const wantedSort = String(request.sort ?? "").trim() || relation.defaultSort || "";
+	if (wantedSort) {
+		if (!columns.some((column) => column.name === wantedSort)) {
+			throw new BadRequest(
+				`'${wantedSort}' is not a column here. Available: ${columns.map((c) => c.name).join(", ")}.`,
+			);
+		}
+		const direction = String(request.dir ?? "asc").toLowerCase() === "desc" ? -1 : 1;
+		matched = [...matched].sort((a, b) => {
+			const left = a[wantedSort];
+			const right = b[wantedSort];
+			// Nulls last in both directions, matching the SQL path's NULLS LAST.
+			if (left === null || left === undefined) return right === null || right === undefined ? 0 : 1;
+			if (right === null || right === undefined) return -1;
+			if (typeof left === "number" && typeof right === "number") {
+				return (left - right) * direction;
+			}
+			return String(left).localeCompare(String(right)) * direction;
+		});
+	}
+
 	return {
-		sql:
-			"SELECT n.nspname AS schema, c.relname AS name," +
-			" CASE c.relkind WHEN 'r' THEN 'table' WHEN 'v' THEN 'view'" +
-			"   WHEN 'm' THEN 'materialized view' END AS kind," +
-			// reltuples is -1 for a table never analysed. That is reported as
-			// unknown (null), not as 0 - "0 rows" and "not yet counted" are
-			// different claims, and conflating them has bitten this platform before.
-			" CASE WHEN c.relkind = 'v' OR c.reltuples < 0 THEN NULL ELSE c.reltuples::bigint END" +
-			"   AS estimated_rows," +
-			" pg_size_pretty(pg_total_relation_size(c.oid)) AS size" +
-			" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace" +
-			" WHERE n.nspname IN ('tms_raw', 'tms_views', 'pipeline_out')" +
-			"   AND c.relkind IN ('r', 'v', 'm')",
-		params: [],
-		source: "information about tms_raw, tms_views and pipeline_out",
-		sourceKind: "catalog",
-		defaultSort: "schema",
-		note:
-			"Every table and view this connection can read. estimated_rows is the planner's " +
-			"statistic; it is blank for views, which store no rows, and for tables not yet analysed.",
+		source: relation.source,
+		sourceKind: relation.sourceKind,
+		columns,
+		rows: matched.slice(offset, offset + limit),
+		total: matched.length,
+		offset,
+		limit,
+		note: relation.note ?? null,
 	};
+}
+
+/**
+ * What a connection can read — asked of the database it points at.
+ *
+ * This used to query the platform's own pg_class over three hardcoded schemas,
+ * so a connection registered against another host listed THIS platform's
+ * tables under a heading that said they were the connection's. A confident
+ * wrong answer is worse than no answer, and it is why this now dials the host.
+ */
+async function connectionPage(resourceId: number, request: DataQuery): Promise<DataPage> {
+	const catalog = await connectionCatalog(resourceId);
+	const rows = catalog.relations.map((relation) => ({
+		schema: relation.schema,
+		name: relation.name,
+		kind: relation.kind,
+		estimated_rows: relation.estimatedRows,
+		size: relation.size,
+	}));
+
+	return pageFromRows(
+		rows,
+		[
+			{ name: "schema", type: "text" },
+			{ name: "name", type: "text" },
+			{ name: "kind", type: "text" },
+			{ name: "estimated_rows", type: "int8" },
+			{ name: "size", type: "text" },
+		],
+		{
+			source: catalog.isPlatformDatabase
+				? "this platform's own database"
+				: `the database '${catalog.connection}' points at`,
+			sourceKind: "catalog",
+			defaultSort: "schema",
+			note:
+				"Every table and view this connection's user can read. estimated_rows is the " +
+				"planner's statistic; it is blank for views, which store no rows, and for " +
+				"tables not yet analysed. Declare a sync against one of these to bring it across.",
+		},
+		request,
+	);
+}
+
+/**
+ * A table the platform itself wrote: a synced landing table, a built transform,
+ * a pipeline output.
+ *
+ * The published ontology is no longer the only honest source of rows, so
+ * `publishedView` alone would refuse a dataset this platform created itself.
+ * The relation is still never taken on trust: its schema must be one of the
+ * three the platform writes, and it must exist in the catalogue.
+ */
+async function platformWrittenRelation(qualified: string, note: string | null): Promise<Relation> {
+	if (!(await isPlatformWrittenRelation(qualified))) {
+		throw new BadRequest(
+			`'${qualified}' is not a relation this platform wrote, and the published ontology ` +
+				"does not expose it either.",
+		);
+	}
+	return {
+		sql: `SELECT * FROM ${quoteQualified(qualified)}`,
+		params: [],
+		source: qualified,
+		sourceKind: "output",
+		note,
+	};
+}
+
+/** The files in a repository, which is what a repository resource contains. */
+async function repoPage(slug: string, request: DataQuery): Promise<DataPage> {
+	const rows = await query<{
+		path: string;
+		language: string;
+		lines: string;
+		updated_by: string;
+		updated_at: Date;
+	}>(
+		`SELECT f.path, f.language,
+		        (length(f.content) - length(replace(f.content, E'\\n', '')) + 1)::text AS lines,
+		        f.updated_by, f.updated_at
+		   FROM platform.code_file f
+		   JOIN platform.code_repo r ON r.repo_id = f.repo_id
+		   JOIN platform.space s ON s.space_id = r.space_id
+		  WHERE s.slug = $1 AND r.slug = $2
+		  ORDER BY f.path`,
+		[currentSpace(), slug],
+	);
+
+	return pageFromRows(
+		rows.map((row) => ({
+			path: row.path,
+			language: row.language,
+			lines: Number(row.lines),
+			updated_by: row.updated_by,
+			updated_at: row.updated_at.toISOString(),
+		})),
+		[
+			{ name: "path", type: "text" },
+			{ name: "language", type: "text" },
+			{ name: "lines", type: "int8" },
+			{ name: "updated_by", type: "text" },
+			{ name: "updated_at", type: "timestamptz" },
+		],
+		{
+			source: `platform.code_file (${slug})`,
+			sourceKind: "catalog",
+			defaultSort: "path",
+			note:
+				rows.length === 0
+					? "This repository has no files yet."
+					: "Open the repository to read or edit a file, and to build it.",
+		},
+		request,
+	);
 }
 
 async function pipelineRelation(slug: string): Promise<Relation> {
@@ -352,19 +502,44 @@ export async function resourceData(resourceId: number, request: DataQuery): Prom
 	if (!resource) throw new NotFound(`No resource ${resourceId} in the '${currentSpace()}' space.`);
 
 	const ref = resource.target_ref ?? "";
-	const needsOntology = ["dataset", "objectType", "kpi", "linkType"].includes(resource.kind);
+	const backing =
+		typeof resource.properties?.sourceView === "string"
+			? String(resource.properties.sourceView)
+			: ref;
+	// A dataset the platform wrote itself — a synced landing table, a built
+	// transform — is readable without a published ontology, because nothing
+	// about it resolves through the registry. Only the kinds that genuinely
+	// need the ontology are gated on it.
+	const platformWritten = resource.kind === "dataset" && (await isPlatformWrittenRelation(backing));
+	const needsOntology =
+		!platformWritten && ["dataset", "objectType", "kpi", "linkType"].includes(resource.kind);
 	if (needsOntology && !hasOntology(currentSpace())) {
 		throw new BadRequest(`No ontology is published in '${currentSpace()}', so there is nothing to read.`);
 	}
 
 	switch (resource.kind) {
 		case "dataset": {
-			const view =
-				typeof resource.properties?.sourceView === "string"
-					? String(resource.properties.sourceView)
-					: ref;
-			return page(publishedView(view), request);
+			if (platformWritten) {
+				const origin = String(resource.properties?.backing ?? "");
+				return page(
+					await platformWrittenRelation(
+						backing,
+						origin === "sync"
+							? `Landed by the '${resource.properties?.syncName ?? "?"}' sync from ` +
+									`${resource.properties?.source ?? "the source"} through the ` +
+									`'${resource.properties?.connectionName ?? "?"}' connection.`
+							: origin === "transform"
+								? `Built by ${resource.properties?.repo ?? "a repository"}/${resource.properties?.repoPath ?? "?"}.`
+								: null,
+					),
+					request,
+				);
+			}
+			return page(publishedView(backing), request);
 		}
+
+		case "codeRepo":
+			return repoPage(ref, request);
 		case "objectType": {
 			const type = getRegistry().objectTypeByApiName.get(ref);
 			if (!type) throw new NotFound(`No object type '${ref}' in this space.`);
@@ -390,7 +565,7 @@ export async function resourceData(resourceId: number, request: DataQuery): Prom
 		case "actionType":
 			return page(await actionRelation(ref), request);
 		case "connection":
-			return page(connectionRelation(), request);
+			return connectionPage(resourceId, request);
 		case "pipeline":
 			return page(await pipelineRelation(ref), request);
 		case "dashboard":

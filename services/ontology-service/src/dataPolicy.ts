@@ -1,20 +1,21 @@
 /**
- * Whether simulated data may be served.
+ * Whether generated data may be served.
  *
- * The pipeline synthesises execution data into tms_sim when
- * PIPELINE_SIMULATE_EXECUTION is on, which is what makes the service and cost
- * KPIs answerable from a snapshot that has no execution history. That is right
- * for a demonstration and wrong for production, where a plausible invented
- * number is worse than no number.
+ * The pipeline once synthesised execution data into tms_sim, which is what made
+ * the service and cost KPIs answerable from a snapshot that has no execution
+ * history. That was right for a demonstration and wrong everywhere else, where
+ * a plausible invented number is worse than no number. Migration 0018 removed
+ * the schema, the metrics that rested on it and the three what-if actions that
+ * computed against it.
  *
- * Every KPI already carries dependsOnSimulation, and the action layer already
- * captions its cost figures as simulated. What was missing was a way to say
- * "not here": a caption is a convention, and conventions get quoted out of
- * context into a slide.
+ * So this gate currently gates nothing: no KPI, widget or action carries
+ * dependsOnSimulation. It stays anyway, and that is the point — the check is
+ * the one place a deployment decides whether it will serve an invented figure
+ * at all, and removing it would mean the next one arrives unannounced.
  *
- * ALLOW_SIMULATED_DATA=false turns that convention into a refusal. The
- * affected KPIs, dashboards widgets and actions return 409 rather than a
- * number, and say why.
+ * ALLOW_SIMULATED_DATA=false turns a caption into a refusal: anything flagged
+ * returns 409 rather than a number, and says why. A caption is a convention,
+ * and conventions get quoted out of context into a slide.
  */
 
 export const ALLOW_SIMULATED_DATA =
@@ -26,9 +27,9 @@ export class SimulatedDataRefused extends Error {
 
 	constructor(subject: string) {
 		super(
-			`${subject} is derived from simulated execution data (tms_sim), and this ` +
-				`deployment runs with ALLOW_SIMULATED_DATA=false. Ingest real execution ` +
-				`data, or set ALLOW_SIMULATED_DATA=true if simulated figures are acceptable here.`,
+			`${subject} is derived from generated execution data, and this deployment ` +
+				`runs with ALLOW_SIMULATED_DATA=false. Ingest real execution data, or set ` +
+				`ALLOW_SIMULATED_DATA=true if generated figures are acceptable here.`,
 		);
 	}
 }
@@ -44,7 +45,7 @@ export function describePolicy(): { allowSimulatedData: boolean; note: string } 
 	return {
 		allowSimulatedData: ALLOW_SIMULATED_DATA,
 		note: ALLOW_SIMULATED_DATA
-			? "Simulated execution data (tms_sim) may be served. KPIs built on it are flagged dependsOnSimulation and captioned."
-			: "Simulated execution data is refused: KPIs, widgets and actions that depend on tms_sim return 409.",
+			? "Generated execution data may be served where something is flagged dependsOnSimulation. Nothing is, today."
+			: "Generated execution data is refused: anything flagged dependsOnSimulation returns 409. Nothing is flagged today, so nothing is refused.",
 	};
 }

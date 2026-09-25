@@ -193,233 +193,35 @@ function isAutoApproved(meta: ActionTypeMeta, parameters: Record<string, unknown
 	});
 }
 
-// ── read-only action implementations ────────────────────────────────────────
-
 /**
- * Reprice a slice of the book and report the effect on cost, revenue and margin.
- * Computes against the real rows; writes nothing.
+ * Read-only actions: the ones that genuinely compute and return a result
+ * rather than being staged.
+ *
+ * Empty, and deliberately kept rather than deleted. Three lived here — Simulate
+ * Rate Change, Project On-Time Impact and Recalculate Transport Cost — and all
+ * three computed against the generated execution data in tms_sim: a cost the
+ * snapshot does not carry, a carrier it does not name, a distance every leg
+ * reports as 0 m. Migration 0018 dropped that schema and the views they read,
+ * so they could only answer 409, and they were withdrawn from the catalogue.
+ *
+ * The gate below still works. Declare a read-only action, register its
+ * implementation here, and it executes — which is what should happen the day
+ * the TMS starts sending actuals.
  */
-async function simulateRateChange(parameters: Record<string, unknown>): Promise<Record<string, unknown>> {
-	const scope = String(parameters.scope);
-	const scopeValue = String(parameters.scopeValue);
-	const pctChange = Number(parameters.ratePctChange);
-
-	const scopeColumn: Record<string, { transport: string; shipment: string }> = {
-		lane: { transport: "lane", shipment: "lane" },
-		carrier: { transport: "carrier_name", shipment: "" },
-		account: { transport: "account_name", shipment: "account_name" },
-		mode: { transport: "transportation_mode", shipment: "transportation_mode" },
-	};
-	const mapping = scopeColumn[scope];
-	if (!mapping) {
-		throw new BadRequest(`Unsupported scope '${scope}'. Use lane, carrier, account or mode.`);
-	}
-
-	const costRow = await queryOne<{ n: string; cost: string | null; km: string | null }>(
-		`SELECT count(*)::bigint AS n, sum(total_cost) AS cost, sum(total_distance_km) AS km
-		   FROM tms_views.v_transport
-		  WHERE ${quoteIdentifier(mapping.transport)}::text = $1`,
-		[scopeValue],
-	);
-
-	// Carrier is not a column on the shipment view, so revenue for a carrier scope
-	// comes through the transports that carrier ran.
-	const revenueRow = mapping.shipment
-		? await queryOne<{ n: string; revenue: string | null }>(
-				`SELECT count(*)::bigint AS n, sum(total_charge) AS revenue
-				   FROM tms_views.v_shipment
-				  WHERE ${quoteIdentifier(mapping.shipment)}::text = $1`,
-				[scopeValue],
-			)
-		: await queryOne<{ n: string; revenue: string | null }>(
-				`SELECT count(*)::bigint AS n, sum(s.total_charge) AS revenue
-				   FROM tms_views.v_shipment s
-				   JOIN tms_views.v_transport t ON t.order_key = s.order_key
-				  WHERE t.carrier_name::text = $1`,
-				[scopeValue],
-			);
-
-	const currentCost = Number(costRow?.cost ?? 0);
-	const revenue = Number(revenueRow?.revenue ?? 0);
-	const newCost = currentCost * (1 + pctChange / 100);
-	const currentMargin = revenue - currentCost;
-	const newMargin = revenue - newCost;
-
-	return {
-		effect: "computed",
-		scope,
-		scopeValue,
-		ratePctChange: pctChange,
-		transportsMatched: Number(costRow?.n ?? 0),
-		shipmentsMatched: Number(revenueRow?.n ?? 0),
-		totalKm: round2(Number(costRow?.km ?? 0)),
-		currentCost: round2(currentCost),
-		projectedCost: round2(newCost),
-		costDelta: round2(newCost - currentCost),
-		revenue: round2(revenue),
-		currentMargin: round2(currentMargin),
-		projectedMargin: round2(newMargin),
-		marginDelta: round2(newMargin - currentMargin),
-		currentMarginPct: revenue ? round2((currentMargin / revenue) * 100) : null,
-		projectedMarginPct: revenue ? round2((newMargin / revenue) * 100) : null,
-		note:
-			"Cost figures rest on the simulated execution data in tms_sim; the snapshot " +
-			"carries no transport cost. Treat the deltas as directional.",
-	};
-}
-
-/** Project on-time percentage if volume shifted between two carriers. */
-async function projectOnTimeImpact(parameters: Record<string, unknown>): Promise<Record<string, unknown>> {
-	const fromKey = String(parameters.fromCarrierKey);
-	const toKey = String(parameters.toCarrierKey);
-	const share = Number(parameters.sharePctToMove ?? 50) / 100;
-
-	const rows = await query<{
-		carrier_key: string;
-		carrier_name: string;
-		load_count: string;
-		measured_count: string;
-		on_time_count: string;
-	}>(
-		`SELECT carrier_key::text AS carrier_key, carrier_name,
-		        load_count::text, measured_count::text, on_time_count::text
-		   FROM tms_views.v_kpi_carrier_scorecard
-		  WHERE carrier_key::text = ANY($1)`,
-		[[fromKey, toKey]],
-	);
-
-	const from = rows.find((r) => r.carrier_key === fromKey);
-	const to = rows.find((r) => r.carrier_key === toKey);
-	if (!from || !to) {
-		const missing = !from ? fromKey : toKey;
-		throw new BadRequest(
-			`Carrier ${missing} has no loads in the scorecard, so there is nothing to project from.`,
-		);
-	}
-
-	const rate = (row: typeof from) =>
-		Number(row.measured_count) > 0 ? Number(row.on_time_count) / Number(row.measured_count) : null;
-	const fromRate = rate(from);
-	const toRate = rate(to);
-	if (fromRate === null || toRate === null) {
-		throw new BadRequest("One of the carriers has no measured arrivals, so no projection is possible.");
-	}
-
-	const fromLoads = Number(from.load_count);
-	const toLoads = Number(to.load_count);
-	const moved = Math.round(fromLoads * share);
-
-	const currentOnTime = fromRate * fromLoads + toRate * toLoads;
-	const projectedOnTime = fromRate * (fromLoads - moved) + toRate * (toLoads + moved);
-	const totalLoads = fromLoads + toLoads;
-
-	return {
-		effect: "computed",
-		fromCarrier: from.carrier_name,
-		toCarrier: to.carrier_name,
-		loadsMoved: moved,
-		fromCarrierOnTimePct: round2(fromRate * 100),
-		toCarrierOnTimePct: round2(toRate * 100),
-		combinedCurrentOnTimePct: totalLoads ? round2((currentOnTime / totalLoads) * 100) : null,
-		combinedProjectedOnTimePct: totalLoads ? round2((projectedOnTime / totalLoads) * 100) : null,
-		deltaPoints: totalLoads ? round2(((projectedOnTime - currentOnTime) / totalLoads) * 100) : null,
-		note:
-			"Assumes each carrier keeps its observed on-time rate on the moved volume. " +
-			"Those rates come from the simulated execution data in tms_sim.",
-	};
-}
-
-/** Recompute a transport's cost at a given rate and report the difference. */
-async function recalculateTransportCost(parameters: Record<string, unknown>): Promise<Record<string, unknown>> {
-	const transportKey = String(parameters.transportKey);
-	const row = await queryOne<{
-		transport_number: string;
-		transportation_mode: string | null;
-		total_distance_km: string | null;
-		total_cost: string | null;
-		linehaul_cost: string | null;
-		fuel_cost: string | null;
-		accessorial_cost: string | null;
-		carrier_name: string | null;
-	}>(
-		`SELECT transport_number, transportation_mode, total_distance_km::text,
-		        total_cost::text, linehaul_cost::text, fuel_cost::text,
-		        accessorial_cost::text, carrier_name
-		   FROM tms_views.v_transport WHERE transport_key::text = $1`,
-		[transportKey],
-	);
-	if (!row) throw new NotFound(`No transport with key ${transportKey}.`);
-
-	// The same per-mode rates the pipeline's simulation uses, so a recalculation at
-	// the default rate reproduces the stored figure rather than contradicting it.
-	const defaultRates: Record<string, number> = {
-		"Less Than Truckload": 2.35,
-		Truckload: 1.55,
-		Rail: 0.85,
-		Air: 4.8,
-		Ocean: 0.4,
-		Intermodal: 1.1,
-	};
-	const mode = row.transportation_mode ?? "Truckload";
-	const ratePerKm = parameters.ratePerKm !== undefined && parameters.ratePerKm !== null
-		? Number(parameters.ratePerKm)
-		: (defaultRates[mode] ?? 1.55);
-
-	const km = Number(row.total_distance_km ?? 0);
-	if (!km) {
-		throw new BadRequest(
-			`Transport ${row.transport_number} has no distance recorded, so cost per km cannot be recomputed.`,
-		);
-	}
-	const currentCost = Number(row.total_cost ?? 0);
-	const recomputedLinehaul = km * ratePerKm;
-	const fuel = Number(row.fuel_cost ?? 0);
-	const accessorial = Number(row.accessorial_cost ?? 0);
-	const recomputedTotal = recomputedLinehaul + fuel + accessorial;
-
-	return {
-		effect: "computed",
-		transportNumber: row.transport_number,
-		carrier: row.carrier_name,
-		transportationMode: mode,
-		distanceKm: round2(km),
-		ratePerKmApplied: ratePerKm,
-		currentLinehaul: round2(Number(row.linehaul_cost ?? 0)),
-		recomputedLinehaul: round2(recomputedLinehaul),
-		fuel: round2(fuel),
-		accessorial: round2(accessorial),
-		currentTotalCost: round2(currentCost),
-		recomputedTotalCost: round2(recomputedTotal),
-		delta: round2(recomputedTotal - currentCost),
-		note: "Reported only. Nothing was written.",
-	};
-}
-
-function round2(value: number): number {
-	return Math.round(value * 100) / 100;
-}
-
 const READ_ONLY_IMPLEMENTATIONS: Record<
 	string,
 	(parameters: Record<string, unknown>) => Promise<Record<string, unknown>>
-> = {
-	SimulateRateChange: simulateRateChange,
-	ProjectOnTimeImpact: projectOnTimeImpact,
-	RecalculateTransportCost: recalculateTransportCost,
-};
+> = {};
 
 /**
- * Read-only actions whose numbers come from the simulated execution data.
+ * Actions whose numbers would come from generated data.
  *
- * Each of these computes against tms_sim or the same synthetic rate table the
- * simulation uses, so their output is invented however carefully it is
- * captioned. ALLOW_SIMULATED_DATA=false refuses them outright.
+ * Empty for the same reason, and kept for the same reason: the policy check at
+ * the top of executeAction is the one place a deployment decides whether it
+ * serves an invented figure at all, and it should not have to be re-derived if
+ * such an action is ever declared again.
  */
-const SIMULATION_BACKED = new Set([
-	"SimulateRateChange",
-	"ProjectOnTimeImpact",
-	"RecalculateTransportCost",
-]);
+const SIMULATION_BACKED = new Set<string>([]);
 
 // ── the mutating path: stage, never pretend ─────────────────────────────────
 

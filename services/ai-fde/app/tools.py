@@ -313,7 +313,7 @@ async def get_data_coverage(_: dict[str, Any]) -> dict[str, Any]:
         ],
         "guidance": (
             "Metric areas below 100% source coverage rest partly or wholly on the "
-            "seeded execution simulation in tms_sim. Say so whenever you quote a "
+            "execution data this snapshot does not carry. Say so whenever you quote a "
             "figure from one of them."
         ),
     }
@@ -422,9 +422,10 @@ async def list_actions(_: dict[str, Any]) -> dict[str, Any]:
             for a in actions
         ],
         "guidance": (
-            "You may invoke read-only actions yourself. A mutating action must be "
-            "proposed to the user, never invoked without their explicit go-ahead in "
-            "this conversation."
+            "Every action here mutates, so you may invoke none of them: propose one "
+            "to the user and let them run it. A read-only action - one that computes "
+            "and returns a result rather than being staged - you could invoke "
+            "yourself, but the catalogue currently holds none."
         ),
     }
 

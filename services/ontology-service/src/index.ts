@@ -102,9 +102,31 @@ import {
 	registerDataset,
 	renameResource,
 	retestConnection,
-	testConnection,
 	seedSandbox,
 } from "./spaces";
+import {
+	connectionCatalog,
+	createSync,
+	deleteSync,
+	listSyncRuns,
+	listSyncs,
+	runSync,
+	testConnection,
+} from "./connections";
+import {
+	buildRepo,
+	commitRepo,
+	createRepo,
+	deleteFile,
+	deleteRepo,
+	getRepo,
+	listBuilds,
+	listCommits,
+	listFiles,
+	listRepos,
+	putFile,
+	repoOutputs,
+} from "./repos";
 
 const app = express();
 const PORT = Number(process.env.PORT ?? 4000);
@@ -1305,6 +1327,174 @@ app.post(
 app.post(
 	"/api/resources/:id/test",
 	handle(async (req, res) => res.json(await retestConnection(Number(req.params.id)))),
+);
+
+// ── data connection: what is on the far side, and bringing it across ─────────
+//
+//  A connection used to be a business card — registerable, testable, and
+//  incapable of delivering a single row. A SYNC is the missing half: a named,
+//  re-runnable pull from one table on the source into one dataset here.
+
+// Every relation the connection's own user can read, asked of the host it
+// points at rather than of this database.
+app.get(
+	"/api/resources/:id/catalog",
+	handle(async (req, res) => res.json(await connectionCatalog(Number(req.params.id)))),
+);
+
+app.get(
+	"/api/resources/:id/syncs",
+	handle(async (req, res) => res.json(await listSyncs(Number(req.params.id)))),
+);
+
+app.post(
+	"/api/resources/:id/syncs",
+	handle(async (req, res) => {
+		res.json(
+			await createSync(
+				Number(req.params.id),
+				req.body ?? {},
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/syncs/:id/run",
+	handle(async (req, res) => {
+		res.json(await runSync(Number(req.params.id), req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.get(
+	"/api/syncs/:id/runs",
+	handle(async (req, res) => {
+		res.json(await listSyncRuns(Number(req.params.id), Number(req.query.limit ?? 25)));
+	}),
+);
+
+app.delete(
+	"/api/syncs/:id",
+	handle(async (req, res) => {
+		await deleteSync(Number(req.params.id));
+		res.status(204).end();
+	}),
+);
+
+// ── code repositories ───────────────────────────────────────────────────────
+//
+//  Two kinds. A transforms repository ingests through a connection and builds
+//  tables from what lands; a functions repository publishes definitions into
+//  the function catalogue. Neither executes arbitrary code: see repos.ts.
+
+app.get(
+	"/api/repos",
+	handle(async (req, res) => {
+		res.json(await listRepos(req.query.space ? String(req.query.space) : undefined));
+	}),
+);
+
+app.post(
+	"/api/repos",
+	handle(async (req, res) => {
+		res.json(
+			await createRepo(
+				req.body ?? {},
+				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+/** Everything the repository page needs in one request. */
+app.get(
+	"/api/repos/:slug",
+	handle(async (req, res) => {
+		const space = req.query.space ? String(req.query.space) : undefined;
+		const repo = await getRepo(String(req.params.slug), space);
+		res.json({
+			repo,
+			files: await listFiles(repo.id),
+			commits: await listCommits(repo.id),
+			builds: await listBuilds(repo.id),
+			outputs: await repoOutputs(repo),
+		});
+	}),
+);
+
+app.put(
+	"/api/repos/:slug/files",
+	handle(async (req, res) => {
+		const repo = await getRepo(
+			String(req.params.slug),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		const body = req.body ?? {};
+		res.json(
+			await putFile(
+				repo.id,
+				String(body.path ?? ""),
+				String(body.content ?? ""),
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.delete(
+	"/api/repos/:slug/files",
+	handle(async (req, res) => {
+		const repo = await getRepo(
+			String(req.params.slug),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		// The path arrives as a query parameter: a DELETE body is legal but not
+		// reliably forwarded, and a file path is not a secret.
+		await deleteFile(repo.id, String(req.query.path ?? ""));
+		res.status(204).end();
+	}),
+);
+
+app.post(
+	"/api/repos/:slug/commit",
+	handle(async (req, res) => {
+		const repo = await getRepo(
+			String(req.params.slug),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		res.json(
+			await commitRepo(
+				repo.id,
+				String((req.body ?? {}).message ?? ""),
+				req.principal?.username ?? "unknown",
+			),
+		);
+	}),
+);
+
+app.post(
+	"/api/repos/:slug/build",
+	handle(async (req, res) => {
+		const repo = await getRepo(
+			String(req.params.slug),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		res.json(await buildRepo(repo.id, req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.delete(
+	"/api/repos/:slug",
+	handle(async (req, res) => {
+		const repo = await getRepo(
+			String(req.params.slug),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		await deleteRepo(repo.id);
+		res.status(204).end();
+	}),
 );
 
 // What the preview window shows: schema, sample rows, lineage and the

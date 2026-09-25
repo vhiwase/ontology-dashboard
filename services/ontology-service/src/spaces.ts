@@ -15,6 +15,17 @@
 
 import { pool, query, queryOne } from "./db";
 import {
+	type ConnectionSpec,
+	type ConnectionTest,
+	displayDsn,
+	isPlatformWrittenRelation,
+	listSyncs,
+	remoteDatabaseInfo,
+	specFromProperties,
+	testConnection,
+} from "./connections";
+import { findRepo } from "./repos";
+import {
 	BadRequest,
 	NotFound,
 	currentSpace,
@@ -31,6 +42,7 @@ export type ResourceKind =
 	| "pipeline"
 	| "dashboard"
 	| "connection"
+	| "codeRepo"
 	| "kpi";
 
 export interface SpaceRecord {
@@ -566,6 +578,60 @@ function safeDsn(raw: string): string {
 	}
 }
 
+/** The DSN the pool was built from, however it was supplied. */
+function rawDsn(): string {
+	if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+	const path = process.env.DATABASE_URL_FILE;
+	if (!path) return "";
+	try {
+		const { readFileSync } = require("node:fs") as typeof import("node:fs");
+		return readFileSync(path, "utf8").trim();
+	} catch {
+		return "";
+	}
+}
+
+/**
+ * The platform's own database, as a connection anyone could have registered.
+ *
+ * Host, port, database and user are taken from the DSN the service is already
+ * using; the password is not — what is stored is the PATH of the Docker secret
+ * that holds it, and only when that file is actually readable here. A
+ * credential in platform.resource would be readable by anyone who can read the
+ * workspace and would land in every backup.
+ */
+function platformConnectionProperties(): Record<string, unknown> {
+	const dsn = rawDsn();
+	let host = "";
+	let port = 5432;
+	let database = "";
+	let username = "";
+	try {
+		const url = new URL(dsn);
+		host = url.hostname;
+		port = Number(url.port) || 5432;
+		database = decodeURIComponent(url.pathname.replace(/^\//, ""));
+		username = decodeURIComponent(url.username);
+	} catch {
+		return {};
+	}
+	if (!host) return {};
+
+	const secretPath = "/run/secrets/postgres_password";
+	let secretRef: string | null = null;
+	try {
+		const { accessSync } = require("node:fs") as typeof import("node:fs");
+		accessSync(secretPath);
+		secretRef = secretPath;
+	} catch {
+		// Not mounted here. The connection is still registered and still says
+		// where it points; a test will say plainly that it has no credential.
+		secretRef = null;
+	}
+
+	return { host, port, database, username, secretRef, sslMode: "prefer" };
+}
+
 /**
  * What the sandbox connection resource shows: the database this platform is
  * actually running against, read live rather than stored at seed time.
@@ -724,11 +790,20 @@ async function sampleOf(
 	qualified: string,
 	limit: number,
 ): Promise<{ rows: Array<Record<string, unknown>>; total: number | null }> {
-	const registry = getRegistry();
-	const known =
-		registry.objectTypes.some((type) => type.sourceView === qualified) ||
-		registry.kpis.some((kpi) => kpi.sourceView === qualified);
-	if (!known) return { rows: [], total: null };
+	// Two ways a relation earns the right to be read here: the published
+	// ontology exposes it, or this platform wrote it itself — a synced landing
+	// table, a built transform, a pipeline output. The second was missing, so a
+	// dataset a sync had just filled previewed as empty.
+	const known = hasOntology(currentSpace())
+		? (() => {
+				const registry = getRegistry();
+				return (
+					registry.objectTypes.some((type) => type.sourceView === qualified) ||
+					registry.kpis.some((kpi) => kpi.sourceView === qualified)
+				);
+			})()
+		: false;
+	if (!known && !(await isPlatformWrittenRelation(qualified))) return { rows: [], total: null };
 
 	for (const part of qualified.split(".")) {
 		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(part)) return { rows: [], total: null };
@@ -764,7 +839,54 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 
 	switch (resource.kind) {
 		case "connection": {
-			return { ...empty, detail: { ...(await databaseInfo()) } };
+			// The syncs are this connection's downstream: they are the only way
+			// anything crosses it, and a connection with none is the state the
+			// preview should make obvious rather than hide.
+			const syncs = await listSyncs(resource.id);
+			return {
+				...empty,
+				detail: {
+					...(await connectionDetail(resource.name, resource.properties)),
+					syncCount: syncs.length,
+					lastTest: resource.properties.lastTest ?? null,
+				},
+				lineage: {
+					upstream: [],
+					downstream: syncs.map((sync) => ({
+						kind: "dataset" as const,
+						name: sync.targetTable,
+						relation: `synced ${sync.mode}`,
+						detail:
+							`${sync.sourceSchema}.${sync.sourceTable}` +
+							(sync.lastRun
+								? ` · ${sync.lastRun.status}, ${sync.lastRun.rowsAfter ?? 0} rows`
+								: " · never run"),
+					})),
+				},
+			};
+		}
+
+		case "codeRepo": {
+			const repo = await findRepo(currentSpace(), String(resource.targetRef ?? ""));
+			if (!repo) return { ...empty, resolved: false };
+			return {
+				...empty,
+				detail: {
+					slug: repo.slug,
+					kind: repo.kind,
+					branch: repo.defaultBranch,
+					files: repo.fileCount,
+					commits: repo.commitCount,
+					lastCommit: repo.lastCommitAt,
+					lastBuild: repo.lastBuild
+						? `${repo.lastBuild.status} · ${repo.lastBuild.startedAt}`
+						: "never built",
+				},
+				lineage: {
+					upstream: [],
+					downstream: [],
+				},
+			};
 		}
 
 		case "dataset": {
@@ -1237,7 +1359,12 @@ export async function seedSandbox(
 			description: `PostgreSQL. ${info.sizePretty}, ${info.schemas.length} schemas.`,
 			folderId: connections.id,
 			targetRef: null,
-			properties: { engine: "PostgreSQL", dsn: info.dsn },
+			// The host, user and credential REFERENCE as well as the display
+			// DSN. Without them this was a card describing a database it had no
+			// way to reach: it could not be tested and nothing could be synced
+			// through it, which made the Connections folder describe a
+			// capability the platform did not have.
+			properties: { engine: "PostgreSQL", dsn: info.dsn, ...platformConnectionProperties() },
 		});
 
 	const registry = getRegistry();
@@ -1340,6 +1467,35 @@ export async function seedSandbox(
 			});
 	}
 
+	// Code repositories. Seeded from platform.code_repo rather than created
+	// here: a repository exists in a space whether or not anyone has filled the
+	// workspace, and this only gives it a card to open.
+	const repos = await query<{
+		slug: string;
+		name: string;
+		description: string | null;
+		kind: string;
+		default_branch: string;
+	}>(
+		`SELECT r.slug, r.name, r.description, r.kind, r.default_branch
+		   FROM platform.code_repo r
+		   JOIN platform.space s ON s.space_id = r.space_id
+		  WHERE s.slug = 'sandbox' ORDER BY r.name`,
+	);
+	if (repos.length > 0) {
+		const code = await ensureFolder("Code", null);
+		for (const repo of repos) {
+			await ensureResource({
+				kind: "codeRepo",
+				name: repo.name,
+				description: repo.description,
+				folderId: code.id,
+				targetRef: repo.slug,
+				properties: { repoKind: repo.kind, branch: repo.default_branch },
+			});
+		}
+	}
+
 	return { created: !hadProject, added };
 }
 
@@ -1404,127 +1560,12 @@ export async function lookupResource(
 }
 
 // ── connections ─────────────────────────────────────────────────────────────
-
-export interface ConnectionSpec {
-	name: string;
-	description?: string | null;
-	folderId?: number | null;
-	engine: "postgresql";
-	host: string;
-	port: number;
-	database: string;
-	username: string;
-	/**
-	 * The NAME of an environment variable or Docker secret file holding the
-	 * password — never the password itself.
-	 *
-	 * A password stored in this table would be readable by anyone who can read
-	 * the workspace, would appear in every backup taken with scripts/backup.sh,
-	 * and would survive in the version history of the row. Storing the
-	 * reference keeps the credential where the rest of them already live.
-	 */
-	secretRef?: string | null;
-	sslMode?: "disable" | "require" | "prefer";
-}
-
-export interface ConnectionTest {
-	ok: boolean;
-	latencyMs: number;
-	detail: string;
-	serverVersion?: string | null;
-	testedAt: string;
-}
-
-/** Read a password from the referenced env var or secret file, never storage. */
-function resolveSecret(secretRef: string | null | undefined): string | null {
-	if (!secretRef) return null;
-	// A file path is treated as a Docker secret; anything else as an env var.
-	if (secretRef.startsWith("/")) {
-		try {
-			const { readFileSync } = require("node:fs") as typeof import("node:fs");
-			return readFileSync(secretRef, "utf8").trim();
-		} catch {
-			return null;
-		}
-	}
-	return process.env[secretRef] ?? null;
-}
-
-function buildDsn(spec: ConnectionSpec, password: string | null): string {
-	const auth = password
-		? `${encodeURIComponent(spec.username)}:${encodeURIComponent(password)}`
-		: encodeURIComponent(spec.username);
-	const ssl = spec.sslMode && spec.sslMode !== "prefer" ? `?sslmode=${spec.sslMode}` : "";
-	return `postgresql://${auth}@${spec.host}:${spec.port}/${spec.database}${ssl}`;
-}
-
-/** The DSN as it is safe to display and store: no password, ever. */
-export function displayDsn(spec: ConnectionSpec): string {
-	const secret = spec.secretRef ? ":***" : "";
-	return `postgresql://${spec.username}${secret}@${spec.host}:${spec.port}/${spec.database}`;
-}
-
-/**
- * Actually connect, and say what happened.
- *
- * A connection that has never been tested is a guess, which is the whole
- * reason this exists: the failure modes here — wrong host, wrong password,
- * no route, SSL required — are indistinguishable from each other until
- * something tries.
- */
-export async function testConnection(spec: ConnectionSpec): Promise<ConnectionTest> {
-	const started = Date.now();
-	const password = resolveSecret(spec.secretRef);
-
-	if (spec.secretRef && password === null) {
-		return {
-			ok: false,
-			latencyMs: 0,
-			detail:
-				`The secret '${spec.secretRef}' is not readable by this service. ` +
-				"For a Docker secret, use its path under /run/secrets and mount it on " +
-				"the ontology-service container; for an environment variable, use its name.",
-			testedAt: new Date().toISOString(),
-		};
-	}
-
-	// A short-lived pool of its own: this must never borrow the platform's
-	// connection, and a bad host should fail in seconds rather than hang the
-	// request.
-	const { Pool } = require("pg") as typeof import("pg");
-	const probe = new Pool({
-		connectionString: buildDsn(spec, password),
-		max: 1,
-		connectionTimeoutMillis: 5000,
-		idleTimeoutMillis: 1000,
-		statement_timeout: 5000,
-	});
-
-	try {
-		const result = await probe.query<{ version: string }>("SELECT version()");
-		return {
-			ok: true,
-			latencyMs: Date.now() - started,
-			detail: "Connected.",
-			serverVersion: (result.rows[0]?.version ?? "").split(" on ")[0] ?? null,
-			testedAt: new Date().toISOString(),
-		};
-	} catch (error) {
-		// The driver's message is the useful part here — "password authentication
-		// failed", "no pg_hba.conf entry", "ECONNREFUSED" each point somewhere
-		// different — so it is passed through rather than replaced.
-		return {
-			ok: false,
-			latencyMs: Date.now() - started,
-			detail: (error as Error).message,
-			testedAt: new Date().toISOString(),
-		};
-	} finally {
-		await probe.end().catch(() => {
-			/* the probe is disposable */
-		});
-	}
-}
+//
+//  Registering one is resource work and lives here; everything that reaches
+//  the far side — testing, the catalogue, and the syncs that bring rows across
+//  — lives in connections.ts. The dependency runs one way, spaces → connections,
+//  so a connection can be previewed without connections.ts needing to know what
+//  a project is.
 
 /** Create a connection resource, testing it first so it is never stored blind. */
 export async function createConnection(
@@ -1534,13 +1575,83 @@ export async function createConnection(
 	createdBy: string,
 ): Promise<{ resource: ResourceRecord; test: ConnectionTest }> {
 	if (!spec.name?.trim()) throw new BadRequest("A connection needs a name.");
-	if (!spec.host?.trim()) throw new BadRequest("A connection needs a host.");
-	if (!spec.database?.trim()) throw new BadRequest("A connection needs a database.");
-	if (!spec.username?.trim()) throw new BadRequest("A connection needs a username.");
 
-	const port = Number(spec.port) || 5432;
-	const normalised: ConnectionSpec = { ...spec, port, engine: "postgresql" };
+	const connector = spec.engine === "rest" ? "rest" : "postgresql";
+	let normalised: ConnectionSpec;
+	let properties: Record<string, unknown>;
 
+	if (connector === "rest") {
+		const baseUrl = String(spec.baseUrl ?? "").trim().replace(/\/+$/, "");
+		if (!baseUrl) throw new BadRequest("A REST connection needs a base URL.");
+		let parsed: URL;
+		try {
+			parsed = new URL(baseUrl);
+		} catch {
+			throw new BadRequest(
+				`'${baseUrl}' is not a URL. Give the scheme too, e.g. https://api.example.com/v1.`,
+			);
+		}
+		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+			throw new BadRequest(`'${parsed.protocol}' is not a scheme this connector speaks. Use http or https.`);
+		}
+
+		const authScheme = spec.authScheme ?? "none";
+		if (authScheme !== "none" && !spec.secretRef) {
+			throw new BadRequest(
+				`A ${authScheme} credential needs a secret to read it from: the NAME of an ` +
+					"environment variable, or the PATH of a Docker secret. The credential itself " +
+					"is never stored here.",
+			);
+		}
+		if (authScheme === "header" && !spec.headerName?.trim()) {
+			throw new BadRequest("A header credential needs the header's name, e.g. X-API-Key.");
+		}
+		if (authScheme === "basic" && !spec.username?.trim()) {
+			throw new BadRequest("Basic authentication needs a username as well as a secret.");
+		}
+
+		normalised = {
+			...spec,
+			engine: "rest",
+			baseUrl,
+			authScheme,
+			headerName: spec.headerName?.trim() || undefined,
+			healthPath: spec.healthPath?.trim() || undefined,
+		};
+		properties = {
+			engine: "rest",
+			connector: "REST API",
+			baseUrl,
+			authScheme,
+			headerName: normalised.headerName ?? null,
+			healthPath: normalised.healthPath ?? null,
+			username: normalised.username ?? null,
+			secretRef: normalised.secretRef ?? null,
+			dsn: displayDsn(normalised),
+		};
+	} else {
+		if (!spec.host?.trim()) throw new BadRequest("A connection needs a host.");
+		if (!spec.database?.trim()) throw new BadRequest("A connection needs a database.");
+		if (!spec.username?.trim()) throw new BadRequest("A connection needs a username.");
+
+		const port = Number(spec.port) || 5432;
+		normalised = { ...spec, port, engine: "postgresql" };
+		properties = {
+			engine: "PostgreSQL",
+			connector: "PostgreSQL",
+			host: normalised.host,
+			port,
+			database: normalised.database,
+			username: normalised.username,
+			// The reference, never the credential.
+			secretRef: normalised.secretRef ?? null,
+			sslMode: normalised.sslMode ?? "prefer",
+			dsn: displayDsn(normalised),
+		};
+	}
+
+	// Tested before it is stored, so a wrong host, an unreadable secret or a
+	// rejected token is found now rather than by whoever tries to sync.
 	const test = await testConnection(normalised);
 
 	const resource = await createResource(
@@ -1549,21 +1660,14 @@ export async function createConnection(
 		{
 			kind: "connection",
 			name: normalised.name.trim(),
-			description: normalised.description ?? `PostgreSQL at ${normalised.host}:${port}`,
+			description:
+				normalised.description ??
+				(connector === "rest"
+					? `REST API at ${normalised.baseUrl}`
+					: `PostgreSQL at ${normalised.host}:${normalised.port}`),
 			folderId: normalised.folderId ?? null,
 			targetRef: null,
-			properties: {
-				engine: "PostgreSQL",
-				host: normalised.host,
-				port,
-				database: normalised.database,
-				username: normalised.username,
-				// The reference, never the credential.
-				secretRef: normalised.secretRef ?? null,
-				sslMode: normalised.sslMode ?? "prefer",
-				dsn: displayDsn(normalised),
-				lastTest: test,
-			},
+			properties: { ...properties, lastTest: test },
 		},
 		createdBy,
 	);
@@ -1579,10 +1683,10 @@ export async function retestConnection(resourceId: number): Promise<ConnectionTe
 	);
 	if (!row) throw new NotFound(`No connection resource ${resourceId}.`);
 
-	const properties = row.properties ?? {};
-	// The seeded platform connection describes the database this service is
-	// already using, and has no host of its own to probe.
-	if (!properties.host) {
+	const spec = specFromProperties(row.name, row.properties ?? {});
+	// A connection with no host describes the database this service is already
+	// using, and has nothing of its own to dial.
+	if (!spec) {
 		const info = await databaseInfo();
 		return {
 			ok: true,
@@ -1593,16 +1697,7 @@ export async function retestConnection(resourceId: number): Promise<ConnectionTe
 		};
 	}
 
-	const test = await testConnection({
-		name: row.name,
-		engine: "postgresql",
-		host: String(properties.host),
-		port: Number(properties.port) || 5432,
-		database: String(properties.database),
-		username: String(properties.username),
-		secretRef: (properties.secretRef as string | null) ?? null,
-		sslMode: (properties.sslMode as ConnectionSpec["sslMode"]) ?? "prefer",
-	});
+	const test = await testConnection(spec);
 
 	await query(
 		`UPDATE platform.resource
@@ -1614,3 +1709,49 @@ export async function retestConnection(resourceId: number): Promise<ConnectionTe
 
 	return test;
 }
+
+/**
+ * The live detail behind a connection: what the database it points at reports
+ * about itself.
+ *
+ * Asked of the host the connection names. The preview used to answer with
+ * databaseInfo() whatever the connection pointed at, so a source on another
+ * machine was described with this platform's own version, size and schema
+ * list — a wrong answer that looked exactly like a right one.
+ */
+async function connectionDetail(
+	name: string,
+	properties: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	const spec = specFromProperties(name, properties);
+	if (!spec) return { ...(await databaseInfo()), isPlatformDatabase: true };
+
+	try {
+		const info = await remoteDatabaseInfo(spec);
+		return {
+			...info,
+			host: spec.host,
+			port: spec.port,
+			username: spec.username,
+			sslMode: spec.sslMode,
+			secretRef: spec.secretRef,
+			dsn: displayDsn(spec),
+			isPlatformDatabase: false,
+		};
+	} catch (error) {
+		// A source that is down is a normal state for a preview to report, and
+		// it is not the same as a resource that no longer resolves.
+		return {
+			host: spec.host,
+			port: spec.port,
+			database: spec.database,
+			username: spec.username,
+			sslMode: spec.sslMode,
+			secretRef: spec.secretRef,
+			dsn: displayDsn(spec),
+			isPlatformDatabase: false,
+			unreachable: (error as Error).message,
+		};
+	}
+}
+

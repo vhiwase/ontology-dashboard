@@ -52,6 +52,13 @@ ENV NODE_ENV=production
 
 RUN npm install -g npm@11.11.0 --no-audit --no-fund
 
+# Python, for the transforms a `python` code repository runs. The standard
+# library only: the runner deliberately has no third-party dependency, so a
+# transform gets the same interpreter everywhere and the image gains ~50 MB
+# rather than the ~300 MB a scientific stack would cost. See
+# src/pythonTransforms.ts for what a transform may and may not reach.
+RUN apk add --no-cache python3
+
 # The compiled library: its dist and manifest only, so no dev toolchain is
 # carried into the runtime image.
 WORKDIR /srv/vendor/ontograph-core
@@ -65,6 +72,8 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 COPY --from=build /srv/app/service/dist ./dist
+# The transform runner, beside the compiled service so dist/../python resolves.
+COPY python ./python
 
 RUN addgroup -g 10003 svc && adduser -u 10003 -G svc -D svc \
     && chown -R svc:svc /srv

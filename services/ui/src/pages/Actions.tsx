@@ -83,7 +83,15 @@ export function Actions() {
 			.then(([actionRows, roleRows]) => {
 				setActions(actionRows);
 				setRoles(roleRows);
-				setSelected((current) => current ?? actionRows.find((a) => a.isReadOnly)?.apiName ?? null);
+				// A read-only action first when there is one, because it is the one
+				// a visitor can actually run. There are none today — all three
+				// were withdrawn with the generated execution data they computed
+				// from — so this falls back to the first action rather than
+				// opening the page with nothing selected.
+				setSelected(
+					(current) =>
+						current ?? actionRows.find((a) => a.isReadOnly)?.apiName ?? actionRows[0]?.apiName ?? null,
+				);
 			})
 			.catch((exc: Error) =>
 				isMissingOntology(exc) ? setMissing(true) : setError(exc.message),
@@ -183,19 +191,26 @@ export function Actions() {
 
 			<div className="split">
 				<div className="card" style={{ padding: 10 }}>
-					<div className="rail-section">Read-only · safe to run</div>
-					{actions
-						.filter((entry) => entry.isReadOnly)
-						.map((entry) => (
-							<button
-								key={entry.apiName}
-								className={`rail-link ${entry.apiName === selected ? "active" : ""}`}
-								style={{ width: "100%", textAlign: "left" }}
-								onClick={() => setSelected(entry.apiName)}
-							>
-								<span>{entry.label}</span>
-							</button>
-						))}
+					{/* The read-only group appears only when there is something in
+					    it. An empty heading reads as a fault; the note below the
+					    list says where they went. */}
+					{actions.some((entry) => entry.isReadOnly) && (
+						<>
+							<div className="rail-section">Read-only · safe to run</div>
+							{actions
+								.filter((entry) => entry.isReadOnly)
+								.map((entry) => (
+									<button
+										key={entry.apiName}
+										className={`rail-link ${entry.apiName === selected ? "active" : ""}`}
+										style={{ width: "100%", textAlign: "left" }}
+										onClick={() => setSelected(entry.apiName)}
+									>
+										<span>{entry.label}</span>
+									</button>
+								))}
+						</>
+					)}
 					<div className="rail-section">Mutating · staged only</div>
 					{actions
 						.filter((entry) => !entry.isReadOnly)
@@ -210,6 +225,13 @@ export function Actions() {
 								{entry.requiresApproval && <span className="count">approval</span>}
 							</button>
 						))}
+					{!actions.some((entry) => entry.isReadOnly) && (
+						<p className="muted" style={{ fontSize: 11, margin: "10px 4px 2px" }}>
+							Every action here is staged rather than run. The three read-only ones —
+							a rate what-if, an on-time projection, a cost recalculation — computed
+							from generated execution data and were withdrawn with it.
+						</p>
+					)}
 				</div>
 
 				<div className="col">

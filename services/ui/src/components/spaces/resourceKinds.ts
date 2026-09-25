@@ -16,6 +16,7 @@ export type ResourceKind =
 	| "pipeline"
 	| "dashboard"
 	| "connection"
+	| "codeRepo"
 	| "kpi";
 
 export interface ResourceSpec {
@@ -42,6 +43,16 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 		label: "Dataset",
 		plural: "Datasets",
 		accent: "var(--node-data)",
+	},
+	codeRepo: {
+		kind: "codeRepo",
+		glyph: "⌥",
+		label: "Repository",
+		plural: "Repositories",
+		// Transform's accent: a repository is where a transform is written,
+		// and it belongs beside the pipeline rather than beside the data.
+		accent: "var(--node-transform)",
+		route: (ref) => `/repos/${encodeURIComponent(ref)}`,
 	},
 	objectType: {
 		kind: "objectType",
@@ -107,6 +118,9 @@ export const RESOURCE_KIND_LIST = Object.values(RESOURCE_SPECS);
  */
 export const BROWSE_KINDS: Array<{ slug: string; kind: ResourceKind; label: string }> = [
 	{ slug: "connections", kind: "connection", label: "Connections" },
+	// Between the connection and the dataset, which is where a repository sits
+	// in the flow: it is the code that pulls one through and reshapes it.
+	{ slug: "repositories", kind: "codeRepo", label: "Repositories" },
 	{ slug: "datasets", kind: "dataset", label: "Datasets" },
 	{ slug: "object-types", kind: "objectType", label: "Object Types" },
 	{ slug: "links", kind: "linkType", label: "Links" },

@@ -1710,3 +1710,18 @@ button.ghost.danger, .btn.ghost.danger {
   background: var(--surface-2); border-left: 3px solid var(--status-good, #2f855a);
   border-radius: var(--radius);
 }
+
+/* A dialog opened from a list page: the connection form, and anything else
+   that is an interruption rather than a place. */
+.rb-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in srgb, var(--surface-1) 72%, transparent);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 16px;
+  overflow-y: auto;
+  z-index: 40;
+}
+.rb-dialog { width: min(560px, 100%); }

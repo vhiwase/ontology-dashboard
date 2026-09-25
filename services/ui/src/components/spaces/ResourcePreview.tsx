@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, formatCell } from "../../api";
 import { RESOURCE_SPECS, type ResourceKind } from "./resourceKinds";
+import { SyncPanel } from "./SyncPanel";
 
 export interface ResourceSummary {
 	id: number;
@@ -323,6 +324,12 @@ export function ResourcePreview({
 										</div>
 									)}
 								</div>
+							)}
+
+							{/* The syncs are what makes a connection more than a business
+							    card, so they sit in the overview rather than behind a tab. */}
+							{preview.resource.kind === "connection" && (
+								<SyncPanel resourceId={resourceId} />
 							)}
 
 							{onOpenTarget && preview.resource.targetRef && (
