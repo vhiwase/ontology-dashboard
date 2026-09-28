@@ -31,9 +31,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import CONFIG
+from .context import current_session_state
 from .llm import LlmError, LlmProvider, ToolCall, recover_text_tool_calls
+from .modes import MODES, SessionAgentState, tools_for
 from .prompts import SYSTEM_PROMPT, build_context_message
-from .tools import TOOL_NAMES, run_tool, serialise_result, tool_schemas
+from .tools import TOOL_NAMES, run_tool, schemas_for, serialise_result
 
 log = logging.getLogger("ai_fde.agent")
 
@@ -109,6 +111,16 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "upstreamByLayer": payload.get("upstreamByLayer"),
             "sourceColumnCount": payload.get("sourceColumnCount"),
         }
+    if name in ("generate_plan", "manage_plan") and payload.get("plan"):
+        return {"kind": "plan", "plan": payload["plan"]}
+    if name == "manage_todo_list":
+        return {"kind": "todos", "todos": payload.get("todos") or []}
+    if name == "change_mode" and payload.get("mode"):
+        return {
+            "kind": "modeChange",
+            "mode": payload.get("mode"),
+            "label": payload.get("label"),
+        }
     return None
 
 
@@ -155,8 +167,16 @@ class Agent:
         user_message: str,
         history: list[dict[str, Any]],
         snapshot: dict[str, Any],
+        state: SessionAgentState | None = None,
     ) -> AgentResult:
         started = time.monotonic()
+        if state is None:
+            # Every caller in main.py passes the session's state; the default
+            # keeps the agent usable standalone (tests, one-off scripts).
+            state = SessionAgentState()
+        # The stateful tools reach the state through this contextvar rather
+        # than arguments, exactly as the token and space travel.
+        current_session_state.set(state)
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -168,7 +188,6 @@ class Agent:
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
 
-        schemas = tool_schemas()
         invocations: list[ToolInvocation] = []
         artifacts: list[dict[str, Any]] = []
         # Accumulated across every round, not replaced by the last one. A turn
@@ -188,6 +207,11 @@ class Agent:
         for round_index in range(CONFIG.max_tool_rounds):
             rounds = round_index + 1
             is_final_round = round_index == CONFIG.max_tool_rounds - 1
+
+            # Recomputed every round, not fixed before the loop: change_mode
+            # and enable_capabilities are meant to take effect mid-turn, so
+            # the tool set the model sees has to track the state it mutates.
+            schemas = None if is_final_round else schemas_for(tools_for(state))
 
             if is_final_round:
                 messages.append(
@@ -264,6 +288,11 @@ class Agent:
 
             for call in calls:
                 payload, ok, duration_ms = await self._invoke(call, cache)
+                if ok and call.name == "manage_context":
+                    # Applied here, where the message list is in hand, and
+                    # before the tool message is appended - so the model's
+                    # own view of what was pruned is accurate.
+                    self._apply_context_operations(state, messages, payload)
                 invocations.append(
                     ToolInvocation(
                         name=call.name,
@@ -417,3 +446,53 @@ class Agent:
             "tool %s %s in %dms", call.name, "ok" if ok else "FAILED", duration_ms
         )
         return payload, ok, duration_ms
+
+    def _apply_context_operations(
+        self,
+        state: SessionAgentState,
+        messages: list[dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Hide or restore tool results named by manage_context, in place.
+
+        Hidden content is stashed on the turn's state keyed by tool_call id,
+        so unhide restores exactly what was hidden and the message dicts
+        themselves never carry extra keys - what reaches the provider stays
+        strictly OpenAI-shaped. Hiding only ever matches results already in
+        the transcript; the result of the manage_context call itself is
+        appended afterwards and is always kept.
+        """
+        applied_hide: list[str] = []
+        applied_unhide: list[str] = []
+
+        for name in state.pending_hide:
+            hidden = 0
+            for message in messages:
+                if (
+                    message.get("role") == "tool"
+                    and message.get("name") == name
+                    and message["tool_call_id"] not in state.stashed
+                ):
+                    state.stashed[message["tool_call_id"]] = message["content"]
+                    message["content"] = (
+                        f"[hidden by manage_context: the {name} result was pruned "
+                        "for the rest of this turn; call manage_context with "
+                        f"unhide=[\"{name}\"] to restore it]"
+                    )
+                    hidden += 1
+            if hidden:
+                applied_hide.append(name)
+
+        for name in state.pending_unhide:
+            for message in messages:
+                if (
+                    message.get("role") == "tool"
+                    and message.get("name") == name
+                    and message["tool_call_id"] in state.stashed
+                ):
+                    message["content"] = state.stashed.pop(message["tool_call_id"])
+                    applied_unhide.append(name)
+
+        state.pending_hide = []
+        state.pending_unhide = []
+        payload["applied"] = {"hidden": applied_hide, "unhidden": applied_unhide}

@@ -1,9 +1,12 @@
 """The assistant's tools: its entire access to the platform.
 
-Every tool is a call to the ontology service. The assistant has no database
-connection and cannot write SQL, which is the point: it can only ask questions the
-ontology already knows how to answer, so a wrong answer is a wrong choice of
-metric rather than a wrong query.
+Two families live here. The domain tools call the ontology service: the
+assistant has no database connection and cannot write SQL, which is the point -
+it can only ask questions the ontology already knows how to answer, so a wrong
+answer is a wrong choice of metric rather than a wrong query. The capability
+tools (modes, plans, notepad, context management - the assistant managing
+itself, per the Palantir AI-FDE prompt) live in capability_tools.py and are
+merged into the same registry below.
 
 Two design decisions that shape everything here:
 
@@ -25,10 +28,18 @@ import logging
 from urllib.parse import quote
 from typing import Any, Callable, Awaitable
 
-import httpx
-
-from .config import CONFIG
-from .context import current_request_id, current_space, current_token
+# The client, the error types and the shared instance live in their own module
+# so the capability tools (modes, plans, notepad) can reach the ontology
+# through the same client without importing this module and its registry.
+from .capability_tools import CAPABILITY_TOOL_SCHEMAS, CAPABILITY_TOOLS
+from .context import current_session_state
+from .modes import tools_for
+from .ontology_client import (  # noqa: F401 - re-exported for existing imports
+    NoOntologyInSpace,
+    OntologyClient,
+    ToolError,
+    client,
+)
 
 log = logging.getLogger("ai_fde.tools")
 
@@ -37,73 +48,6 @@ log = logging.getLogger("ai_fde.tools")
 MAX_OBJECT_ROWS = 20
 MAX_AGGREGATE_ROWS = 25
 MAX_SERIES_POINTS = 30
-
-
-class OntologyClient:
-    def __init__(self, base_url: str | None = None) -> None:
-        self.base_url = (base_url or CONFIG.ontology_service_url).rstrip("/")
-
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        url = f"{self.base_url}{path}"
-
-        # Forward the caller's bearer token. Without one the ontology service
-        # answers 401, which is the correct outcome: there is no ambient
-        # service identity here that could read the ontology on nobody's
-        # behalf.
-        headers = dict(kwargs.pop("headers", None) or {})
-        token = current_token.get()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        # Carry the correlation id downstream so the ontology service logs the
-        # same id against the queries this turn caused.
-        request_id = current_request_id.get()
-        if request_id:
-            headers["X-Request-ID"] = request_id
-        if headers:
-            kwargs["headers"] = headers
-
-        # Every call is made in the conversation's space, so the assistant
-        # reads the ontology of the environment the user is actually in. A
-        # tool that set its own space explicitly keeps it.
-        params = dict(kwargs.pop("params", None) or {})
-        params.setdefault("space", current_space.get())
-        kwargs["params"] = params
-
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.request(method, url, **kwargs)
-        if response.status_code >= 400:
-            # Pass the service's own message through: it usually names the valid
-            # options, which is exactly what the model needs to recover.
-            try:
-                detail = response.json().get("error") or response.text
-            except Exception:
-                detail = response.text
-            if response.status_code == 409:
-                # The space has no published ontology. A distinct type because
-                # the answer is "nothing has been published here yet", which is
-                # worth saying plainly rather than reporting as a failed call.
-                raise NoOntologyInSpace(detail)
-            raise ToolError(f"{method} {path} failed ({response.status_code}): {detail}")
-        if response.status_code == 204:
-            return None
-        return response.json()
-
-    async def get(self, path: str, **kwargs: Any) -> Any:
-        return await self._request("GET", path, **kwargs)
-
-    async def post(self, path: str, json_body: Any = None) -> Any:
-        return await self._request("POST", path, json=json_body or {})
-
-
-class ToolError(RuntimeError):
-    pass
-
-
-class NoOntologyInSpace(ToolError):
-    """Raised where the conversation's space has no published ontology."""
-
-
-client = OntologyClient()
 
 
 def _truncate(rows: list[Any], cap: int, total: int | None = None) -> dict[str, Any]:
@@ -732,6 +676,14 @@ TOOL_IMPLEMENTATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, A
     "global_search": global_search,
 }
 
+# The capability tools (modes, plans, notepad, context) are part of the same
+# registry and the same duplicate-call cache as the domain tools. A mode or
+# capability decides which of these names the model SEES (schemas_for) and
+# which it may RUN (run_tool checks the same set): hiding a schema while the
+# tool stayed callable would make capability gating advisory - a hallucinated
+# or text-recovered call would run anyway.
+TOOL_IMPLEMENTATIONS.update(CAPABILITY_TOOLS)
+
 FILTER_CLAUSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -773,7 +725,24 @@ WIDGET_SCHEMA = {
 
 def tool_schemas() -> list[dict[str, Any]]:
     """The OpenAI-style function schemas both providers accept."""
-    return [
+    return _BASE_TOOL_SCHEMAS + CAPABILITY_TOOL_SCHEMAS
+
+
+def schemas_for(names: set[str]) -> list[dict[str, Any]]:
+    """The schemas whose tool is in `names`, in registry order.
+
+    The agent calls this once per round with the set derived from the
+    conversation's mode and enabled capabilities. A model is only ever handed
+    the tools it may actually run: offering apply_action while the
+    executeAction capability is off would invite a refusal round instead of
+    preventing one.
+    """
+    return [schema for schema in tool_schemas() if schema["function"]["name"] in names]
+
+
+# The domain tool schemas, built once at import. The capability schemas are
+# appended by tool_schemas(); both are filtered per turn by schemas_for().
+_BASE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         {
             "type": "function",
             "function": {
@@ -1258,6 +1227,33 @@ def tool_schemas() -> list[dict[str, Any]]:
 TOOL_NAMES = set(TOOL_IMPLEMENTATIONS)
 
 
+def _how_to_get(name: str, state: Any) -> str | None:
+    """Where the tool lives, as an actionable instruction.
+
+    The error a gated call returns should be recoverable in one round, like
+    every other tool error: name the capability to enable, or the mode to
+    switch to, rather than leaving the model to guess which.
+    """
+    from .capability_tools import CAPABILITY_TOOLS
+    from .modes import CAPABILITIES, MODES
+
+    for capability, entry in CAPABILITIES.items():
+        if name in entry["tools"]:
+            return (
+                f"It needs the {entry['label']} capability: call "
+                f"enable_capabilities with [\"{capability}\"]."
+            )
+    if name in CAPABILITY_TOOLS:
+        return None  # a meta-tool outside every mode set should not happen
+    for mode, entry in MODES.items():
+        if name in entry["tools"]:
+            return (
+                f"It belongs to the {mode} mode: call change_mode with "
+                f"mode=\"{mode}\"."
+            )
+    return None
+
+
 async def run_tool(name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any], bool]:
     """Execute a tool. Returns (payload, ok); a failure comes back as data."""
     implementation = TOOL_IMPLEMENTATIONS.get(name)
@@ -1269,6 +1265,23 @@ async def run_tool(name: str, arguments: dict[str, Any]) -> tuple[dict[str, Any]
             },
             False,
         )
+
+    # The gate is checked at run time, not only at schema-build time, so a
+    # call that arrives any other way - text-recovered, hallucinated, a
+    # capability disabled mid-turn - is refused on the same terms.
+    state = current_session_state.get()
+    if state is not None and name not in tools_for(state):
+        hint = _how_to_get(name, state)
+        message = (
+            f"Tool '{name}' is not available in mode '{state.mode}' with "
+            f"capabilities {sorted(state.capabilities)}."
+        )
+        if hint:
+            message += f" {hint}"
+        else:
+            message += " None of the current modes offer it."
+        return {"error": message}, False
+
     try:
         return await implementation(arguments), True
     except ToolError as exc:

@@ -236,7 +236,7 @@ model at all.
           │     object sets · KPIs · actions · lineage · exports
           │
           ├─▶ services/ai-fde            (Python + FastAPI)
-          │     15 tools over the ontology · Ollama or Azure OpenAI
+          │     mode/capability tools over the ontology · Ollama or Azure OpenAI
           │
           └─▶ services/ui                (React + Vite, nginx)
                 workbench · explorer · graph · lineage · dashboards · chat
@@ -348,9 +348,46 @@ Named after Palantir's forward deployed engineer: the person who sits with a
 business user and turns "am I losing money on the Chicago lane" into a working
 artefact.
 
-It has **15 tools and no database connection**. It cannot write SQL — it can only
-ask questions the ontology already knows how to answer, so a wrong answer is a
-wrong choice of metric, not a wrong query.
+It works through a **mode/capability layer modelled on the Palantir AI-FDE
+prompt** (`secrets/prompt`), and it has **no database connection**. It cannot
+write SQL — it can only ask questions the ontology already knows how to answer,
+so a wrong answer is a wrong choice of metric, not a wrong query.
+
+**Modes.** The reference prompt does not hand its assistant one flat tool list;
+it loads a *mode* — a named bundle of tools plus the documentation for the job.
+This assistant does the same: `exploration` (the default), `dataIntegration`,
+`dataConnection`, `ontologyEditing`, `functionsEditing`, `governance`,
+`applicationBuilding`, `platformQna` and `machineLearning`. The model switches
+with `change_mode`, and the tool schemas it sees are recomputed for the next
+round — a 7B model that would drown in thirty schemas is handed the dozen its
+task needs.
+
+**Capabilities.** On top of the mode, tools can be toggled independently and
+survive a mode switch: `notepad`, `generatePlan`/`managePlan`,
+`manageTodoList`, `executeAction` (read-only actions only, and the catalogue
+currently holds none), `viewPermissions`, `resourceDocumentation`,
+`filesystem` (read-only workspace browsing) and `workflowLineage`. The
+capabilities the reference prompt names that this platform cannot honour
+honestly — subagents, skills, an issue tracker — refuse with the reason
+rather than enabling nothing.
+
+**Gating is enforced twice.** The schemas a turn receives are filtered by mode
+and capabilities, and `run_tool` checks the same set at execution time, so a
+call that arrives any other way is refused with the instruction that recovers
+it ("it needs the Todo list capability: call enable_capabilities…").
+
+**Plans, notes and context.** For multi-step work the assistant writes a plan
+(`generate_plan`) and ticks steps off as it goes; the plan renders in the chat
+as a live checklist. `notepad` writes persistent notes scoped to the signed-in
+user and the conversation's space (they survive the conversation and the
+container). And `manage_context` — always on, like in the reference prompt —
+lets the model hide tool results it is finished with for the rest of a turn,
+so a row dump it has already summarised stops spending the context a small
+model cannot spare.
+
+Mode, capabilities, plan and todos are session state (migration 0027): a
+conversation that switched into governance mode is still in it after a
+restart.
 
 Try:
 
@@ -361,10 +398,12 @@ Try:
 - *"Which parts of this snapshot are measured, and what is missing at source?"*
 - *"What happens to cost and margin if we cut rates on the BMW account by 8 %?"*
 - *"Trace where the shipped weight figure comes from, back to the source API."*
+- *"Write down which lanes we agreed to re-rate, and keep a plan for the
+  dashboard you're building me."*
 
 Every answer shows the tool calls behind it, expandable to their arguments and
 results. When it runs a KPI you get the chart; when it builds a dashboard you get
-a link to it.
+a link to it; when it plans the work you get the plan, ticking over.
 
 ---
 
@@ -983,7 +1022,9 @@ services/pipeline/    ingest · simulate (coverage report only) · introspect
                       lineage_gen · dashboards
 services/ontology-service/  registry · objectSet · kpi · actions · lineage · dashboards
                       connections (sources, syncs) · repos (files, commits, builds)
-services/ai-fde/      llm (providers + failover) · tools · agent · prompts · store
+services/ai-fde/      llm (providers + failover) · modes (mode/capability model)
+                      tools · capability_tools (plans, notepad, context)
+                      ontology_client · agent · prompts · store
 services/ui/          pages: Overview, OntologyManager, ObjectExplorer, GraphView,
                       LineagePage, Dashboards, Actions, Assistant
 vendor/ontograph-core/      the vendored library — see below

@@ -43,6 +43,8 @@ interface Turn {
 		tokens?: number;
 		costUsd?: number;
 		priced?: boolean;
+		/** The operational mode the conversation is in after this turn. */
+		agentMode?: string;
 	};
 }
 
@@ -194,6 +196,7 @@ export function Assistant() {
 						tokens: response.cost?.totalTokens,
 						costUsd: response.cost?.usd,
 						priced: response.cost?.priced,
+						agentMode: response.agentMode,
 					},
 				},
 			]);
@@ -562,6 +565,7 @@ function TurnView({
 					<div className="muted" style={{ fontSize: 11, marginTop: 7 }}>
 						{turn.meta.rounds} round{turn.meta.rounds === 1 ? "" : "s"} ·{" "}
 						{(turn.meta.latencyMs / 1000).toFixed(1)}s · {turn.meta.model}
+						{turn.meta.agentMode && ` · mode: ${turn.meta.agentMode}`}
 						{turn.meta.stoppedBecause !== "answered" && ` · ${turn.meta.stoppedBecause}`}
 						{turn.meta.failoverReason && " · answered by the fallback model"}
 						{/* Tokens and cost per turn, so the price of a question is visible
@@ -881,6 +885,81 @@ function ArtifactView({
 					))}
 				</dl>
 			</div>
+		);
+	}
+
+	// The plan the assistant is working through. Steps render with their live
+	// status, because a plan only earns its place on the screen while it is
+	// visibly being followed - a finished list of ticks is an answer, not a plan.
+	if (artifact.kind === "plan" && artifact.plan) {
+		const plan = artifact.plan as {
+			title: string;
+			background?: string | null;
+			status: string;
+			steps: Array<{ description: string; status: string }>;
+		};
+		const glyph: Record<string, string> = {
+			pending: "○",
+			in_progress: "◐",
+			done: "●",
+			skipped: "◌",
+		};
+		return (
+			<div className="card" style={{ background: "var(--surface-2)" }}>
+				<div className="card-head">
+					<h3>Plan · {plan.title}</h3>
+					<span className="rp-rows mono" style={{ marginLeft: "auto" }}>
+						{plan.status}
+					</span>
+				</div>
+				{plan.background && <p className="secondary">{plan.background}</p>}
+				<ol style={{ margin: "8px 0 0", paddingLeft: 4, listStyle: "none" }}>
+					{plan.steps.map((step, index) => (
+						<li key={index} style={{ padding: "3px 0" }}>
+							<span aria-hidden style={{ marginRight: 8 }}>
+								{glyph[step.status] ?? "○"}
+							</span>
+							<span className={step.status === "done" ? "secondary" : ""}>
+								{step.description}
+							</span>
+						</li>
+					))}
+				</ol>
+			</div>
+		);
+	}
+
+	if (artifact.kind === "todos" && Array.isArray(artifact.todos)) {
+		const todos = artifact.todos as Array<{ text: string; status: string }>;
+		if (!todos.length) return null;
+		return (
+			<div className="card" style={{ background: "var(--surface-2)" }}>
+				<div className="card-head">
+					<h3>Follow-ups</h3>
+				</div>
+				<ul style={{ margin: "8px 0 0", paddingLeft: 20 }}>
+					{todos.map((todo, index) => (
+						<li
+							key={index}
+							className={todo.status === "done" ? "secondary" : ""}
+							style={{ padding: "2px 0" }}
+						>
+							{todo.status === "done" ? "✓ " : ""}
+							{todo.text}
+						</li>
+					))}
+				</ul>
+			</div>
+		);
+	}
+
+	// A mode switch is worth one quiet line in the transcript: it explains why
+	// the next answer was shaped by a different set of tools.
+	if (artifact.kind === "modeChange" && artifact.mode) {
+		return (
+			<p className="muted" style={{ fontSize: 12, margin: "8px 0" }}>
+				↳ switched to the <strong>{String(artifact.label ?? artifact.mode)}</strong> mode
+			</p>
 		);
 	}
 

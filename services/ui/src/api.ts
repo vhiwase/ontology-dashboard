@@ -675,7 +675,13 @@ export interface ChatArtifact {
 		/** A metric the assistant drafted, awaiting a person's approval. */
 		| "functionProposal"
 		/** A pipeline graph the assistant drafted, awaiting acceptance (§18). */
-		| "pipelineProposal";
+		| "pipelineProposal"
+		/** The step-by-step plan the assistant is working through. */
+		| "plan"
+		/** The conversation's follow-up checklist. */
+		| "todos"
+		/** One line noting the assistant switched operational mode. */
+		| "modeChange";
 	[key: string]: unknown;
 }
 
@@ -691,6 +697,9 @@ export interface ChatResponse {
 	provider: string;
 	model: string;
 	failoverReason?: string | null;
+	/** The conversation's agent state after this turn. */
+	agentMode?: string;
+	enabledCapabilities?: string[];
 	/** What the turn cost. `priced` is false when the provider has no rate. */
 	cost?: {
 		usd: number;

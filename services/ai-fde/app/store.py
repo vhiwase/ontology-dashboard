@@ -225,8 +225,161 @@ def delete_session(session_id: int, owner: str | None = None) -> bool:
             """DELETE FROM platform.chat_session
                 WHERE chat_session_id = %s
                   AND (%s::text IS NULL OR user_id = %s)
-            RETURNING chat_session_id""",
+                RETURNING chat_session_id""",
             (session_id, owner, owner),
+        )
+        return cur.fetchone() is not None
+
+
+# ── agent state: mode, capabilities, plan, todos ────────────────────────────
+# Migration 0027 put these on the session row, because a conversation that
+# switched into governance mode must still be in it after a restart. The
+# columns hold the whole state in one place the agent loop reads at the start
+# of every turn and writes back at the end.
+
+
+def get_session_state(session_id: int) -> dict[str, Any]:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT agent_mode, capabilities, plan, todos
+              FROM platform.chat_session
+             WHERE chat_session_id = %s
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return {"agent_mode": "exploration", "capabilities": [], "plan": None, "todos": []}
+    return {
+        "agent_mode": row["agent_mode"] or "exploration",
+        "capabilities": row["capabilities"] or [],
+        "plan": row["plan"],
+        "todos": row["todos"] or [],
+    }
+
+
+def set_session_state(
+    session_id: int,
+    agent_mode: str,
+    capabilities: list[str],
+    plan: dict[str, Any] | None,
+    todos: list[dict[str, Any]],
+) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE platform.chat_session
+               SET agent_mode = %s, capabilities = %s, plan = %s, todos = %s
+             WHERE chat_session_id = %s
+            """,
+            (
+                agent_mode,
+                json.dumps(sorted(capabilities)),
+                json.dumps(plan) if plan is not None else None,
+                json.dumps(todos),
+                session_id,
+            ),
+        )
+
+
+# ── notepad ─────────────────────────────────────────────────────────────────
+# Notes belong to a user in a space, like every other artefact here: a finding
+# written down while working the sandbox must not resurface as apparent
+# context in production. Created by migration 0027.
+
+
+class NotepadExists(RuntimeError):
+    """A note with this title already exists for the user in this space."""
+
+
+class NotepadSpaceMissing(RuntimeError):
+    """The space slug a note was addressed to does not exist."""
+
+
+def _notepad_space_id(space_slug: str) -> int:
+    """Resolve the space, so a note cannot be written into a space that does
+    not exist by a slug that merely looks plausible."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT space_id FROM platform.space WHERE slug = %s", (space_slug,))
+        row = cur.fetchone()
+    if row is None:
+        raise NotepadSpaceMissing(f"No space '{space_slug}'.")
+    return int(row["space_id"])
+
+
+def notepad_list(user: str, space_slug: str) -> list[dict[str, Any]]:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT n.notepad_document_id, n.title, n.content,
+                   left(n.content, 120) AS preview,
+                   n.created_at, n.updated_at
+              FROM platform.notepad_document n
+              JOIN platform.space s ON s.space_id = n.space_id
+             WHERE n.user_id = %s AND s.slug = %s
+             ORDER BY n.updated_at DESC
+            """,
+            (user, space_slug),
+        )
+        return list(cur.fetchall())
+
+
+def notepad_read(user: str, space_slug: str, title: str) -> dict[str, Any] | None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT n.notepad_document_id, n.title, n.content, n.created_at, n.updated_at
+              FROM platform.notepad_document n
+              JOIN platform.space s ON s.space_id = n.space_id
+             WHERE n.user_id = %s AND s.slug = %s AND n.title = %s
+            """,
+            (user, space_slug, title),
+        )
+        return cur.fetchone()
+
+
+def notepad_create(user: str, space_slug: str, title: str, content: str) -> dict[str, Any]:
+    space_id = _notepad_space_id(space_slug)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO platform.notepad_document (user_id, space_id, title, content)
+            VALUES (%s, %s, %s, %s)
+            RETURNING notepad_document_id, title, content, created_at, updated_at
+            """,
+            (user, space_id, title, content),
+        )
+        return cur.fetchone()
+
+
+def notepad_update(
+    user: str, space_slug: str, title: str, content: str
+) -> dict[str, Any] | None:
+    space_id = _notepad_space_id(space_slug)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE platform.notepad_document
+               SET content = %s, updated_at = now()
+             WHERE user_id = %s AND space_id = %s AND title = %s
+            RETURNING notepad_document_id, title, content, created_at, updated_at
+            """,
+            (content, user, space_id, title),
+        )
+        return cur.fetchone()
+
+
+def notepad_delete(user: str, space_slug: str, title: str) -> bool:
+    space_id = _notepad_space_id(space_slug)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM platform.notepad_document
+             WHERE user_id = %s AND space_id = %s AND title = %s
+            RETURNING notepad_document_id
+            """,
+            (user, space_id, title),
         )
         return cur.fetchone() is not None
 

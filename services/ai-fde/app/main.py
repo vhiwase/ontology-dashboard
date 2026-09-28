@@ -19,10 +19,11 @@ from pydantic import BaseModel, Field
 from . import store
 from .agent import Agent
 from .auth import Principal, require_role
-from .context import current_request_id, current_space
+from .context import current_request_id, current_session_state, current_space, current_user
 from .config import CONFIG
 from .limits import REPLICA_WARNING, RateLimited, limiter
 from .llm import LlmError, _single_provider, build_provider
+from .modes import SessionAgentState, resolve_mode
 from .pricing import price_turn, rates
 from .prompts import STARTER_PROMPTS
 from .tools import NoOntologyInSpace, OntologyClient
@@ -253,6 +254,11 @@ class ChatResponse(BaseModel):
     model: str
     # Set when the primary provider was skipped or failed for this turn.
     failoverReason: str | None = None
+    # The conversation's agent state after this turn: which mode it is in and
+    # which capabilities are enabled, so the UI can show both without a
+    # second request.
+    agentMode: str = "exploration"
+    enabledCapabilities: list[str] = Field(default_factory=list)
     # What the turn cost, priced with the rate in force when it ran. `priced`
     # is false when the provider has no configured rate, so an unpriced model
     # reads as a gap rather than as free.
@@ -670,6 +676,27 @@ async def chat(
     snapshot = await ontology_snapshot()
     history = store.history_for_model(session_id)
 
+    # The conversation's agent state - its mode and enabled capabilities, its
+    # plan and todos - comes from the session row, not from the request, for
+    # the same reason the space does: a conversation cannot be steered into a
+    # different configuration by what a turn claims to be.
+    stored_state = store.get_session_state(session_id)
+    try:
+        stored_mode = resolve_mode(stored_state["agent_mode"])
+    except ValueError:
+        # A mode that no longer exists (renamed or removed) falls back rather
+        # than wedging the conversation.
+        stored_mode = "exploration"
+    agent_state = SessionAgentState(
+        mode=stored_mode,
+        capabilities={c for c in stored_state["capabilities"] if isinstance(c, str)},
+        plan=stored_state["plan"],
+        todos=stored_state["todos"],
+    )
+    # Tools that write something the user owns - the notepad - need to know
+    # whose note it is, from the token rather than the request.
+    current_user.set(principal.username)
+
     # Resolve what the user attached. Anything that cannot be resolved is
     # reported in the block rather than dropped: the model should know a
     # requested object was unavailable, not silently answer without it.
@@ -678,7 +705,17 @@ async def chat(
 
     store.append_message(session_id, "user", request.message)
 
-    result = await agent.run(request.message, history, snapshot)
+    result = await agent.run(request.message, history, snapshot, agent_state)
+
+    # Whatever the turn changed - a mode switch, a capability toggled, a plan
+    # written - is the conversation's state now, persisted for its next turn.
+    store.set_session_state(
+        session_id,
+        agent_state.mode,
+        sorted(agent_state.capabilities),
+        agent_state.plan,
+        agent_state.todos,
+    )
 
     # Charge the budget with what the turn actually cost. This runs after the
     # call, so a single turn can overshoot the cap; the next one is refused.
@@ -748,6 +785,8 @@ async def chat(
         provider=result.provider or attempted_provider,
         model=result.model or CONFIG.model_for(attempted_provider),
         failoverReason=result.failover_reason,
+        agentMode=agent_state.mode,
+        enabledCapabilities=sorted(agent_state.capabilities),
         cost={
             "usd": cost.cost_usd,
             "priced": cost.priced,
