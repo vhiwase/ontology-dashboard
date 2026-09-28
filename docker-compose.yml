@@ -200,6 +200,9 @@ services:
       # false refuses every KPI, widget and action derived from tms_sim, so a
       # simulated figure cannot be served as though it were measured.
       ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-false}
+      # How often the background loop checks platform.schedule for due syncs
+      # and pipelines. 0 disables scheduling entirely.
+      SCHEDULE_TICK_SECONDS: ${SCHEDULE_TICK_SECONDS:-20}
       NODE_ENV: production
     secrets:
       - database_url

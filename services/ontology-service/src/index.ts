@@ -46,6 +46,24 @@ import {
 	validateGraph,
 } from "./pipelines";
 import { datasetVersions, nodeRunsFor, previewOutput } from "./execute";
+import {
+	createSchedule,
+	deleteSchedule,
+	getSchedule,
+	listScheduleRuns,
+	listSchedules,
+	runScheduleNow,
+	startScheduler,
+	updateSchedule,
+} from "./schedules";
+import {
+	createSuite as createEvalSuite,
+	deleteSuite as deleteEvalSuite,
+	getSuite as getEvalSuite,
+	listRuns as listEvalRuns,
+	listSuites as listEvalSuites,
+	runSuite as runEvalSuite,
+} from "./evals";
 import { resourceData } from "./resourceData";
 import {
 	createLinkType,
@@ -1597,6 +1615,152 @@ app.get(
 	}),
 );
 
+// ── schedules ────────────────────────────────────────────────────────────────
+//  A schedule is a named, recurring trigger for a sync or a pipeline. The
+//  ontology service's background loop (startScheduler, at boot) fires them
+//  when due; these routes manage the definitions and show what they did.
+
+app.get(
+	"/api/schedules",
+	handle(async (req, res) => {
+		res.json(
+			await listSchedules(req.query.space ? String(req.query.space) : undefined),
+		);
+	}),
+);
+
+app.post(
+	"/api/schedules",
+	handle(async (req, res) => {
+		res.status(201).json(
+			await createSchedule(req.body, req.principal?.username ?? "unknown"),
+		);
+	}),
+);
+
+app.get(
+	"/api/schedules/:id",
+	handle(async (req, res) => {
+		res.json(
+			await getSchedule(
+				Number(req.params.id),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.patch(
+	"/api/schedules/:id",
+	handle(async (req, res) => {
+		res.json(
+			await updateSchedule(
+				Number(req.params.id),
+				req.body,
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.delete(
+	"/api/schedules/:id",
+	handle(async (req, res) => {
+		await deleteSchedule(
+			Number(req.params.id),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		res.status(204).end();
+	}),
+);
+
+app.get(
+	"/api/schedules/:id/runs",
+	handle(async (req, res) => {
+		res.json(await listScheduleRuns(Number(req.params.id), Number(req.query.limit ?? 25)));
+	}),
+);
+
+/** Fire now, from a person's click, without disturbing the cadence. */
+app.post(
+	"/api/schedules/:id/run",
+	handle(async (req, res) => {
+		res.json(
+			await runScheduleNow(
+				Number(req.params.id),
+				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+// ── eval suites (function targets) ──────────────────────────────────────────
+//  Suites whose cases assert properties of what a metric function returns.
+//  Assistant-targeted suites share these tables but are managed and run by
+//  the AI-FDE service, which owns the agent they exercise.
+
+app.get(
+	"/api/evals/suites",
+	handle(async (req, res) => {
+		res.json(
+			await listEvalSuites("function", req.query.space ? String(req.query.space) : undefined),
+		);
+	}),
+);
+
+app.post(
+	"/api/evals/suites",
+	handle(async (req, res) => {
+		res.status(201).json(
+			await createEvalSuite(req.body, req.principal?.username ?? "unknown"),
+		);
+	}),
+);
+
+app.get(
+	"/api/evals/suites/:id",
+	handle(async (req, res) => {
+		res.json(
+			await getEvalSuite(
+				Number(req.params.id),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.delete(
+	"/api/evals/suites/:id",
+	handle(async (req, res) => {
+		await deleteEvalSuite(
+			Number(req.params.id),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		res.status(204).end();
+	}),
+);
+
+app.post(
+	"/api/evals/suites/:id/run",
+	handle(async (req, res) => {
+		res.json(
+			await runEvalSuite(
+				Number(req.params.id),
+				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.get(
+	"/api/evals/suites/:id/runs",
+	handle(async (req, res) => {
+		res.json(await listEvalRuns(Number(req.params.id), Number(req.query.limit ?? 10)));
+	}),
+);
+
 // ── errors ──────────────────────────────────────────────────────────────────
 
 app.use((_req, res) => {
@@ -1642,6 +1806,8 @@ async function start(): Promise<void> {
 	console.log("[boot] TMS ontology service starting.");
 	await waitForOntology();
 	await loadRegistry();
+
+	startScheduler();
 
 	// Report the validation state at boot: if the published ontology has a
 	// structural problem, the log says so before anyone hits an endpoint.

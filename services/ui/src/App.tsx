@@ -27,6 +27,8 @@ import { Spaces } from "./pages/Spaces";
 import { SpaceProvider, envTone, useSpace } from "./SpaceContext";
 import { OntologyManager } from "./pages/OntologyManager";
 import { Overview } from "./pages/Overview";
+import { Schedules } from "./pages/Schedules";
+import { Evals } from "./pages/Evals";
 
 interface HealthPayload {
 	status: string;
@@ -58,6 +60,10 @@ const NAV = [
 	{ to: "/dashboards", label: "Dashboards", glyph: "▦" },
 	{ to: "/actions", label: "Actions", glyph: "▶" },
 	{ to: "/functions", label: "Functions", glyph: "ƒ" },
+	// The two ways work keeps happening without someone watching: a cadence
+	// that fires itself, and a regression contract that scores what did.
+	{ to: "/schedules", label: "Schedules", glyph: "⏱" },
+	{ to: "/evals", label: "Evals", glyph: "✓" },
 	{ section: "Assistant" },
 	{ to: "/assistant", label: "AI-FDE", glyph: "✦", exact: true },
 	{ to: "/assistant/cost", label: "Cost analysis", glyph: "$" },
@@ -76,6 +82,8 @@ const TITLES: Record<string, string> = {
 	"/dashboards/history": "Dashboard history",
 	"/actions": "Actions",
 	"/functions": "Functions",
+	"/schedules": "Schedules",
+	"/evals": "Eval suites",
 	"/assistant": "AI-FDE assistant",
 	"/assistant/cost": "Assistant cost analysis",
 };
@@ -354,6 +362,8 @@ function AppShell() {
 							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
 							<Route path="/actions" element={<Actions />} />
 							<Route path="/functions" element={<Functions />} />
+								<Route path="/schedules" element={<Schedules />} />
+								<Route path="/evals" element={<Evals />} />
 							<Route path="/repos" element={<RepoList />} />
 							<Route path="/repos/:slug" element={<RepoDetail />} />
 							<Route path="/browse/:kind" element={<ResourceBrowser />} />

@@ -384,6 +384,160 @@ def notepad_delete(user: str, space_slug: str, title: str) -> bool:
         return cur.fetchone() is not None
 
 
+# ── assistant eval suites ───────────────────────────────────────────────────
+# The assistant owns the 'assistant' target kind of platform.eval_suite; the
+# ontology-service owns the 'function' kind. Same tables, shared shape, one
+# owner each - so neither service invents a second schema for a suite.
+
+
+def eval_suite_list(space_slug: str) -> list[dict[str, Any]]:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT es.eval_suite_id, es.name, es.target_kind, es.target_ref,
+                   es.description, es.created_by, es.created_at,
+                   (SELECT count(*) FROM platform.eval_case c
+                     WHERE c.suite_id = es.eval_suite_id)::int AS case_count,
+                   (SELECT count(*) FROM platform.eval_run r
+                     WHERE r.suite_id = es.eval_suite_id)::int AS run_count
+              FROM platform.eval_suite es
+              JOIN platform.space sp ON sp.space_id = es.space_id
+             WHERE es.target_kind = 'assistant' AND sp.slug = %s
+             ORDER BY es.name
+            """,
+            (space_slug,),
+        )
+        return list(cur.fetchall())
+
+
+def eval_suite_create(
+    space_slug: str,
+    name: str,
+    description: str,
+    cases: list[dict[str, Any]],
+    user: str,
+) -> int:
+    space_id = _notepad_space_id(space_slug)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO platform.eval_suite
+                (space_id, name, target_kind, target_ref, description, created_by)
+            VALUES (%s, %s, 'assistant', 'assistant', %s, %s)
+            RETURNING eval_suite_id
+            """,
+            (space_id, name, description or None, user),
+        )
+        suite_id = int(cur.fetchone()["eval_suite_id"])
+        for ordinal, case in enumerate(cases, start=1):
+            cur.execute(
+                """
+                INSERT INTO platform.eval_case (suite_id, name, spec, ordinal)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (suite_id, case["name"], json.dumps(case["spec"]), ordinal),
+            )
+    return suite_id
+
+
+def eval_suite_get(suite_id: int, space_slug: str) -> dict[str, Any] | None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT es.eval_suite_id, es.name, es.target_kind, es.target_ref,
+                   es.description, es.created_by, es.created_at
+              FROM platform.eval_suite es
+              JOIN platform.space sp ON sp.space_id = es.space_id
+             WHERE es.eval_suite_id = %s AND es.target_kind = 'assistant'
+               AND sp.slug = %s
+            """,
+            (suite_id, space_slug),
+        )
+        suite = cur.fetchone()
+        if suite is None:
+            return None
+        cur.execute(
+            """
+            SELECT eval_case_id, name, spec, ordinal
+              FROM platform.eval_case
+             WHERE suite_id = %s ORDER BY ordinal, eval_case_id
+            """,
+            (suite_id,),
+        )
+        suite["cases"] = list(cur.fetchall())
+    return suite
+
+
+def eval_suite_delete(suite_id: int, space_slug: str) -> bool:
+    space_id = _notepad_space_id(space_slug)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM platform.eval_suite
+             WHERE eval_suite_id = %s AND space_id = %s AND target_kind = 'assistant'
+            RETURNING eval_suite_id
+            """,
+            (suite_id, space_id),
+        )
+        return cur.fetchone() is not None
+
+
+def eval_run_record(
+    suite_id: int,
+    started_by: str,
+    outcome: dict[str, Any],
+    duration_seconds: float,
+    cost: Any | None = None,
+) -> int:
+    """Persist a finished suite run. Counters are columns so a run list can be
+    read without opening every detail blob."""
+    tokens = outcome.get("tokens") or {}
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO platform.eval_run
+                (suite_id, started_by, status, passed, failed, total, detail,
+                 prompt_tokens, completion_tokens, total_tokens, cost_usd,
+                 started_at, finished_at)
+            VALUES (%s, %s, 'succeeded', %s, %s, %s, %s, %s, %s, %s, %s,
+                    now() - make_interval(secs => %s), now())
+            RETURNING eval_run_id
+            """,
+            (
+                suite_id,
+                started_by,
+                outcome["passed"],
+                outcome["failed"],
+                outcome["total"],
+                json.dumps(outcome["outcomes"]),
+                tokens.get("promptTokens"),
+                tokens.get("completionTokens"),
+                tokens.get("totalTokens"),
+                getattr(cost, "cost_usd", None) if getattr(cost, "priced", False) else None,
+                # The row spans the whole suite; reconstruct started_at from
+                # the measured duration rather than fabricating a timestamp.
+                max(0, int(duration_seconds)),
+            ),
+        )
+        return int(cur.fetchone()["eval_run_id"])
+
+
+def eval_runs_list(suite_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT eval_run_id, started_by, status, passed, failed, total, detail,
+                   prompt_tokens, completion_tokens, total_tokens, cost_usd,
+                   started_at, finished_at
+              FROM platform.eval_run
+             WHERE suite_id = %s
+             ORDER BY started_at DESC LIMIT %s
+            """,
+            (suite_id, max(1, min(limit, 50))),
+        )
+        return list(cur.fetchall())
+
+
 def cost_summary(
     owner: str | None, days: int = 30, space_slug: str | None = None
 ) -> dict[str, Any]:

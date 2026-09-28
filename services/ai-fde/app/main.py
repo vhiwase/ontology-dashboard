@@ -21,6 +21,7 @@ from .agent import Agent
 from .auth import Principal, require_role
 from .context import current_request_id, current_session_state, current_space, current_user
 from .config import CONFIG
+from .evals import run_assistant_suite, validate_case_spec
 from .limits import REPLICA_WARNING, RateLimited, limiter
 from .llm import LlmError, _single_provider, build_provider
 from .modes import SessionAgentState, resolve_mode
@@ -797,6 +798,148 @@ async def chat(
             "rateOutputPerM": cost.rate_output_per_m,
         },
     )
+
+
+# ── assistant eval suites ───────────────────────────────────────────────────
+#  The assistant's half of platform.eval_suite: prompts with structural
+#  evaluators, run against the live agent. The function-targeted suites are
+#  served by the ontology service at /api/evals; the UI shows both.
+
+
+@app.get("/api/assistant/evals/suites")
+async def eval_suites(
+    space: str | None = None,
+    _: Principal = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    return {"suites": store.eval_suite_list(space or current_space.get())}
+
+
+class EvalSuiteCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2000)
+    # Each case: {"name": "...", "spec": {"prompt": "...", "evaluators": [...]}}
+    cases: list[dict[str, Any]] = Field(min_length=1, max_length=50)
+
+
+@app.post("/api/assistant/evals/suites", status_code=201)
+async def eval_suite_new(
+    request: EvalSuiteCreate,
+    principal: Principal = Depends(require_role("analyst")),
+) -> dict[str, Any]:
+    space = current_space.get()
+    for index, case in enumerate(request.cases, start=1):
+        spec = case.get("spec") or {}
+        reason = validate_case_spec(spec if isinstance(spec, dict) else {})
+        if reason:
+            raise HTTPException(status_code=400, detail=f"Case {index}: {reason}")
+    suite_id = store.eval_suite_create(
+        space,
+        request.name.strip(),
+        request.description.strip(),
+        [
+            {
+                "name": str(case.get("name") or f"Case {index}").strip(),
+                "spec": case.get("spec") or {},
+            }
+            for index, case in enumerate(request.cases, start=1)
+        ],
+        principal.username,
+    )
+    return store.eval_suite_get(suite_id, space)
+
+
+@app.get("/api/assistant/evals/suites/{suite_id}")
+async def eval_suite_detail(
+    suite_id: int,
+    _: Principal = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    suite = store.eval_suite_get(suite_id, current_space.get())
+    if suite is None:
+        raise HTTPException(status_code=404, detail=f"No eval suite {suite_id}.")
+    return suite
+
+
+@app.delete("/api/assistant/evals/suites/{suite_id}", status_code=204, response_class=Response)
+async def eval_suite_remove(
+    suite_id: int,
+    _: Principal = Depends(require_role("admin")),
+) -> Response:
+    if not store.eval_suite_delete(suite_id, current_space.get()):
+        raise HTTPException(status_code=404, detail=f"No eval suite {suite_id}.")
+    return Response(status_code=204)
+
+
+@app.post("/api/assistant/evals/suites/{suite_id}/run")
+async def eval_suite_run(
+    suite_id: int,
+    principal: Principal = Depends(require_role("analyst")),
+) -> dict[str, Any]:
+    """Run every case through the live agent and score the transcripts.
+
+    Not rate-limited like chat: this is an explicit analyst-initiated run of
+    a fixed suite, and a regression check that tripped the per-user chat
+    limits would measure the limiter rather than the assistant. What it spends
+    is priced and recorded on the run row instead.
+    """
+    if "agent" not in state:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "The language model is not available: "
+                + state.get("provider_error", "unknown")
+                + " Check /health for detail."
+            ),
+        )
+    space = current_space.get()
+    suite = store.eval_suite_get(suite_id, space)
+    if suite is None:
+        raise HTTPException(status_code=404, detail=f"No eval suite {suite_id}.")
+
+    # Every case runs in the suite's own space, reading its ontology, bound by
+    # the caller's token like any chat turn.
+    current_space.set(space)
+    started = time.monotonic()
+    outcome = await run_assistant_suite(
+        suite["name"],
+        suite["cases"],
+        state["agent"],
+        ontology_snapshot,
+        _validate_citations,
+    )
+    duration = time.monotonic() - started
+
+    agent: Agent = state["agent"]
+    cost = price_turn(
+        getattr(agent.provider, "name", CONFIG.provider),
+        CONFIG.model_for(getattr(agent.provider, "name", CONFIG.provider)),
+        outcome["tokens"],
+    )
+    run_id = store.eval_run_record(suite_id, principal.username, outcome, duration, cost)
+    # The detail key matches the platform.eval_run rows the history route
+    # serves, so the UI renders a fresh run exactly like a recorded one.
+    return {
+        "runId": run_id,
+        "suite": suite["name"],
+        "passed": outcome["passed"],
+        "failed": outcome["failed"],
+        "total": outcome["total"],
+        "detail": outcome["outcomes"],
+        "totalTokens": outcome["tokens"].get("totalTokens"),
+        "cost": {
+            "usd": cost.cost_usd,
+            "priced": cost.priced,
+            "totalTokens": cost.total_tokens,
+        },
+    }
+
+
+@app.get("/api/assistant/evals/suites/{suite_id}/runs")
+async def eval_suite_history(
+    suite_id: int,
+    limit: int = 10,
+    _: Principal = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    return {"runs": store.eval_runs_list(suite_id, limit)}
 
 
 def main() -> None:

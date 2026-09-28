@@ -465,6 +465,20 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/versions\/[^/]+\/restore$/, role: "analyst" },
 	{ method: "DELETE", pattern: /^\/pipelines\/[^/]+$/, role: "admin" },
 
+	// Schedules fire real work on a cadence, so defining or triggering one is
+	// an analyst act; deleting one is admin, like the other destructive verbs.
+	{ method: "POST", pattern: /^\/schedules$/, role: "analyst" },
+	{ method: "PATCH", pattern: /^\/schedules\/[^/]+$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/schedules\/[^/]+\/run$/, role: "analyst" },
+	{ method: "DELETE", pattern: /^\/schedules\/[^/]+$/, role: "admin" },
+
+	// An eval suite is a regression contract: writing one is analyst work,
+	// running one is analyst work (it may execute a function), deleting one
+	// that other people read results from is admin.
+	{ method: "POST", pattern: /^\/evals\/suites$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/evals\/suites\/[^/]+\/run$/, role: "analyst" },
+	{ method: "DELETE", pattern: /^\/evals\/suites\/[^/]+$/, role: "admin" },
+
 	// Creating projects, folders, resources and datasets is authoring work.
 	// Reading the tree and previewing a resource stay at viewer, so anyone can
 	// look at what exists without being able to reshape it.

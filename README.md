@@ -848,6 +848,77 @@ curl -X POST -H "authorization: Bearer $TOKEN" -d '{"graph":{…}}' .../api/pipe
 Editing a pipeline needs the `analyst` role; deleting one needs `admin`.
 Reading, validating and the palette are `viewer`.
 
+## Schedules
+
+`/schedules`. The platform concept this repo was missing: work that happens on
+a cadence instead of on a click.
+
+A **schedule** names one target and one interval:
+
+```
+schedule  ──▶  sync (by id)      ──▶  a named pull through a connection
+          ──▶  pipeline (by slug) ──▶  a real run into pipeline_out
+```
+
+- The cadence is an **interval, not a cron expression** — the honest subset a
+  small UI can validate, with a 60-second floor, because a sub-minute schedule
+  is a misconfiguration rather than a frequency.
+- **A scheduled run is a normal run.** The ontology service's background loop
+  calls the same `runSync` and `runPipeline` functions the API routes call,
+  inside the schedule's own space, so a scheduled run lands in the same run
+  history and passes the same validation as a manual one. **Run now** fires
+  immediately without moving the next scheduled run.
+- **The claim is the fire.** `next_run_at` moves forward inside the same
+  `UPDATE` that records the firing, so two ticks can never double-run one
+  schedule, and a schedule paused between the check and the run is not run.
+- **Failure keeps the cadence.** A failing target writes a failed schedule run
+  with the error, updates the schedule's last status — and the failing ones
+  lead the page, because a schedule that died quietly would be a silent gap in
+  the data, while one that keeps reporting failure can be seen and fixed.
+
+```bash
+# Create one: every hour, re-run the order sync
+curl -X POST -H "authorization: Bearer $TOKEN" -d '{
+  "name": "Hourly order sync", "kind": "sync",
+  "targetRef": "3", "intervalSeconds": 3600
+}' .../api/schedules
+```
+
+The loop ticks every `SCHEDULE_TICK_SECONDS` (default 20; `0` disables it).
+Creating or triggering a schedule needs the `analyst` role, deleting one
+`admin`; the dialog lists the syncs and pipelines that actually exist in the
+current space, so a schedule names a real target rather than a plausible id.
+
+## Eval suites
+
+`/evals`. AIP Evals, in the shape this platform can honour: test cases with
+deterministic evaluators, so "does it still compute what it computed when
+someone approved it" has an answer you can run at any time, not a memory.
+
+Two kinds, one contract:
+
+| Tests | Cases assert | Run by |
+|---|---|---|
+| **A metric function** | what its SQL returns: equals within tolerance, bounds, row counts, columns not null | the ontology service |
+| **The assistant** | the turn it produces: tools used or refused, the data-quality caveat it owed, reply shape, bounds on rounds, latency and tokens | the AI-FDE service, against the live agent |
+
+There is **no LLM judge** in either. An evaluator that is itself a model makes
+a passing score a matter of opinion; these assertions either hold on the
+transcript or name why they do not — the same standard the platform applies to
+figures. Proposed functions can be evaluated before approval, which is part of
+what reviewing a proposal should mean.
+
+An assistant suite run is **not rate-limited like chat** — it is an explicit
+analyst-initiated run of a fixed suite, and a regression check that tripped
+the per-user chat limits would measure the limiter rather than the assistant.
+What it spends is priced and recorded on the run row instead, so the cost of
+a regression check sits next to the cost of a conversation.
+
+Each case runs from an empty history and a fresh agent state: an eval measures
+what the assistant does from the prompt alone, not what it inherits from
+whatever conversation ran last. Run it after changing a function's SQL or the
+assistant's tools — the failures name what moved.
+
 ## Choosing the model per conversation
 
 The assistant's composer has a model picker. **Ollama is the default** where it
@@ -990,22 +1061,26 @@ the message, type and stack stay in the log under that id.
 ### Tests
 
 ```bash
-cd services/ontology-service && npm test          # 47 tests
-cd services/ai-fde          && pytest tests/ -q   # 19 tests
-cd services/pipeline        && pytest tests/ -q   # 19 tests
+cd services/ontology-service && npm test          # 211 tests
+cd services/ai-fde          && pytest tests/ -q   # 54 tests
+cd services/pipeline        && pytest tests/ -q   # 22 tests
 ```
 
 The TypeScript tests cover the dynamic SQL builders in `objectSet.ts` and
 `kpi.ts` — identifiers allowlisted, every value bound, limits clamped and
-coerced. `.github/workflows/ci.yml` runs all of it plus a typecheck, an
-`nginx -t` and a full image build.
+coerced — plus the eval assertion evaluators and the schedule interval parser,
+the two places where a wrong answer is silent. `.github/workflows/ci.yml` runs
+all of it plus a typecheck, an `nginx -t` and a full image build.
 
 ### Known limits
 
-- Rate limiting, the token budget and the ontology registry are all in-process,
-  so horizontal scaling needs a shared store and a cache-invalidation story.
-- The pipeline reads a relative host path (`../api_responses`) and runs once.
-  There is no schedule, no incremental ingest and no late-data handling;
+- Rate limiting, the token budget, the ontology registry and the scheduler are
+  all in-process, so horizontal scaling needs a shared store and a
+  cache-invalidation story (the scheduler's claim UPDATE means two replicas
+  will not double-fire a schedule, but only one of them needed to run).
+- The pipeline that generates the ontology from the capture runs once. Syncs
+  and pipelines can now be put on a schedule (see below), but there is no
+  incremental ingest of the capture itself and no late-data handling;
   production needs the real TMS API or object storage behind it.
 - No metrics or tracing, only structured logs.
 
@@ -1022,9 +1097,10 @@ services/pipeline/    ingest · simulate (coverage report only) · introspect
                       lineage_gen · dashboards
 services/ontology-service/  registry · objectSet · kpi · actions · lineage · dashboards
                       connections (sources, syncs) · repos (files, commits, builds)
+                      schedules (the trigger loop) · evals (function suites)
 services/ai-fde/      llm (providers + failover) · modes (mode/capability model)
                       tools · capability_tools (plans, notepad, context)
-                      ontology_client · agent · prompts · store
+                      evals (assistant suites) · ontology_client · agent · prompts · store
 services/ui/          pages: Overview, OntologyManager, ObjectExplorer, GraphView,
                       LineagePage, Dashboards, Actions, Assistant
 vendor/ontograph-core/      the vendored library — see below

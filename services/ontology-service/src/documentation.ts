@@ -196,6 +196,73 @@ const PLATFORM_PAGES: Document[] = [
 			},
 		],
 	},
+	{
+		path: "platform/schedules",
+		title: "Schedules: work that runs on a cadence",
+		category: "Platform",
+		summary: "How a sync or a pipeline fires itself, and what a schedule run records.",
+		sections: [
+			{
+				title: "What a schedule is",
+				body:
+					"A named, recurring trigger with one target: a connection sync (by id) or a " +
+					"pipeline (by slug), and an interval of at least 60 seconds. The ontology " +
+					"service's background loop fires each schedule when due. There is no cron " +
+					"syntax, deliberately: an interval is the honest subset, and the minimum " +
+					"exists because a sub-minute schedule is a misconfiguration rather than a " +
+					"cadence.",
+			},
+			{
+				title: "A scheduled run is a normal run",
+				body:
+					"The scheduler calls the same runSync and runPipeline functions the API routes " +
+					"call, inside the schedule's own space, so a scheduled run lands in the same " +
+					"run history and honors the same validation as a manual one. Run Now fires " +
+					"immediately without moving the next scheduled run.",
+			},
+			{
+				title: "Failure keeps the cadence",
+				body:
+					"A failing target writes a failed schedule run with the error and updates the " +
+					"schedule's last status, and the cadence continues. A schedule that died " +
+					"quietly because one run failed would be a silent gap in the data; one that " +
+					"keeps reporting failure can be seen and fixed.",
+			},
+		],
+	},
+	{
+		path: "platform/evals",
+		title: "Eval suites: does it still compute what it computed?",
+		category: "Platform",
+		summary: "Test cases with deterministic evaluators, for metric functions and for the assistant.",
+		sections: [
+			{
+				title: "Function suites",
+				body:
+					"A suite names a metric function and a set of cases; each case asserts " +
+					"properties of what the function returns - equals within tolerance, bounds, " +
+					"row counts, columns not null. Proposed functions can be evaluated before " +
+					"approval, which is part of what reviewing a proposal should mean. Every " +
+					"evaluator is deterministic: a score means the same thing twice.",
+			},
+			{
+				title: "Assistant suites",
+				body:
+					"A suite of prompts with structural evaluators over the turn the agent " +
+					"produces: which tools it used or refused, whether it passed on the data " +
+					"quality caveat, citation and reply shape, and bounds on rounds, latency and " +
+					"cost. There is no LLM judge - an opinion scoring an opinion is not a test.",
+			},
+			{
+				title: "What a run records",
+				body:
+					"Per case: pass or fail, each assertion's outcome and the reason. Per run: " +
+					"counters and, for assistant suites, the tokens and cost it spent. A suite is " +
+					"a regression contract - run it after changing a function's SQL or the " +
+					"assistant's tools, and the failures name what moved.",
+			},
+		],
+	},
 ];
 
 // ── generated pages ─────────────────────────────────────────────────────────
