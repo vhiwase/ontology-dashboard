@@ -240,7 +240,9 @@ null in all 90 orders.
 
 Object types grouped by domain. For each: properties with their semantic role and
 SQL column, links with match ratio and how they were discovered, and the actions
-declared against it.
+declared against it. Below them, the **interfaces** the types declare — the
+shared shapes (Geolocatable, Party, ProvenanceTracked) with their required
+attributes and implementors, which until now lived only inside the JSON export.
 
 ### Object explorer (`/explorer`)
 

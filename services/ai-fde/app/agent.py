@@ -33,7 +33,7 @@ from typing import Any
 from .config import CONFIG
 from .context import current_session_state
 from .llm import LlmError, LlmProvider, ToolCall, recover_text_tool_calls
-from .modes import MODES, SessionAgentState, tools_for
+from .modes import SessionAgentState, tools_for
 from .prompts import SYSTEM_PROMPT, build_context_message
 from .tools import TOOL_NAMES, run_tool, schemas_for, serialise_result
 

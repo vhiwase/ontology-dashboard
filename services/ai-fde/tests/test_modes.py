@@ -145,6 +145,19 @@ def test_tool_outside_the_mode_points_at_the_mode(state):
     assert "exploration" in payload["error"]
 
 
+def test_new_capability_tools_are_wired_into_their_modes(state):
+    """list_schedules belongs to the data modes, list_interfaces to the
+    ontology-reading ones — the audit that found them missing also pins them."""
+    for mode in ("dataIntegration", "dataConnection"):
+        probe = SessionAgentState(mode=mode)
+        assert "list_schedules" in tools_for(probe), mode
+    for mode in ("exploration", "ontologyEditing"):
+        probe = SessionAgentState(mode=mode)
+        assert "list_interfaces" in tools_for(probe), mode
+    # And they stay out of the modes where they would be noise.
+    assert "list_schedules" not in tools_for(SessionAgentState(mode="platformQna"))
+
+
 def test_always_on_tools_are_in_every_mode_set(state):
     for mode in MODES:
         probe = SessionAgentState(mode=mode)

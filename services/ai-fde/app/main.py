@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from . import store
 from .agent import Agent
 from .auth import Principal, require_role
-from .context import current_request_id, current_session_state, current_space, current_user
+from .context import current_request_id, current_space, current_user
 from .config import CONFIG
 from .evals import run_assistant_suite, validate_case_spec
 from .limits import REPLICA_WARNING, RateLimited, limiter
@@ -834,13 +834,35 @@ async def eval_suite_run(
     # the caller's token like any chat turn.
     current_space.set(space)
     started = time.monotonic()
-    outcome = await run_assistant_suite(
-        suite["name"],
-        suite["cases"],
-        state["agent"],
-        ontology_snapshot,
-        _validate_citations,
-    )
+    try:
+        outcome = await run_assistant_suite(
+            suite["name"],
+            suite["cases"],
+            state["agent"],
+            ontology_snapshot,
+            _validate_citations,
+        )
+    except HTTPException as exc:
+        # A space with no published ontology (409) would otherwise abort the
+        # run leaving only a 'running' row behind. The failure IS the result:
+        # record it, failed per case, and hand the reason back.
+        duration = time.monotonic() - started
+        outcome = {
+            "passed": 0,
+            "failed": len(suite["cases"]),
+            "total": len(suite["cases"]),
+            "outcomes": [
+                {"case": case.get("name") or f"Case {i}", "ok": False, "evaluators": [],
+                 "error": f"The suite could not run: {exc.detail}"}
+                for i, case in enumerate(suite["cases"], start=1)
+            ],
+            "tokens": {},
+        }
+        run_id = store.eval_run_record(suite_id, principal.username, outcome, duration)
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=f"{exc.detail} (recorded as failed eval run {run_id}.)",
+        ) from exc
     duration = time.monotonic() - started
 
     agent: Agent = state["agent"]

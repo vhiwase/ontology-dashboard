@@ -188,6 +188,89 @@ export function spacesWithOntology(): string[] {
 	return [...registries.keys()].sort();
 }
 
+// ── interfaces ──────────────────────────────────────────────────────────────
+// The pipeline emits InterfaceDefinitions (Geolocatable, Party,
+// ProvenanceTracked) and stamps `implements` on the entity types that satisfy
+// them. Until now nothing read them back: they existed only inside the raw
+// definition document and the OWL export. This is the read side.
+
+export interface InterfaceMeta {
+	rid: string;
+	apiName: string;
+	label: string;
+	description: string | null;
+	/** Attributes every implementor carries, resolved to property names. */
+	requiredAttributes: Array<{ apiName: string; label: string; required: boolean }>;
+	/** Object types declaring `implements` for this interface, by api name. */
+	implementors: string[];
+}
+
+function localizedText(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (value && typeof value === "object") {
+		const record = value as Record<string, string>;
+		return record.en ?? Object.values(record)[0] ?? "";
+	}
+	return "";
+}
+
+export function interfacesOf(registry: Registry): InterfaceMeta[] {
+	const interfaces = registry.definition.interfaces ?? [];
+	if (!interfaces.length) return [];
+
+	// Attributes are shared across object types (462 properties collapse to
+	// 238 attribute definitions), so one property per rid is enough to resolve
+	// every requiredAttributes ref to a named property.
+	const propertyByRid = new Map<string, { apiName: string; label: string }>();
+	for (const type of registry.objectTypes) {
+		for (const prop of type.properties) {
+			if (!propertyByRid.has(prop.rid)) {
+				propertyByRid.set(prop.rid, { apiName: prop.apiName, label: prop.label });
+			}
+		}
+	}
+
+	const entityTypes = [
+		...(registry.definition.entityTypes ?? []),
+		...(registry.definition.eventTypes ?? []),
+		...(registry.definition.roleTypes ?? []),
+	];
+	// Entity @ids are RIDs ("ri.object.main.location"), not api names, so the
+	// implementors are translated through the registry — the same lookup the
+	// link endpoints do — with the raw id as the fallback for a type the
+	// registry has not shredded.
+	const apiNameByRid = new Map(registry.objectTypes.map((type) => [type.rid, type.apiName]));
+
+	return interfaces.map((iface) => {
+		const refs = (iface.requiredAttributes ?? []) as Array<{
+			ref?: string;
+			required?: boolean;
+		}>;
+		return {
+			rid: iface["@id"],
+			apiName: iface["@id"].split(":").pop() ?? iface["@id"],
+			label: localizedText(iface.label),
+			description: iface.description ? localizedText(iface.description) : null,
+			requiredAttributes: refs.map((ref) => {
+				const prop = propertyByRid.get(ref.ref ?? "");
+				return {
+					apiName: prop?.apiName ?? ref.ref ?? "",
+					label: prop?.label ?? "",
+					required: Boolean(ref.required),
+				};
+			}),
+			implementors: entityTypes
+				.filter((entity) => (entity.implements ?? []).includes(iface["@id"]))
+				.map(
+					(entity) =>
+						apiNameByRid.get(entity["@id"]) ??
+						entity["@id"].split(":").pop() ??
+						entity["@id"],
+				),
+		};
+	});
+}
+
 export function hasOntology(spaceSlug: string): boolean {
 	return registries.has(spaceSlug);
 }

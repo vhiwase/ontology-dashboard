@@ -13,7 +13,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
 import { Empty, ErrorBanner, Spinner } from "../components/common";
-import { useResources } from "../ResourceContext";
 
 interface Schedule {
 	scheduleId: number;
@@ -44,6 +43,15 @@ interface SyncOption {
 	name: string;
 	connection: string;
 }
+
+/** The shape of GET /api/syncs — SyncRecord, camelCase. */
+type SyncRecordList = Array<{
+	id: number;
+	name: string;
+	connectionName: string;
+	mode: string;
+	targetRelation: string;
+}>;
 
 const INTERVALS: Array<{ label: string; seconds: number }> = [
 	{ label: "Every 15 minutes", seconds: 900 },
@@ -295,9 +303,10 @@ function ScheduleRow({
 }
 
 /**
- * The create dialog lists the syncs it can reach by walking the workspace's
- * connection resources, so a schedule names a target that exists rather than
- * typing an id and hoping.
+ * The create dialog asks the space-wide endpoints — /api/pipelines and
+ * /api/syncs — rather than the workspace resource context, which only covers
+ * the first project: a schedule may legitimately target a pipeline registered
+ * in another project of the same space.
  */
 function CreateDialog({
 	onClose,
@@ -306,38 +315,38 @@ function CreateDialog({
 	onClose: () => void;
 	onCreated: () => void;
 }) {
-	const { resources } = useResources();
 	const [name, setName] = useState("");
 	const [kind, setKind] = useState<"sync" | "pipeline">("pipeline");
 	const [target, setTarget] = useState("");
 	const [intervalSeconds, setIntervalSeconds] = useState(3600);
+	const [pipelines, setPipelines] = useState<Array<{ slug: string; name: string }> | null>(null);
 	const [syncs, setSyncs] = useState<SyncOption[] | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 
-	const connections = resources.filter((r) => r.kind === "connection");
-	const pipelines = resources.filter((r) => r.kind === "pipeline");
+	useEffect(() => {
+		api
+			.get<Array<{ slug: string; name: string }>>("/api/pipelines")
+			.then(setPipelines)
+			.catch(() => setPipelines([]));
+	}, []);
 
 	useEffect(() => {
 		if (kind !== "sync") return;
 		setSyncs(null);
-		Promise.all(
-			connections.map((connection) =>
-				api
-					.get<Array<Record<string, unknown>>>(`/api/resources/${connection.id}/syncs`)
-					.then((rows) =>
-						rows.map((row) => ({
-							syncId: Number(row.sync_id ?? row.syncId),
-							name: String(row.name ?? ""),
-							connection: connection.name,
-						})),
-					)
-					.catch(() => [] as SyncOption[]),
-			),
-		).then((groups) => setSyncs(groups.flat()));
-		// Re-read when the connections themselves change, not on every render.
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [kind, resources]);
+		api
+			.get<SyncRecordList>("/api/syncs")
+			.then((rows) =>
+				setSyncs(
+					rows.map((row) => ({
+						syncId: Number(row.id),
+						name: String(row.name ?? ""),
+						connection: String(row.connectionName ?? ""),
+					})),
+				),
+			)
+			.catch(() => setSyncs([]));
+	}, [kind]);
 
 	async function create() {
 		setBusy(true);
@@ -395,14 +404,20 @@ function CreateDialog({
 					<label className="col" style={{ gap: 4 }}>
 						<span className="muted">Target</span>
 						{kind === "pipeline" ? (
-							<select value={target} onChange={(e) => setTarget(e.target.value)}>
-								<option value="">Choose a pipeline…</option>
-								{pipelines.map((p) => (
-									<option key={p.id} value={p.targetRef ?? p.name}>
-										{p.name}
-									</option>
-								))}
-							</select>
+							pipelines === null ? (
+								<Spinner label="Listing pipelines" />
+							) : pipelines.length === 0 ? (
+								<p className="muted">No pipelines in this space yet.</p>
+							) : (
+								<select value={target} onChange={(e) => setTarget(e.target.value)}>
+									<option value="">Choose a pipeline…</option>
+									{pipelines.map((p) => (
+										<option key={p.slug} value={p.slug}>
+											{p.name}
+										</option>
+									))}
+								</select>
+							)
 						) : syncs === null ? (
 							<Spinner label="Listing syncs" />
 						) : syncs.length === 0 ? (

@@ -95,6 +95,7 @@ import {
 	BadRequest,
 	currentSpace,
 	getRegistry,
+	interfacesOf,
 	hasOntology,
 	loadRegistry,
 	NotFound,
@@ -128,6 +129,7 @@ import {
 	deleteSync,
 	listSyncRuns,
 	listSyncs,
+	listSyncsInSpace,
 	runSync,
 	testConnection,
 } from "./connections";
@@ -531,6 +533,11 @@ app.get(
 					sourceProperty: null,
 				})),
 			],
+			// The interfaces this type declares `implements` for, resolved to
+			// names — the definition carries the raw @ids only.
+			implements: interfacesOf(registry)
+				.filter((iface) => iface.implementors.includes(type.apiName))
+				.map((iface) => ({ apiName: iface.apiName, label: iface.label })),
 			actions: registry.actionTypes
 				.filter((action) => action.targetObjectTypes.includes(type.rid))
 				.map((action) => ({
@@ -567,6 +574,13 @@ app.get(
 	"/api/action-types",
 	handle(async (_req, res) => {
 		res.json(getRegistry().actionTypes);
+	}),
+);
+
+app.get(
+	"/api/interfaces",
+	handle(async (_req, res) => {
+		res.json(interfacesOf(getRegistry()));
 	}),
 );
 
@@ -1619,6 +1633,16 @@ app.get(
 //  A schedule is a named, recurring trigger for a sync or a pipeline. The
 //  ontology service's background loop (startScheduler, at boot) fires them
 //  when due; these routes manage the definitions and show what they did.
+
+/** Every sync in the space — the schedules dialog's target list. */
+app.get(
+	"/api/syncs",
+	handle(async (req, res) => {
+		res.json(
+			await listSyncsInSpace(req.query.space ? String(req.query.space) : undefined),
+		);
+	}),
+);
 
 app.get(
 	"/api/schedules",

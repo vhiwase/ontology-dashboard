@@ -431,6 +431,12 @@ async def manage_context(arguments: dict[str, Any]) -> dict[str, Any]:
 
 # ── ontology-backed capability tools ────────────────────────────────────────
 
+def _localized(value: Any) -> str | None:
+    """A LocalizedText ({en: ...}) or a plain string, as plain text."""
+    if isinstance(value, dict):
+        return value.get("en") or next(iter(value.values()), None)
+    return value
+
 # The docs corpus is generated per resource kind; a resource kind maps to the
 # prefix its documentation lives under. Kinds with no generated docs are told
 # so honestly, with the platform pages they can still read.
@@ -527,7 +533,15 @@ async def get_access_requirements(arguments: dict[str, Any]) -> dict[str, Any]:
             "actions": "ontology role, checked against each action's allowedRoles",
         },
         "ontologyRoles": [
-            {"name": r.get("name"), "label": r.get("label")} for r in roles
+            {
+                # Roles are ontograph RoleDefinitions: identified by "@id"
+                # ("tms:DispatcherRole") with LocalizedText labels. Neither is a
+                # plain column, so both are unwrapped here rather than handed to
+                # the model as raw objects.
+                "name": str(role.get("@id") or "").split(":")[-1],
+                "label": _localized(role.get("label")),
+            }
+            for role in roles
         ],
         "actionsOnThisObject": related,
         "gates": [
@@ -618,6 +632,54 @@ async def list_functions(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def list_interfaces(_: dict[str, Any]) -> dict[str, Any]:
+    """The interfaces object types declare `implements` for.
+
+    An interface is the ontology's claim that several types share a shape -
+    everything Geolocatable has coordinates, everything Party is a
+    counterparty. Knowing them lets an answer generalise honestly ("every
+    Party type carries entity_name") instead of enumerating types by hand.
+    """
+    rows = await client.get("/api/interfaces")
+    return {
+        "interfaces": rows,
+        "note": (
+            "implementors are the object types declaring this interface; "
+            "requiredAttributes are the properties they all carry."
+        ),
+    }
+
+
+async def list_schedules(_: dict[str, Any]) -> dict[str, Any]:
+    """What fires itself in this space, and when it last did.
+
+    Read-only by design: creating or pausing a schedule writes the cadence
+    other people rely on, which stays a human act on /schedules.
+    """
+    rows = await client.get("/api/schedules")
+    return {
+        "schedules": [
+            {
+                "name": s["name"],
+                "kind": s["kind"],
+                "target": s["targetRef"],
+                "intervalSeconds": s["intervalSeconds"],
+                "enabled": s["enabled"],
+                "nextRunAt": s["nextRunAt"],
+                "lastStatus": s["lastStatus"],
+                "lastError": s["lastError"],
+                "runCount": s["runCount"],
+            }
+            for s in rows
+        ],
+        "note": (
+            "Enabled schedules fire automatically; lastStatus 'failed' means "
+            "the target errored and the reason is in lastError. To create or "
+            "pause one, point the user at the Schedules page."
+        ),
+    }
+
+
 # ── registry and schemas ────────────────────────────────────────────────────
 
 CAPABILITY_TOOLS: dict[str, Any] = {
@@ -635,6 +697,8 @@ CAPABILITY_TOOLS: dict[str, Any] = {
     "get_action_audit": get_action_audit,
     "browse_workspace": browse_workspace,
     "list_functions": list_functions,
+    "list_interfaces": list_interfaces,
+    "list_schedules": list_schedules,
 }
 
 
@@ -826,6 +890,21 @@ CAPABILITY_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "scope": {"type": "string", "enum": ["spaces", "projects", "tree"]},
             "projectId": {"type": "integer"},
         },
+    ),
+    _schema(
+        "list_interfaces",
+        "List the interfaces object types implement - the shared shapes in this "
+        "ontology (e.g. everything Party carries entity_name and is_active). Use "
+        "when an answer should generalise across types rather than enumerate them.",
+        {"type": "object", "properties": {}},
+    ),
+    _schema(
+        "list_schedules",
+        "List the schedules in this space: what fires itself (a sync or a "
+        "pipeline), its interval, whether it is enabled, and the last run's "
+        "status. Use for 'what runs automatically' or 'why didn't the nightly "
+        "sync happen' questions.",
+        {"type": "object", "properties": {}},
     ),
     _schema(
         "list_functions",

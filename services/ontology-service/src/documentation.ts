@@ -231,6 +231,32 @@ const PLATFORM_PAGES: Document[] = [
 		],
 	},
 	{
+		path: "platform/interfaces",
+		title: "Interfaces: the shapes several object types share",
+		category: "Platform",
+		summary: "What an interface claims, and how to read its implementors.",
+		sections: [
+			{
+				title: "What an interface is",
+				body:
+					"A named shape that several object types declare `implements` for: " +
+					"everything Party is a counterparty carrying entity_name and " +
+					"is_active; everything Geolocatable has coordinates and an address; " +
+					"everything ProvenanceTracked carries data_origin, saying whether " +
+					"the row came from the captured payloads or the simulation.",
+			},
+			{
+				title: "How to use them",
+				body:
+					"An interface lets an answer generalise without enumerating types: " +
+					"'every Party type can be reached through entity_name' covers " +
+					"Carrier, Customer, Supplier and the rest at once. The interface " +
+					"list names the implementors explicitly, so the claim can be " +
+					"checked against the types rather than taken on trust.",
+			},
+		],
+	},
+	{
 		path: "platform/evals",
 		title: "Eval suites: does it still compute what it computed?",
 		category: "Platform",

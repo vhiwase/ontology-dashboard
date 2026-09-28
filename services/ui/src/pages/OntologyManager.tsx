@@ -33,11 +33,21 @@ import {
 
 type Tab = "properties" | "links" | "actions" | "raw";
 
+/** GET /api/interfaces — the shared shapes object types declare. */
+interface InterfaceMeta {
+	apiName: string;
+	label: string;
+	description: string | null;
+	requiredAttributes: Array<{ apiName: string; label: string; required: boolean }>;
+	implementors: string[];
+}
+
 export function OntologyManager() {
 	const [types, setTypes] = useState<ObjectTypeSummary[] | null>(null);
 	const [selected, setSelected] = useState<string | null>(null);
 	const [detail, setDetail] = useState<ObjectTypeDetail | null>(null);
 	const [allLinks, setAllLinks] = useState<LinkTypeRow[] | null>(null);
+	const [interfaces, setInterfaces] = useState<InterfaceMeta[]>([]);
 	const [tab, setTab] = useState<Tab>("properties");
 	const [filter, setFilter] = useState("");
 	const [error, setError] = useState<string | null>(null);
@@ -86,11 +96,13 @@ export function OntologyManager() {
 			// Tolerated separately: the journal is context, and failing to load
 			// it should not hide the ontology itself.
 			api.get<OntologyEdit[]>("/api/ontology/edits").catch(() => [] as OntologyEdit[]),
+			api.get<InterfaceMeta[]>("/api/interfaces").catch(() => [] as InterfaceMeta[]),
 		])
-			.then(([typeRows, linkRows, journal]) => {
+			.then(([typeRows, linkRows, journal, interfaceRows]) => {
 				setTypes(typeRows);
 				setAllLinks(linkRows);
 				setEdits(journal);
+				setInterfaces(interfaceRows);
 				setSelected((current) => current ?? typeRows[0]?.apiName ?? null);
 			})
 			.catch((exc: Error) =>
@@ -359,6 +371,53 @@ export function OntologyManager() {
 							}))}
 							maxHeight={380}
 						/>
+					</div>
+				)}
+
+				{/* Interfaces are the shared shapes several types declare — the
+				    generated ontology has carried them all along; this renders
+				    them instead of leaving them inside the JSON export. */}
+				{interfaces.length > 0 && (
+					<div className="card">
+						<div className="card-head">
+							<h3>Interfaces</h3>
+							<span className="sub">
+								shapes several object types declare — required attributes every
+								implementor carries
+							</span>
+						</div>
+						<div className="col" style={{ gap: 8 }}>
+							{interfaces.map((iface) => (
+								<div key={iface.apiName} style={{ padding: "6px 0" }}>
+									<div className="row" style={{ gap: 8, alignItems: "baseline" }}>
+										<strong>{iface.label}</strong>
+										<span className="mono muted" style={{ fontSize: 11.5 }}>
+											{iface.apiName}
+										</span>
+										<span className="muted" style={{ fontSize: 11.5 }}>
+											{iface.implementors.length} implementor
+											{iface.implementors.length === 1 ? "" : "s"}
+										</span>
+									</div>
+									{iface.description && (
+										<p className="muted" style={{ fontSize: 12, margin: "2px 0 4px" }}>
+											{iface.description}
+										</p>
+									)}
+									<div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+										{iface.requiredAttributes.map((attr) => (
+											<span key={attr.apiName} className={`chip ${attr.required ? "good" : ""}`}>
+												{attr.apiName}
+												{attr.required ? "" : " (optional)"}
+											</span>
+										))}
+									</div>
+									<div className="muted" style={{ fontSize: 11.5, marginTop: 4 }}>
+										Implemented by: {iface.implementors.join(", ") || "nothing yet"}
+									</div>
+								</div>
+							))}
+						</div>
 					</div>
 				)}
 			</div>

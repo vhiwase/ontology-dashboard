@@ -977,6 +977,26 @@ export async function listSyncs(resourceId: number): Promise<SyncRecord[]> {
 	return Promise.all(rows.map(async (row) => toSync(row, await lastRunOf(row.sync_id))));
 }
 
+/**
+ * Every sync in a space, across all of its projects and connections.
+ *
+ * listSyncs answers "what can THIS connection pull"; the schedules page needs
+ * the space-wide question — "what exists here that could fire on a cadence" —
+ * and walking project trees client-side would make every dialog pay for a
+ * hierarchy it does not care about.
+ */
+export async function listSyncsInSpace(spaceSlug?: string): Promise<SyncRecord[]> {
+	const rows = await query<SyncRow>(
+		`${SYNC_SELECT}
+		   JOIN platform.project p ON p.project_id = r.project_id
+		   JOIN platform.space sp ON sp.space_id = p.space_id
+		  WHERE ($1::text IS NULL OR sp.slug = $1)
+		  ORDER BY s.name`,
+		[spaceSlug ?? null],
+	);
+	return Promise.all(rows.map(async (row) => toSync(row, await lastRunOf(row.sync_id))));
+}
+
 export async function getSync(syncId: number): Promise<SyncRecord> {
 	const row = await queryOne<SyncRow>(`${SYNC_SELECT} WHERE s.sync_id = $1`, [syncId]);
 	if (!row) throw new NotFound(`No sync ${syncId}.`);
