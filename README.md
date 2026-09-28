@@ -5,9 +5,8 @@ system, with an AI-FDE assistant that answers business questions and builds
 dashboards from it.
 
 Built on [`openshuyi/ontograph-core`](https://github.com/openshuyi/ontograph-core)
-(vendored in `vendor/`, compiled from source), Postgres, and an LLM that is either
-a local open-source model via Ollama or the Azure AI Foundry deployment already in
-use elsewhere in this repo.
+(vendored in `vendor/`, compiled from source), Postgres, and the Azure AI Foundry
+deployment already in use elsewhere in this repo.
 
 ```
 docker compose up -d --build        # or ./scripts/bootstrap.sh
@@ -81,7 +80,7 @@ exception count.
 ### Requirements
 
 - Docker with Compose v2 (tested on Docker Desktop 29.1.3 / Compose 2.40.3)
-- ~8 GB free disk (4.7 GB of that is the Ollama model, only if you use it)
+- ~2 GB free disk
 - The sibling `../api_responses` directory, mounted read-only by the pipeline
 
 ### The quick path
@@ -103,15 +102,14 @@ Then open **https://127.0.0.1:3000** and sign in as `admin` with that password.
 The certificate is self-signed on first run, so the browser will warn once.
 Mount a real one over `/etc/nginx/certs` for anything public.
 
-### The path that picks the right LLM for your hardware
+### One-command bring-up
 
 ```bash
 ./scripts/bootstrap.sh
 ```
 
-It runs `nvidia-smi`, writes the LLM configuration into `.env` accordingly, and
-brings the stack up with the GPU overlay if there is a GPU. See
-[Choosing the LLM](#choosing-the-llm).
+It creates `.env` from the example if missing, brings the stack up, and waits
+for the one-shot pipeline to finish. See [The language model](#the-language-model).
 
 ### Ports
 
@@ -126,7 +124,6 @@ the port, which is why the services authenticate rather than relying on it.
 | Ontology service | http://127.0.0.1:4000/api/stats | needs a bearer token |
 | AI-FDE | http://127.0.0.1:4100/health | liveness only; detail needs a token |
 | Postgres | `127.0.0.1:55432` | password in `secrets/postgres_password` |
-| Ollama | `127.0.0.1:11435` | moved off 11434; see below |
 
 > The HTTPS redirect on port 3080 targets the standard 443, which is right
 > wherever the stack is published on 443 and wrong locally, where compose maps
@@ -138,74 +135,25 @@ the port, which is why the services authenticate rather than relying on it.
 > and then hangs until libpq times out. Measured on this project: **130.6 s with
 > `localhost` versus 6.9 s with `127.0.0.1`** for an identical pipeline run.
 
-> **Ollama is on 11435** because a native Ollama install on the host already
-> listens on 11434, and Docker cannot bind a port twice. Services inside the
-> compose network always reach it as `ollama:11434`, so this only affects access
-> from the host. Change it with `OLLAMA_PORT`.
-
 ---
 
-## Choosing the LLM
+## The language model
 
-Two backends, one interface. `LLM_PROVIDER=auto` (the default) decides from the
-hardware:
+One backend: the **Azure OpenAI** deployment configured in `.env`
+(`AZURE_OPENAI_ENDPOINT`, deployment name, and the key in
+`./secrets/azure_openai_key`). It answers in seconds, and a tool-calling agent
+makes several calls per question, which is what keeps the assistant usable.
 
-| Hardware | Primary | Fallback | Why |
-|---|---|---|---|
-| NVIDIA GPU present | `ollama` | `azure_openai` | Local, no keys, nothing leaves the machine |
-| CPU only | `azure_openai` | `ollama` | A 7B model with a 15-tool schema takes minutes per call on CPU, and the agent makes several calls per question |
+`LLM_PROVIDER=azure_openai` is the only value; the variable exists so a
+misconfigured one fails loudly in the assistant's log rather than being
+silently ignored. The provider interface in `services/ai-fde/app/llm.py` is
+kept separate from the agent loop, so a second backend is an addition, not a
+rewrite. Everything except the assistant works with no model at all: the
+workbench, explorer, graph, lineage, pipelines, schedules and actions do not
+call it.
 
-**This is not a preference, it is a measured constraint.** On the CPU-only machine
-this was built on, `qwen2.5:7b-instruct` did not return within 300 s for a single
-tool-calling round. The same question answered in **7.2 s** against `gpt-4.1`.
-
-### Automatic failover
-
-`LLM_FALLBACK_PROVIDER` enables failover, with a **circuit breaker**: after the
-primary fails it is skipped for `LLM_FALLBACK_COOLDOWN` seconds rather than
-retried on every tool round. Without the breaker one question would pay the
-primary's timeout up to eight times.
-
-Measured with Ollama primary and a 45 s timeout:
-
-```
-first question  : 52.4 s   (45 s Ollama timeout, then Azure answered)
-second question :  7.4 s   (breaker open, straight to Azure)
-```
-
-The UI shows a note when it is running on the fallback, and each answer's footer
-says which model produced it.
-
-### Running on a GPU
-
-The official `ollama/ollama` image ships **CUDA and ROCm backends only**. Apply
-the overlay to pass an NVIDIA device through:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-```
-
-Confirm offload actually happened — a GPU that exists on the host but was not
-passed through looks identical until you check:
-
-```bash
-curl -s http://127.0.0.1:11435/api/ps    # size_vram > 0 means layers are on the GPU
-```
-
-Intel Iris Xe / Arc and Apple Silicon are **not** covered by that image and will
-run on CPU. That is the case `auto` detects and routes around.
-
-### Fully offline
-
-```bash
-# .env
-LLM_PROVIDER=ollama
-LLM_FALLBACK_PROVIDER=
-AZURE_OPENAI_KEY=
-```
-
-Expect slow answers without a GPU. Everything except the assistant works with no
-model at all.
+The model picker in the composer remains and reports live availability of the
+configured deployment; `Automatic` uses whatever the server resolved.
 
 ---
 
@@ -236,7 +184,7 @@ model at all.
           │     object sets · KPIs · actions · lineage · exports
           │
           ├─▶ services/ai-fde            (Python + FastAPI)
-          │     mode/capability tools over the ontology · Ollama or Azure OpenAI
+          │     mode/capability tools over the ontology · Azure OpenAI
           │
           └─▶ services/ui                (React + Vite, nginx)
                 workbench · explorer · graph · lineage · dashboards · chat
@@ -478,9 +426,7 @@ tells you to run `down -v`.
 |---|---|
 | Pipeline: "database schema is incomplete" | An init script failed on first boot. `docker compose down -v && docker compose up -d`. |
 | Ontology service waits forever at boot | No published ontology. Run the pipeline. |
-| Assistant: "language model is not ready" | Check `/health`. With Ollama, the model may not be pulled: `docker compose exec ollama ollama pull qwen2.5:7b-instruct`. |
-| Assistant is very slow, then answers | Ollama primary on CPU, timing out and failing over. Set `LLM_PROVIDER=azure_openai`, or use a GPU. |
-| "ports are not available … 11434" | A native Ollama on the host. Change `OLLAMA_PORT`. |
+| Assistant: "language model is not ready" | Check `/health` for the detail. Usually the Azure endpoint or the key in `secrets/azure_openai_key`. Everything else works without it. |
 | Anything from the host takes ~130 s | `localhost` resolving to `::1`. Use `127.0.0.1`. |
 
 ---
@@ -919,23 +865,6 @@ what the assistant does from the prompt alone, not what it inherits from
 whatever conversation ran last. Run it after changing a function's SQL or the
 assistant's tools — the failures name what moved.
 
-## Choosing the model per conversation
-
-The assistant's composer has a model picker. **Ollama is the default** where it
-is usable; the option falls back to whatever is actually available, because a
-default that cannot answer is not a default.
-
-An explicit choice is honoured exactly, with **no failover**: someone who
-picked the local model should be told it is unreachable rather than have the
-hosted one answer — and be billed for it — without saying so. `Automatic`
-keeps the server's configured chain and its failover.
-
-The picker reports live availability, and flags Ollama as **slow (CPU)** when
-no GPU offload is detected. That is not cosmetic: a 7B model with this
-fifteen-tool schema needs minutes per round on CPU, and on hardware without a
-GPU it will usually exhaust `OLLAMA_TIMEOUT` (default 300s) before answering.
-With a GPU it is the better choice; without one, Azure answers in seconds.
-
 ## Dashboard history and backup
 
 `/dashboards/history` shows every dashboard with where it came from: the
@@ -1098,14 +1027,13 @@ services/pipeline/    ingest · simulate (coverage report only) · introspect
 services/ontology-service/  registry · objectSet · kpi · actions · lineage · dashboards
                       connections (sources, syncs) · repos (files, commits, builds)
                       schedules (the trigger loop) · evals (function suites)
-services/ai-fde/      llm (providers + failover) · modes (mode/capability model)
+services/ai-fde/      llm (Azure OpenAI provider) · modes (mode/capability model)
                       tools · capability_tools (plans, notepad, context)
                       evals (assistant suites) · ontology_client · agent · prompts · store
 services/ui/          pages: Overview, OntologyManager, ObjectExplorer, GraphView,
                       LineagePage, Dashboards, Actions, Assistant
 vendor/ontograph-core/      the vendored library — see below
 scripts/              bootstrap.sh · reload-views.sh
-docker-compose.gpu.yml      NVIDIA overlay
 ```
 
 ### Changes to the vendored library

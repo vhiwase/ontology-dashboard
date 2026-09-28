@@ -40,12 +40,12 @@ state: dict[str, Any] = {}
 
 
 # The providers a caller may choose between, in the order the dropdown shows
-# them. "auto" is the server's configured chain, which is what ran before a
-# per-request choice existed.
-SELECTABLE_PROVIDERS = ("ollama", "azure_openai")
+# them. "auto" is the server's configured provider; with one backend the
+# choice is between the hosted model and the hosted model, and the picker
+# remains so a second backend can be added without UI churn.
+SELECTABLE_PROVIDERS = ("azure_openai",)
 
 PROVIDER_LABELS = {
-    "ollama": "Ollama (local, open source)",
     "azure_openai": "Azure OpenAI (hosted)",
     "auto": "Automatic (server default)",
 }
@@ -214,9 +214,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     sessionId: int | None = None
     # Which model answers this turn. Unset, or "auto", uses the server's
-    # configured chain with its failover. Naming one pins the turn to it, with
-    # no failover: a caller who asked for the local model should be told it is
-    # unavailable, not quietly billed for the hosted one.
+    # configured provider. Naming one pins the turn to it.
     provider: str | None = None
     # Ontology entities the user attached to this question with the + control.
     # They are resolved server-side and prepended to the turn as context, so
@@ -253,8 +251,6 @@ class ChatResponse(BaseModel):
     usage: dict[str, Any]
     provider: str
     model: str
-    # Set when the primary provider was skipped or failed for this turn.
-    failoverReason: str | None = None
     # The conversation's agent state after this turn: which mode it is in and
     # which capabilities are enabled, so the UI can show both without a
     # second request.
@@ -410,35 +406,6 @@ async def assistant_health(
     return await _health_detail()
 
 
-async def _ollama_is_cpu_only(agent: Agent) -> bool:
-    """Whether Ollama lacks GPU offload, cached for the life of the process.
-
-    has_gpu() proves offload by loading the model and reading its VRAM, which
-    on CPU-only hardware is the very multi-minute operation this is trying to
-    warn about - so probing it on every dropdown render would be its own
-    outage. Whether a GPU is present cannot change while the container runs,
-    so the first answer is kept.
-    """
-    if "ollamaCpuOnly" in state:
-        return bool(state["ollamaCpuOnly"])
-
-    gpu = CONFIG.ollama_gpu
-    if gpu in ("true", "false"):
-        state["ollamaCpuOnly"] = gpu == "false"
-        return bool(state["ollamaCpuOnly"])
-
-    try:
-        detected, _why = await agent.provider.has_gpu()
-        # None means "could not tell", which is not evidence of CPU-only, so it
-        # is not cached: a later call can still find out.
-        if detected is None:
-            return False
-        state["ollamaCpuOnly"] = detected is False
-    except Exception:  # noqa: BLE001 - advisory only, never fatal
-        return False
-    return bool(state["ollamaCpuOnly"])
-
-
 @app.get("/api/assistant/providers")
 async def providers(
     _: Principal = Depends(require_role("viewer")),
@@ -446,8 +413,8 @@ async def providers(
     """The models a chat may choose between, with live availability.
 
     Availability is probed per request rather than cached, because "is the
-    local model pulled yet" changes while the stack is running and a dropdown
-    that lies about it is worse than no dropdown.
+    key working" is exactly the thing that can change while the stack runs,
+    and a dropdown that lies about it is worse than no dropdown.
     """
     agents: dict[str, Agent] = state.get("agents", {})
 
@@ -458,8 +425,6 @@ async def providers(
             "model": CONFIG.model_for(name),
             "configured": name in agents,
             "available": False,
-            # Usable, but slow enough that the choice deserves a warning.
-            "slow": False,
             "detail": None,
         }
         agent = agents.get(name)
@@ -469,29 +434,8 @@ async def providers(
         try:
             health = await agent.provider.health()
             entry["available"] = bool(health.get("reachable"))
-            # Ollama can be reachable with the model absent, which is not the
-            # same as usable, so that case is reported as unavailable.
-            if entry["available"] and health.get("modelPresent") is False:
-                entry["available"] = False
-                entry["detail"] = (
-                    f"{CONFIG.model_for(name)} is not pulled yet. "
-                    "docker compose up ollama-init"
-                )
-            elif not entry["available"]:
+            if not entry["available"]:
                 entry["detail"] = health.get("detail") or "Not reachable."
-
-            # Reachable is not the same as usable. A 7B model with this tool
-            # schema needs minutes per round on CPU, which reads as a hang
-            # rather than as slowness, so the dropdown says so up front instead
-            # of letting someone wait out the timeout to find out.
-            if name == "ollama" and entry["available"]:
-                entry["slow"] = await _ollama_is_cpu_only(agent)
-                if entry.get("slow"):
-                    entry["detail"] = (
-                        "No GPU offload detected, so this runs on CPU and a single "
-                        f"answer can take several minutes (timeout {CONFIG.ollama_timeout:.0f}s). "
-                        "Azure OpenAI answers in seconds."
-                    )
         except Exception as exc:  # noqa: BLE001 - availability, never fatal
             entry["detail"] = str(exc)
         return entry
@@ -506,10 +450,6 @@ async def providers(
             "resolvedTo": getattr(state.get("provider"), "name", None),
             "reason": state.get("providerReason"),
         },
-        # Automatic by default: it uses the server's configured chain and its
-        # failover, so a turn still gets answered when one provider is down.
-        # Pinning a specific model is a deliberate act - and it disables
-        # failover, which is only what you want when you meant it.
         "default": "auto",
     }
 
@@ -611,9 +551,8 @@ async def chat(
         ) from exc
 
     # Pick the agent for this turn. An explicit choice is honoured exactly:
-    # no failover to the other provider, because someone who selected the
-    # local model wants to know it is down rather than have the hosted one
-    # answer - and be charged for it - without saying so.
+    # naming a provider that is not configured is refused rather than silently
+    # answered by the server default.
     chosen = (request.provider or "auto").strip().lower()
     if chosen in ("", "auto"):
         if "agent" not in state:
@@ -778,14 +717,10 @@ async def chat(
         stoppedBecause=result.stopped_because,
         usage=result.usage,
         # When the model errors, result.provider is empty. Falling back to
-        # CONFIG.provider then reported the SERVER default rather than what was
-        # actually attempted - so a turn pinned to Ollama that timed out came
-        # back labelled azure_openai, which reads as "the hosted model answered"
-        # and, worse, as "you were billed for it". Fall back to what this turn
-        # actually selected.
+        # CONFIG.provider then reports the server default rather than what was
+        # actually attempted - so report what this turn actually selected.
         provider=result.provider or attempted_provider,
         model=result.model or CONFIG.model_for(attempted_provider),
-        failoverReason=result.failover_reason,
         agentMode=agent_state.mode,
         enabledCapabilities=sorted(agent_state.capabilities),
         cost={

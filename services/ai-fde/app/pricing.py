@@ -53,7 +53,6 @@ def rates() -> dict[str, Rate]:
         # Self-hosted: no per-token charge. Not free in reality - it burns
         # electricity and hardware - but there is no per-call price to attribute,
         # and inventing one would make the comparison with Azure dishonest.
-        "ollama": Rate(0.0, 0.0, "self-hosted, no per-token charge"),
     }
 
 

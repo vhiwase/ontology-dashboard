@@ -59,10 +59,9 @@ class AgentResult:
     usage: dict[str, Any] = field(default_factory=dict)
     latency_ms: int = 0
     stopped_because: str = "answered"
-    # Which provider and model actually answered, and why the primary was not used.
+    # Which provider and model actually answered.
     provider: str = ""
     model: str = ""
-    failover_reason: str | None = None
 
 
 def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -135,10 +134,10 @@ def _accumulate_usage(
 ) -> dict[str, Any]:
     """Sum token counts across rounds, keeping non-numeric fields from the last.
 
-    The two providers do not report the same keys: Azure sends totalTokens,
-    Ollama sends prompt and completion counts plus a duration. totalTokens is
-    therefore derived when it is missing, so a budget charged on it measures
-    the same thing whichever provider answered.
+    Providers do not all report the same keys: Azure sends totalTokens, others
+    send prompt and completion counts plus a duration. totalTokens is therefore
+    derived when it is missing, so a budget charged on it measures the same
+    thing whichever provider answered.
     """
     merged = dict(total)
     for key, value in latest.items():
@@ -148,9 +147,8 @@ def _accumulate_usage(
             merged[key] = value
 
     # Recomputed from the running prompt/completion totals every round rather
-    # than derived once. Ollama omits totalTokens, so round one derives it and
-    # later rounds have nothing to add to it - which silently froze the total
-    # at the first round's value.
+    # than derived once, so a provider that omits totalTokens on later rounds
+    # cannot silently freeze the total at the first round's value.
     prompt = merged.get("promptTokens") or 0
     completion = merged.get("completionTokens") or 0
     if prompt or completion:
@@ -202,7 +200,6 @@ class Agent:
         rounds = 0
         provider_used = ""
         model_used = ""
-        failover_reason: str | None = None
 
         for round_index in range(CONFIG.max_tool_rounds):
             rounds = round_index + 1
@@ -241,7 +238,6 @@ class Agent:
                 usage = _accumulate_usage(usage, reply.usage)
             provider_used = reply.provider or provider_used
             model_used = reply.model or model_used
-            failover_reason = reply.failover_reason or failover_reason
 
             content = reply.content
             calls = list(reply.tool_calls)
@@ -265,7 +261,6 @@ class Agent:
                     stopped_because=stopped_because,
                     provider=provider_used,
                     model=model_used,
-                    failover_reason=failover_reason,
                 )
 
             messages.append(
@@ -332,8 +327,7 @@ class Agent:
                         stopped_because="needs_clarification",
                         provider=provider_used,
                         model=model_used,
-                        failover_reason=failover_reason,
-                    )
+                        )
 
                 # propose_pipeline is terminal too: a graph that runs writes
                 # real tables the dashboards read, so the turn ends and a
@@ -364,8 +358,7 @@ class Agent:
                         stopped_because="awaiting_pipeline_acceptance",
                         provider=provider_used,
                         model=model_used,
-                        failover_reason=failover_reason,
-                    )
+                        )
 
                 # propose_function is terminal for the same reason. The draft
                 # computes nothing and cannot back a dashboard, so continuing
@@ -394,8 +387,7 @@ class Agent:
                         stopped_because="awaiting_function_approval",
                         provider=provider_used,
                         model=model_used,
-                        failover_reason=failover_reason,
-                    )
+                        )
 
                 messages.append(
                     {
@@ -420,7 +412,6 @@ class Agent:
             stopped_because="round_budget_exhausted",
             provider=provider_used,
             model=model_used,
-            failover_reason=failover_reason,
         )
 
     async def _invoke(

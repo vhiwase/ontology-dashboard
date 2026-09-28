@@ -696,7 +696,6 @@ export interface ChatResponse {
 	usage: Record<string, unknown>;
 	provider: string;
 	model: string;
-	failoverReason?: string | null;
 	/** The conversation's agent state after this turn. */
 	agentMode?: string;
 	enabledCapabilities?: string[];
@@ -727,12 +726,11 @@ export interface AssistantHealth {
 	provider: string;
 	configuredProvider?: string;
 	model: string;
-	/** Why this provider was chosen — GPU detection, explicit setting, or failover. */
+	/** Why this provider was chosen. */
 	providerReason?: string | null;
 	llm: ProviderHealth & {
 		activeProvider?: string;
 		breakerOpen?: boolean;
-		lastFailoverReason?: string | null;
 		primary?: ProviderHealth;
 		fallback?: ProviderHealth;
 	};

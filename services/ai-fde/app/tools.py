@@ -43,8 +43,8 @@ from .ontology_client import (  # noqa: F401 - re-exported for existing imports
 
 log = logging.getLogger("ai_fde.tools")
 
-# Row caps per tool. Chosen so a full turn of tool results stays inside the
-# 16k context the Ollama provider requests.
+# Row caps per tool. Chosen so a full turn of tool results stays inside a
+# context window a hosted model with a large tool schema handles comfortably.
 MAX_OBJECT_ROWS = 20
 MAX_AGGREGATE_ROWS = 25
 MAX_SERIES_POINTS = 30

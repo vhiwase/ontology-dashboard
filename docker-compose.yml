@@ -69,67 +69,6 @@ services:
           cpus: "${POSTGRES_CPUS:-2}"
           memory: ${POSTGRES_MEMORY:-1g}
 
-  # ─── Ollama: hosts the open-source LLM ───────────────────────────────────
-  ollama:
-    # Pinned, like every other image here. `latest` meant the model server
-    # could change under a stack that had not been rebuilt.
-    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
-    restart: unless-stopped
-    environment:
-      # Keeping the model resident avoids a 20-30 s cold load on every question.
-      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
-    ports:
-      - "127.0.0.1:${OLLAMA_PORT:-11435}:11434"
-    volumes:
-      - ollama:/root/.ollama
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
-    deploy:
-      resources:
-        limits:
-          # A 7B model quantised to 4 bits needs roughly 5-6 GB resident; the
-          # headroom above that is for the KV cache on a long conversation.
-          cpus: "${OLLAMA_CPUS:-6}"
-          memory: ${OLLAMA_MEMORY:-10g}
-
-  # ─── One-shot: pull the chat model so the first question is not a 404 ────
-  ollama-init:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
-    # No `profiles:` here. It used to carry profiles: ["default", "llm"], and
-    # "default" is not a special name in Compose - a service with any profile
-    # starts only when that profile is explicitly enabled. So this never ran on
-    # a plain `docker compose up`, the model was never pulled, and the first
-    # question to the local model got a 404 from Ollama. OLLAMA_AUTO_PULL=false
-    # is the supported way to skip the pull; the command below honours it.
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
-      OLLAMA_AUTO_PULL: ${OLLAMA_AUTO_PULL:-true}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        if [ "$${OLLAMA_AUTO_PULL}" != "true" ]; then
-          echo "OLLAMA_AUTO_PULL=false - skipping model pull."; exit 0
-        fi
-        if ollama list 2>/dev/null | grep -q "$${OLLAMA_MODEL%%:*}"; then
-          echo "Model $${OLLAMA_MODEL} already present."; exit 0
-        fi
-        echo "Pulling $${OLLAMA_MODEL} (several GB on first run)..."
-        ollama pull "$${OLLAMA_MODEL}"
-    restart: "no"
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512m
-
   # ─── Pipeline: migrations, ingestion, ontology, users, retention ─────────
   pipeline:
     build:
@@ -233,10 +172,6 @@ services:
     depends_on:
       ontology-service:
         condition: service_healthy
-      # Started, not healthy: with Azure as primary the assistant must not wait on
-      # a multi-gigabyte model pull, and Ollama is only the fallback.
-      ollama:
-        condition: service_started
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
       AUTH_JWT_SECRET_FILE: /run/secrets/jwt_secret
@@ -247,20 +182,12 @@ services:
       CHAT_RATE_PER_MINUTE: ${CHAT_RATE_PER_MINUTE:-10}
       CHAT_RATE_BURST: ${CHAT_RATE_BURST:-5}
       CHAT_DAILY_TOKEN_BUDGET: ${CHAT_DAILY_TOKEN_BUDGET:-0}
-      # auto resolves from whether Ollama has GPU offload; see .env.example.
-      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
-      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
-      LLM_FALLBACK_COOLDOWN: ${LLM_FALLBACK_COOLDOWN:-300}
-      OLLAMA_GPU: ${OLLAMA_GPU:-}
+      # azure_openai is the only provider; the variable stays so a
+      # misconfigured value fails loudly in the assistant's log rather than
+      # being silently ignored.
+      LLM_PROVIDER: ${LLM_PROVIDER:-azure_openai}
       AI_FDE_MAX_TOOL_ROUNDS: ${AI_FDE_MAX_TOOL_ROUNDS:-8}
       AI_FDE_TEMPERATURE: ${AI_FDE_TEMPERATURE:-0.1}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
-      # 300s, not 90s: a 7B model on CPU with a fifteen-tool schema routinely
-      # needs minutes for one round, and 90s meant the local model was selected
-      # and then always timed out. Still bounded, so a wedged model does not
-      # hang the request forever.
-      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_KEY_FILE: /run/secrets/azure_openai_key
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4.1}
@@ -324,5 +251,4 @@ services:
 
 volumes:
   pgdata:
-  ollama:
   ui-certs:

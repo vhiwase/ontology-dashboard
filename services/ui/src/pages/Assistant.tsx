@@ -39,7 +39,6 @@ interface Turn {
 		latencyMs: number;
 		model: string;
 		stoppedBecause: string;
-		failoverReason?: string | null;
 		tokens?: number;
 		costUsd?: number;
 		priced?: boolean;
@@ -59,15 +58,13 @@ interface ProviderOption {
 	model: string;
 	configured: boolean;
 	available: boolean;
-	/** Usable, but slow enough to warn about — a CPU-only local model. */
-	slow: boolean;
 	detail: string | null;
 }
 
 interface ProviderCatalogue {
 	providers: ProviderOption[];
 	auto: { id: string; label: string; resolvedTo: string | null; reason: string | null };
-	/** Which option to preselect; the server yields off Ollama if it is not usable. */
+	/** Which option to preselect. */
 	default: string;
 }
 
@@ -192,7 +189,6 @@ export function Assistant() {
 						latencyMs: response.latencyMs,
 						model: response.model,
 						stoppedBecause: response.stoppedBecause,
-						failoverReason: response.failoverReason,
 						tokens: response.cost?.totalTokens,
 						costUsd: response.cost?.usd,
 						priced: response.cost?.priced,
@@ -209,44 +205,13 @@ export function Assistant() {
 	};
 
 	const llmDown = health && !health.llm.reachable;
-	const modelMissing = health?.llm.reachable && health.llm.modelPresent === false;
-	// The primary can be in cooldown while the fallback answers fine. That is a
-	// working state, not an error, so it gets a note rather than a red banner.
-	const onFallback = Boolean(
-		health?.llm.breakerOpen ||
-			(health?.configuredProvider && health.configuredProvider !== "auto" &&
-				health.provider !== health.configuredProvider),
-	);
-
 	return (
 		<div className="chat">
 			<div className="chat-scroll" ref={scrollRef}>
-				{(llmDown || modelMissing) && (
+				{llmDown && (
 					<div className="banner error" style={{ marginBottom: 12 }}>
 						<strong>The language model is not ready.</strong>{" "}
-						{llmDown ? (
-							<>
-								{health?.provider === "ollama"
-									? "Ollama is not reachable. "
-									: "The configured provider is not reachable. "}
-								{health?.llm.detail}
-							</>
-						) : (
-							<>
-								Ollama is up but the model <code>{health?.model}</code> has not been pulled
-								yet. Run{" "}
-								<code>docker compose exec ollama ollama pull {health?.model}</code> and
-								reload. Everything else in this workbench works without it.
-							</>
-						)}
-					</div>
-				)}
-
-				{onFallback && !llmDown && (
-					<div className="banner" style={{ marginBottom: 12 }}>
-						<strong>Running on the fallback model.</strong>{" "}
-						{health?.llm.lastFailoverReason ?? health?.providerReason}{" "}
-						Answers are unaffected; only which model produces them has changed.
+						The configured provider is not reachable. {health?.llm.detail}
 					</div>
 				)}
 
@@ -348,7 +313,7 @@ export function Assistant() {
 							{catalogue?.providers.map((option) => (
 								<option key={option.id} value={option.id} disabled={!option.available}>
 									{option.label}
-									{!option.available ? " — unavailable" : option.slow ? " — slow (CPU)" : ""}
+									{!option.available ? " — unavailable" : ""}
 								</option>
 							))}
 							{catalogue && (
@@ -360,9 +325,9 @@ export function Assistant() {
 						</select>
 					</label>
 					{selected && <span className="mono">{selected.model}</span>}
-					{selected?.detail && (selected.slow || !selected.available) && (
+					{selected?.detail && !selected.available && (
 						<span className="model-warn" title={selected.detail}>
-							⚠ {selected.slow ? "CPU-only — answers take minutes" : selected.detail}
+							⚠ {selected.detail}
 						</span>
 					)}
 					<span>Enter to send · Shift+Enter for a new line</span>
@@ -567,7 +532,6 @@ function TurnView({
 						{(turn.meta.latencyMs / 1000).toFixed(1)}s · {turn.meta.model}
 						{turn.meta.agentMode && ` · mode: ${turn.meta.agentMode}`}
 						{turn.meta.stoppedBecause !== "answered" && ` · ${turn.meta.stoppedBecause}`}
-						{turn.meta.failoverReason && " · answered by the fallback model"}
 						{/* Tokens and cost per turn, so the price of a question is visible
 						    where the question was asked rather than only in a report.
 						    A turn on an unpriced provider says so instead of showing $0. */}

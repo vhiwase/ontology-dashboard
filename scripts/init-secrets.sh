@@ -65,8 +65,8 @@ write_secret database_url \
 
 # ── Azure OpenAI ───────────────────────────────────────────────────────────
 # Carried over from .env if it is there, so an existing working key is not
-# lost. An empty file is valid: it means "no Azure", and LLM_PROVIDER=ollama
-# then runs the stack entirely offline.
+# lost. An empty file is valid: the assistant is the only thing that needs it,
+# and it reports exactly that at /health until the key is set.
 AZURE_KEY=""
 if [ -f .env ]; then
     AZURE_KEY=$(grep -E '^AZURE_OPENAI_KEY=' .env | head -1 | cut -d= -f2- || true)
@@ -79,7 +79,7 @@ else
     if [ -n "$AZURE_KEY" ]; then
         echo "  + azure_openai_key taken from .env"
     else
-        echo "  + azure_openai_key written empty (set it, or run Ollama only)"
+        echo "  + azure_openai_key written empty (set it to enable the assistant)"
     fi
 fi
 
