@@ -405,7 +405,20 @@ Each migration runs in its own transaction and is recorded in
 applied is reported rather than silently skipped. Migrations are immutable once
 applied: add a new one instead.
 
-`docker compose down -v` still rebuilds from `db/init` — but it **destroys the
+`db/init/*.sql` runs **only when the Postgres data directory is empty**, so it
+is the bootstrap for a fresh database and nothing else. Anything that has to
+change a database which already holds data goes in `db/migrations/` as
+`NNNN_name.sql`, and is applied by `pipeline.migrate` on every pipeline run:
+
+The corollary is a rule the hard way: **init is the post-migration truth, not
+a historical snapshot.** Because a fresh volume replays init and then every
+migration, a view that init still defines but the migrations withdrew makes
+first boot fail — which is exactly what happened when 0018 withdrew the
+simulated-data KPI views and init 05 kept defining them. `05_kpi_views.sql`
+now defines the post-0019 set, and `services/pipeline/tests/
+test_init_matches_migrations.py` fails the suite if any init script defines a
+view the migrations drop without rebuilding, or if `07_verify.sql` demands a
+view init does not create. — but it **destroys the
 volume**, including every AI-built dashboard and chat conversation. Take a
 backup first:
 
