@@ -338,6 +338,77 @@ describe("values named in a question", () => {
 	});
 });
 
+describe("new and returning", () => {
+	const history = () =>
+		type(
+			"OrderHistory",
+			"Order History",
+			"Order Histories",
+			[
+				...order.properties.map((p) => ({ ...p })),
+				prop("customer_order_number", "measure"),
+				prop("is_new_customer", "measure"),
+				prop("is_returning_customer", "measure"),
+			],
+			{ origin: "combination" },
+		);
+
+	it("proposes numbering each customer's orders, measured as new and returning customers", async () => {
+		const item = await first("new customers per month");
+		expect(item.status).toBe("needs_approval");
+		const [proposal] = item.proposals!;
+		expect(proposal!.kind).toBe("combination");
+		expect(proposal!.payload.base).toBe("Order");
+		const derived = proposal!.payload.derived as Array<{ name: string; expression: string; metric?: Record<string, unknown> }>;
+		expect(derived.find((d) => d.name === "is_new_customer")).toMatchObject({
+			expression: "(sequence_of(customer_id, order_date, order_id) = 1)",
+			metric: { aggregation: "sum", label: "New customers" },
+		});
+		expect(derived.find((d) => d.name === "is_returning_customer")?.metric).toMatchObject({
+			aggregation: "count_distinct",
+			of: "customer_id",
+			label: "Returning customers",
+		});
+	});
+
+	it("does not answer 'first-time customers' with the number of customers", async () => {
+		const item = await first("first-time customers by country");
+		expect(item.status).toBe("needs_approval");
+		expect(item.kpi).toBeUndefined();
+	});
+
+	it("reads 'new vs returning' as both figures, from one dataset", async () => {
+		const report = await assess({ text: "new vs returning customers per month" });
+		expect(report.items.map((i) => i.explanation.split(" needs")[0])).toEqual(["New customers", "Returning customers"]);
+		expect(report.items[0]!.proposals![0]!.payload).toEqual(report.items[1]!.proposals![0]!.payload);
+	});
+
+	it("proposes only the metric once the numbered dataset exists", async () => {
+		install([order, customer, shipper, product, history()], [...baseKpis]);
+		const item = await first("returning customers per month");
+		expect(item.proposals).toHaveLength(1);
+		expect(item.proposals![0]).toMatchObject({
+			kind: "metric",
+			payload: { objectType: "OrderHistory", aggregation: "count_distinct", measure: "customer_id", filters: { is_returning_customer: 1 } },
+		});
+	});
+
+	it("answers from the metrics once they exist", async () => {
+		const h = history();
+		install(
+			[order, customer, shipper, product, h],
+			[
+				...baseKpis,
+				kpi("order_history_is_new_customer_sum", "New customers", h, "sum", "is_new_customer"),
+				kpi("returning_customers", "Returning customers", h, "count_distinct", "customer_id", { conditions: { is_returning_customer: 1 } }),
+			],
+		);
+		const fresh = await first("new customers per month");
+		expect(fresh).toMatchObject({ status: "ready", kpi: "order_history_is_new_customer_sum", dimension: "order_date:month" });
+		expect((await first("repeat customers")).kpi).toBe("returning_customers");
+	});
+});
+
 describe("punctuality", () => {
 	it("proposes one timing dataset whose flags name their metrics", async () => {
 		const item = await first("on-time delivery rate by month");

@@ -12,8 +12,11 @@
  *   functions round, abs, coalesce, greatest, least, nullif
  *
  * and, for dates: days_between(from, to) - whole days from one date to the
- * other - and comparisons (< <= > >= = <>) of two numbers or two dates, which
- * give 1 when true, 0 when false and NULL when either side is missing. So
+ * other - sequence_of(key, date[, tiebreak]) - 1 for each key's earliest row
+ * by that date, 2 for its next, and so on, so "is this the customer's first
+ * order" is `(sequence_of(customer_id, order_date, order_id) = 1)` - and
+ * comparisons (< <= > >= = <>) of two numbers or two dates, which give 1 when
+ * true, 0 when false and NULL when either side is missing. So
  * "shipped on time" is `(shipped_date <= required_date) * 100`, and its average
  * is an on-time percentage.
  *
@@ -44,6 +47,7 @@ const FUNCTIONS: Record<string, { min: number; max: number }> = {
 	least: { min: 2, max: 4 },
 	nullif: { min: 2, max: 2 },
 	days_between: { min: 2, max: 2 },
+	sequence_of: { min: 2, max: 3 },
 };
 
 const MAX_LENGTH = 300;
@@ -223,9 +227,10 @@ export function compileTyped(
 	node: Node,
 	numeric: (name: string) => string | null,
 	dates: (name: string) => string | null,
+	keys: (name: string) => string | null = () => null,
 ): Typed {
 	const number = (child: Node, what: string): string => {
-		const typed = compileTyped(child, numeric, dates);
+		const typed = compileTyped(child, numeric, dates, keys);
 		if (typed.type !== "number") throw new BadRequest(`${what} needs numbers; for dates use days_between(from, to) or a comparison.`);
 		return typed.sql;
 	};
@@ -248,8 +253,8 @@ export function compileTyped(
 			return { sql: node.op === "/" ? `(${left} / NULLIF(${right}, 0))` : `(${left} ${node.op} ${right})`, type: "number" };
 		}
 		case "compare": {
-			const left = compileTyped(node.left, numeric, dates);
-			const right = compileTyped(node.right, numeric, dates);
+			const left = compileTyped(node.left, numeric, dates, keys);
+			const right = compileTyped(node.right, numeric, dates, keys);
 			if (left.type !== right.type) throw new BadRequest("A comparison needs two numbers or two dates.");
 			// Dates are compared as dates, so a timestamp and a date compare by day.
 			const l = left.type === "date" ? `(${left.sql})::date` : left.sql;
@@ -260,8 +265,23 @@ export function compileTyped(
 			};
 		}
 		case "call": {
+			if (node.fn === "sequence_of") {
+				// A window over every row, not a value of one row: which of its
+				// key's rows this is, in date order. Ties break on the third
+				// column, so the numbering never depends on how rows are read.
+				const [key, date, tiebreak] = node.args;
+				const named = (arg: Node | undefined, what: string): string => {
+					const sql = arg?.kind === "column" ? keys(arg.name) ?? numeric(arg.name) ?? dates(arg.name) : null;
+					if (!sql) throw new BadRequest(`sequence_of needs ${what} as a property name.`);
+					return sql;
+				};
+				const ordered = compileTyped(date!, numeric, dates, keys);
+				if (date!.kind !== "column" || ordered.type !== "date") throw new BadRequest("sequence_of orders by a date property.");
+				const order = [ordered.sql, ...(tiebreak ? [named(tiebreak, "its tie-break")] : [])].join(", ");
+				return { sql: `(row_number() OVER (PARTITION BY ${named(key, "the key it counts within")} ORDER BY ${order}))::numeric`, type: "number" };
+			}
 			if (node.fn === "days_between") {
-				const [from, to] = node.args.map((arg) => compileTyped(arg, numeric, dates));
+				const [from, to] = node.args.map((arg) => compileTyped(arg, numeric, dates, keys));
 				if (from!.type !== "date" || to!.type !== "date") throw new BadRequest("days_between takes two dates.");
 				return { sql: `((${to!.sql})::date - (${from!.sql})::date)::numeric`, type: "number" };
 			}
@@ -278,12 +298,14 @@ export function compileExpression(
 	source: string,
 	allowed: Map<string, string>,
 	dateColumns: Map<string, string> = new Map(),
+	keyColumns: Map<string, string> = new Map(),
 ): { sql: string; columns: string[] } {
 	const tree = parse(source);
 	const typed = compileTyped(
 		tree,
 		(name) => allowed.get(name) ?? allowed.get(name.toLowerCase()) ?? null,
 		(name) => dateColumns.get(name) ?? dateColumns.get(name.toLowerCase()) ?? null,
+		(name) => keyColumns.get(name) ?? keyColumns.get(name.toLowerCase()) ?? null,
 	);
 	if (typed.type !== "number") {
 		throw new BadRequest("A derived property must be a number: compare dates, or use days_between(from, to).");

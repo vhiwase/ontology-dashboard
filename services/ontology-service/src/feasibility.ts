@@ -449,6 +449,155 @@ function punctualityKpi(counting: boolean): KpiMeta | null {
 	return getRegistry().kpis.find((k) => k.measureColumn === measure && k.aggregation === aggregation) ?? null;
 }
 
+// ── new and returning ───────────────────────────────────────────────────────
+//  "New customers per month", "returning customers by country": a customer is
+//  new in the period of their first order and returning in any period they
+//  order again. No column says so; the order of each customer's rows does.
+
+const NEW_WORDS = /^(new|first[- ]?time|first|newly acquired|acquired)$/;
+const RETURNING_WORDS = /^(returning|repeat|recurring|retained|existing|loyal|repeating)$/;
+const LIFECYCLE = /\b(new|first[- ]?time|first|newly acquired|acquired|returning|repeat|recurring|retained|existing|loyal|repeating)\s+(\p{L}+)/u;
+
+export interface Lifecycle {
+	which: "new" | "returning";
+	/** Who is new or returning: Customer. */
+	entity: ObjectTypeMeta;
+	/** What they do, with a date: Order, along its customer_id. */
+	event: ObjectTypeMeta;
+	link: LinkTypeMeta;
+	date: PropertyMeta;
+}
+
+function lifecycleNames(entity: ObjectTypeMeta, event: ObjectTypeMeta): { seq: string; isNew: string; isReturning: string; newLabel: string; returningLabel: string } {
+	const e = snake(entity.apiName);
+	const many = plural(entity.label);
+	return {
+		seq: `${e}_${snake(event.apiName)}_number`.slice(0, 40),
+		isNew: `is_new_${e}`.slice(0, 40),
+		isReturning: `is_returning_${e}`.slice(0, 40),
+		newLabel: `New ${many.toLowerCase()}`.replace(/^new/, "New"),
+		returningLabel: `Returning ${many.toLowerCase()}`,
+	};
+}
+
+/** "New customers", "repeat buyers": who, through what dated event. */
+export function asksAboutLifecycle(phrase: string): Lifecycle | null {
+	const found = LIFECYCLE.exec(phrase.toLowerCase());
+	if (!found) return null;
+	const which = NEW_WORDS.test(found[1]!) ? "new" : RETURNING_WORDS.test(found[1]!) ? "returning" : null;
+	if (!which) return null;
+	const registry = getRegistry();
+	const entity = registry.objectTypes.find((t) => t.origin !== "combination" && namesTypeExactly(found[2]!, t)) ?? matchType(found[2]!);
+	if (!entity || entity.origin === "combination") return null;
+	// A type with its own start date (an employee's hire date) is new by that
+	// date, not by its first order.
+	if (entity.properties.some((p) => p.semanticRole === "temporal")) return null;
+	let best: Lifecycle | null = null;
+	for (const event of registry.objectTypes) {
+		if (event.origin === "combination" || event.rid === entity.rid) continue;
+		const link = (registry.linksBySourceRid.get(event.rid) ?? []).find((l) => l.targetObjectType === entity.rid);
+		if (!link) continue;
+		const dates = event.properties.filter((p) => p.semanticRole === "temporal");
+		const date = dates.find((p) => START_DATE.test(p.sqlColumn) && !ACTUAL_DATE.test(p.sqlColumn) && !PROMISED_DATE.test(p.sqlColumn)) ?? dates[0];
+		if (!date) continue;
+		// The busiest dated type says the most about when someone first came.
+		if (!best || event.rowCount > best.event.rowCount) best = { which, entity, event, link, date };
+	}
+	return best;
+}
+
+/** The metric for new or returning, once a history dataset made it. */
+function lifecycleKpi(asked: Lifecycle): KpiMeta | null {
+	const names = lifecycleNames(asked.entity, asked.event);
+	return (
+		getRegistry().kpis.find((k) =>
+			asked.which === "new"
+				? k.measureColumn === names.isNew && k.aggregation === "sum"
+				: k.aggregation === "count_distinct" && Number((k.conditions ?? {})[names.isReturning]) === 1,
+		) ?? null
+	);
+}
+
+function lifecycle(request: FeasibilityRequest, asked: Lifecycle): FeasibilityItem {
+	const registry = getRegistry();
+	const { entity, event, link, date } = asked;
+	const names = lifecycleNames(entity, event);
+	const key = link.sourceColumn;
+	const many = plural(entity.label).toLowerCase();
+	const events = (event.pluralLabel ?? plural(event.label)).toLowerCase();
+	const wanted = asked.which === "new" ? names.newLabel : names.returningLabel;
+	const sequence = `sequence_of(${key}, ${date.sqlColumn}, ${event.primaryKeyColumn})`;
+	const derived = [
+		{ name: names.seq, expression: sequence },
+		{
+			name: names.isNew,
+			expression: `(${sequence} = 1)`,
+			metric: { aggregation: "sum", label: names.newLabel, format: "integer" },
+		},
+		{
+			name: names.isReturning,
+			expression: `(${sequence} > 1)`,
+			metric: { aggregation: "count_distinct", of: key, label: names.returningLabel, format: "integer" },
+		},
+	];
+	const meaning =
+		`a ${entity.label.toLowerCase()} is new in the ${date.sqlColumn.replace(/_/g, " ")} period of their first ${event.label.toLowerCase()} ` +
+		`and returning in any period they order again`;
+
+	// The flags exist already (approved earlier): only the figure is new.
+	const history = registry.objectTypes.find(
+		(t) => t.origin === "combination" && t.properties.some((p) => p.sqlColumn === names.isNew),
+	);
+	if (history) {
+		const flag = derived.find((d) => d.metric?.label === wanted)!;
+		return {
+			request,
+			status: "needs_approval",
+			explanation: `${history.pluralLabel ?? history.label} already number each ${entity.label.toLowerCase()}'s ${events}. Approve the metric "${wanted}" over them: ${meaning}.`,
+			proposals: [
+				{
+					kind: "metric",
+					title: `New metric: ${wanted}`,
+					summary: `${wanted}: ${meaning}.`,
+					payload:
+						asked.which === "new"
+							? { objectType: history.apiName, measure: names.isNew, aggregation: "sum", label: wanted, format: "integer" }
+							: { objectType: history.apiName, measure: key, aggregation: "count_distinct", filters: { [names.isReturning]: 1 }, label: wanted, format: "integer" },
+					dependsOn: [],
+				},
+			],
+		};
+	}
+
+	const joins = analysisJoins(event);
+	const name = freeDatasetName(`${event.label} History`);
+	return {
+		request,
+		status: "needs_approval",
+		explanation:
+			`${wanted} needs each ${entity.label.toLowerCase()}'s ${events} in order. Approve and every ${event.label.toLowerCase()} is numbered ` +
+			`within its ${entity.label.toLowerCase()} by ${date.sqlColumn} (\`${names.seq}\`): ${meaning}. ` +
+			`"${names.newLabel}" and "${names.returningLabel}" are measured from that and can be charted by month` +
+			(joins.length ? ` or by ${joins.map((j) => j.target.label.toLowerCase()).join(", ")}` : "") +
+			`. ${capitalise(many)} with no ${event.label.toLowerCase()} are in neither.`,
+		proposals: [
+			{
+				kind: "combination",
+				title: `New dataset: ${name}`,
+				summary:
+					`${event.pluralLabel ?? event.label} with ${derived.map((d) => `${d.name} = \`${d.expression}\``).join(", ")}. ` +
+					`Measured as "${names.newLabel}" and "${names.returningLabel}".`,
+				payload: { name, base: event.apiName, joins: joins.map((j) => ({ path: j.path, fields: j.fields })), derived },
+				dependsOn: [],
+			},
+		],
+	};
+}
+
+function capitalise(text: string): string {
+	return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 /**
  * "On-time rate", "late orders": answered from a promised and an actual date
  * on the same rows. The flags are derived once, in a dataset that also carries
@@ -606,6 +755,17 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 		) ?? null;
 	} else if (kpiMatch) {
 		kpi = kpiMatch.kpi;
+	}
+
+	// 1a. New or returning - "new customers per month" - is a figure no
+	// column holds; the order of each customer's rows does. The count of
+	// customers answers a different question, so it does not stand in.
+	const asked = asksAboutLifecycle(request.text ?? measurePhrase) ?? asksAboutLifecycle(measurePhrase);
+	if (asked) {
+		const measured = lifecycleKpi(asked);
+		if (!measured) return lifecycle(request, asked);
+		kpi = measured;
+		measureProperty = null;
 	}
 
 	// 1b. Punctuality - "on-time rate", "how many orders shipped late" - is a
@@ -2128,10 +2288,13 @@ export async function assess(input: { text?: string; requests?: FeasibilityReque
 			items.push(...(await capabilities()));
 		}
 	} else {
+		// "New vs returning customers per month" is two figures, each in full.
+		const both = /\b(new|first[- ]?time)\s+(?:vs\.?|versus|and|or|compared to)\s+(returning|repeat|recurring)\b/i;
+		const asking = both.test(text) ? `${text.replace(both, "$1")}; ${text.replace(both, "$2")}` : text;
 		const requests: FeasibilityRequest[] = input.requests?.length
 			? input.requests
-			: text
-				? text
+			: asking
+				? asking
 						.split(/\s*(?:;|\band also\b|\bplus\b)\s*/i)
 						.filter(Boolean)
 						.map((part) => {

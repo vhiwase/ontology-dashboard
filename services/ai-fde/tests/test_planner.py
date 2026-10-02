@@ -198,6 +198,19 @@ def test_proposals_are_stored_dependencies_first_with_their_follow_up():
     assert "**Sales dashboard** is built straight away" in answer
 
 
+def test_two_figures_needing_one_dataset_propose_it_once():
+    draft = {"kind": "combination", "title": "New dataset: Order History", "summary": "s", "payload": {"name": "Order History"}, "dependsOn": []}
+    report = {
+        "intent": "chart",
+        "items": [
+            {"status": "needs_approval", "explanation": "New customers needs ...", "proposals": [draft], "request": {}},
+            {"status": "needs_approval", "explanation": "Returning customers needs ...", "proposals": [draft], "request": {}},
+        ],
+    }
+    calls = next_calls(current_turn(transcript("new vs returning customers", ([("check_feasibility", {})], [report]))))
+    assert [c.name for c in calls] == ["propose_change"]
+
+
 def test_not_possible_says_what_is_missing_and_offers_alternatives():
     report = {
         "intent": "chart",

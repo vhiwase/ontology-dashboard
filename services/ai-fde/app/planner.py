@@ -284,14 +284,18 @@ def next_calls(turn: Turn) -> list[ToolCall]:
             stored[_key(step.arguments.get("kind", ""), step.arguments.get("payload"))] = int(proposal["id"])
     attempted = {_key(s.arguments.get("kind", ""), s.arguments.get("payload")) for s in turn.steps if s.name == "propose_change"}
     calls: list[ToolCall] = []
+    queued: set[str] = set()
     for item in items:
         if item.get("status") != "needs_approval":
             continue
         drafts = item.get("proposals") or []
         for draft in drafts:
             key = _key(draft.get("kind", ""), draft.get("payload"))
-            if key in attempted or len(attempted) + len(calls) >= MAX_PROPOSALS:
+            # Two figures that need the same dataset ("new vs returning")
+            # propose it once.
+            if key in attempted or key in queued or len(attempted) + len(calls) >= MAX_PROPOSALS:
                 continue
+            queued.add(key)
             dependency_keys = [
                 _key(drafts[d].get("kind", ""), drafts[d].get("payload")) for d in draft.get("dependsOn") or [] if d < len(drafts)
             ]

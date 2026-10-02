@@ -622,7 +622,11 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 		const dateColumns = new Map(
 			[...outputs.entries()].filter(([, value]) => value.temporal).map(([key, value]) => [key, value.sql]),
 		);
-		const { sql } = compileExpression(String(entry.expression ?? ""), numericColumns, dateColumns);
+		// Any column the dataset carries may be what a sequence counts within.
+		const keyColumns = new Map(
+			[...outputs.entries()].filter(([, value]) => value.from !== "derived").map(([key, value]) => [key, value.sql]),
+		);
+		const { sql } = compileExpression(String(entry.expression ?? ""), numericColumns, dateColumns, keyColumns);
 		outputs.set(column, { sql, numeric: true, from: "derived" });
 		const metric = derivedMetric(entry.metric);
 		derivedUsed.push({ name: column, expression: String(entry.expression), ...(metric ? { metric } : {}) });
@@ -728,7 +732,13 @@ async function applyCombination(payload: Record<string, unknown>, username: stri
 	for (const entry of (p.derived as Array<{ name: string; metric?: DerivedMetric }>) ?? []) {
 		if (!entry.metric) continue;
 		try {
-			const made = await applyMetric({ objectType: p.apiName, measure: entry.name, ...entry.metric }, username);
+			const { of, ...metric } = entry.metric;
+			const made = await applyMetric(
+				of
+					? { objectType: p.apiName, ...metric, measure: of, filters: { [entry.name]: 1 } }
+					: { objectType: p.apiName, measure: entry.name, ...metric },
+				username,
+			);
 			named.push(String(made.metric));
 		} catch (error) {
 			notes.push(`"${entry.metric.label}" was not made: ${(error as Error).message}`);
@@ -746,17 +756,29 @@ async function applyCombination(payload: Record<string, unknown>, username: stri
 
 /** The metric a derived column is made for: "On-time rate" = avg(on_time_pct). */
 export interface DerivedMetric {
-	aggregation: "sum" | "avg" | "min" | "max";
+	aggregation: "sum" | "avg" | "min" | "max" | "count_distinct";
 	label: string;
 	format?: "number" | "integer" | "currency" | "percent";
+	/**
+	 * count_distinct only: the column counted, over the rows this derived
+	 * flag marks - "Returning customers" is the distinct customer_id of the
+	 * orders flagged is_returning_customer.
+	 */
+	of?: string;
 }
 
 export function derivedMetric(raw: unknown): DerivedMetric | null {
 	if (raw === undefined || raw === null) return null;
 	const entry = raw as Record<string, unknown>;
 	const aggregation = String(entry.aggregation ?? "").toLowerCase();
-	if (!["sum", "avg", "min", "max"].includes(aggregation)) {
-		throw new BadRequest("A derived property's metric adds up (sum), averages (avg) or takes the min or max.");
+	if (!["sum", "avg", "min", "max", "count_distinct"].includes(aggregation)) {
+		throw new BadRequest(
+			"A derived property's metric adds up (sum), averages (avg), takes the min or max, or counts the distinct values of a column (count_distinct with of) over the rows it flags.",
+		);
+	}
+	const of = entry.of === undefined || entry.of === null ? undefined : String(entry.of);
+	if ((aggregation === "count_distinct") !== (of !== undefined)) {
+		throw new BadRequest("count_distinct names the column it counts in 'of', and only count_distinct does.");
 	}
 	const label = str(entry.label, "derived[].metric.label");
 	if (label.length > 60) throw new BadRequest("A metric's name is at most 60 characters.");
@@ -764,7 +786,7 @@ export function derivedMetric(raw: unknown): DerivedMetric | null {
 	if (format !== undefined && !["number", "integer", "currency", "percent"].includes(format)) {
 		throw new BadRequest("format must be number, integer, currency or percent.");
 	}
-	return { aggregation, label, ...(format ? { format } : {}) } as DerivedMetric;
+	return { aggregation, label, ...(format ? { format } : {}), ...(of ? { of } : {}) } as DerivedMetric;
 }
 
 // ── action_type ─────────────────────────────────────────────────────────────
