@@ -379,10 +379,10 @@ def compose_answer(turn: Turn) -> str:
             parts.append(_item_sentence(item, turn))
 
     if proposals:
+        # Titles only: each proposal is shown in full on its approval card,
+        # with the evidence, right under this answer.
         parts.append("**Waiting for your approval** (nothing changes until you approve):")
-        parts.append(
-            "\n".join(f"- **{proposal.get('title')}** - {proposal.get('summary') or ''}".rstrip(" -") for proposal in proposals)
-        )
+        parts.append("\n".join(f"- **{proposal.get('title')}**" for proposal in proposals))
         builds = [p.get("followUp") for p in proposals if p.get("followUp")]
         if builds:
             board = builds[-1]

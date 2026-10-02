@@ -846,9 +846,9 @@ export function highlight(widget: ResolvedWidget): string | null {
 		const trend = data.trend;
 		if (trend?.deltaPct !== null && trend?.deltaPct !== undefined && trend.lastPeriod && trend.previousPeriod) {
 			const direction = trend.deltaPct >= 0 ? "up" : "down";
-			return `${title} stands at ${fmt(data.total)}; the latest complete ${trend.grain}, ${formatPeriod(trend.lastPeriod, trend.grain)}, was ${direction} ${Math.abs(trend.deltaPct).toFixed(1)}% on ${formatPeriod(trend.previousPeriod, trend.grain)}.`;
+			return `${title}: ${fmt(data.total)}. The latest complete ${trend.grain}, ${formatPeriod(trend.lastPeriod, trend.grain)}, was ${direction} ${Math.abs(trend.deltaPct).toFixed(1)}% on ${formatPeriod(trend.previousPeriod, trend.grain)}.`;
 		}
-		return `${title} stands at ${fmt(data.total)}.`;
+		return `${title}: ${fmt(data.total)}.`;
 	}
 	const points = data.series.filter((point) => point.value !== null) as Array<{ label: string; value: number }>;
 	if (points.length === 0) return null;

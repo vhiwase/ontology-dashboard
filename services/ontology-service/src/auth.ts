@@ -623,7 +623,6 @@ export function apiAuthorization() {
 
 const PLATFORM_ADMIN_ONLY: ReadonlyArray<{ method: string; pattern: RegExp }> = [
 	{ method: "POST", pattern: /^\/registry\/reload$/ },
-	{ method: "GET", pattern: /^\/actions\/audit$/ },
 	{ method: "POST", pattern: /^\/functions\/[^/]+\/(approve|reject|archive)$/ },
 	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/accept$/ },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/members$/ },

@@ -85,7 +85,7 @@ def test_starters_come_from_the_workspace_metrics():
     # Money first, by month.
     assert "Total Freight per month" in labels
     assert any(label.startswith("Build an order") or label.startswith("Build a ") for label in labels)
-    assert "Combine orders with customer details" in labels
+    assert "Combine orders with their customers" in labels
     assert starter_prompts(TMS) == TMS_STARTERS
     assert starter_prompts(None)[0]["label"] == "How do I get started?"
 

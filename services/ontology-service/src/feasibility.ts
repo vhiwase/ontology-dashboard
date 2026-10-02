@@ -537,7 +537,7 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 					return {
 						request,
 						status: "not_possible",
-						explanation: `Revenue can be derived on ${recipe.type.label} (${recipe.expression}), but ${recipe.type.label} has no chain of links to ${dimensionProperty.type.label}.`,
+						explanation: `Revenue can be derived on ${recipe.type.label} (\`${recipe.expression}\`), but ${recipe.type.label} has no chain of links to ${dimensionProperty.type.label}.`,
 						missing: [`a link from ${recipe.type.label} towards ${dimensionProperty.type.label}`],
 						alternatives: [`revenue by ${humanize(dimensionsOf(recipe.type)[0] ?? "month").toLowerCase()}`],
 					};
@@ -557,14 +557,14 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 				status: "needs_approval",
 				explanation:
 					`No column holds revenue, but ${recipe.type.pluralLabel ?? recipe.type.label} carry what it is made of: ` +
-					`${recipe.expression}. Approving the combined dataset below derives it per row` +
+					`\`${recipe.expression}\`. Approving the combined dataset below derives it per row` +
 					(joins.length ? " and brings in what it is sliced by" : "") +
 					"; its total-revenue metric is created with it.",
 				proposals: [
 					{
 						kind: "combination",
 						title: `${recipe.type.label} with revenue`,
-						summary: `${recipe.type.pluralLabel ?? recipe.type.label} with line_total = ${recipe.expression}.`,
+						summary: `${recipe.type.pluralLabel ?? recipe.type.label} with revenue = \`${recipe.expression}\`.`,
 						payload: {
 							name: `${recipe.type.label} Revenue`,
 							base: recipe.type.apiName,
@@ -914,7 +914,7 @@ function analysisDataset(
 		summary:
 			`${base.pluralLabel ?? plural(base.label)}, one row each, with ` +
 			carried.join("; ") +
-			(recipe ? `, and revenue = ${recipe.expression}` : "") +
+			(recipe ? `, and revenue = \`${recipe.expression}\`` : "") +
 			`. Approve it and the ${intent} "${boardTitle}" is built from it.`,
 		payload: {
 			name,
@@ -932,7 +932,7 @@ function analysisDataset(
 			explanation:
 				`To build "${boardTitle}" properly, ${base.pluralLabel?.toLowerCase() ?? plural(base.label.toLowerCase())} need what they point at in one place: ` +
 				carried.join("; ") +
-				(recipe ? `, with revenue worked out as ${recipe.expression}` : "") +
+				(recipe ? `, with revenue worked out as \`${recipe.expression}\`` : "") +
 				`. That is one new dataset (nothing in your database changes). Approve it and the ${intent} is built straight away - ` +
 				"headline figures, a monthly timeline and the main breakdowns.",
 			proposals: [proposal],

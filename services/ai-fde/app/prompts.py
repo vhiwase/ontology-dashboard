@@ -443,8 +443,8 @@ def starter_prompts(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
         if source and target and source is not target and source.get("rowCount") and target.get("rowCount"):
             out.append(
                 {
-                    "label": f"Combine {plural_of(source)} with {str(target.get('label')).lower()} details",
-                    "prompt": f"Combine {plural_of(source)} with their {str(target.get('label')).lower()} details into one dataset",
+                    "label": f"Combine {plural_of(source)} with their {plural_of(target)}",
+                    "prompt": f"Combine {plural_of(source)} with their {plural_of(target)} into one dataset",
                 }
             )
             break

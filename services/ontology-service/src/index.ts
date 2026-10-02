@@ -1029,7 +1029,10 @@ app.post(
 app.get(
 	"/api/actions/audit",
 	handle(async (req, res) => {
-		res.json(await listAudit(Number(req.query.limit ?? 100)));
+		// A workspace owner reads their own workspace's trail; only a platform
+		// administrator outside a personal workspace reads every space's.
+		const everything = req.principal?.role === "admin" && req.spaceAccess?.kind !== "personal";
+		res.json(await listAudit(Number(req.query.limit ?? 100), everything ? null : currentSpace()));
 	}),
 );
 
