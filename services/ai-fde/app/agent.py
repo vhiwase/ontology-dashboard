@@ -31,11 +31,33 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import CONFIG
+from .context import current_session_state
 from .llm import LlmError, LlmProvider, ToolCall, recover_text_tool_calls
+from .modes import SessionAgentState, tools_for
 from .prompts import SYSTEM_PROMPT, build_context_message
-from .tools import TOOL_NAMES, run_tool, serialise_result, tool_schemas
+from .tools import TOOL_NAMES, run_tool, schemas_for, serialise_result
 
 log = logging.getLogger("ai_fde.agent")
+
+# Tools that change the platform. Their results are never served from the
+# duplicate-call cache, and a successful one empties it, because a read made
+# before it may no longer be true.
+WRITE_TOOLS = frozenset(
+    {
+        "create_sync",
+        "run_sync",
+        "schedule_sync",
+        "create_object_type",
+        "create_link_type",
+        "create_metric",
+        "create_action_type",
+        "delete_ontology_object",
+        "propose_function",
+        "create_dashboard",
+        "apply_action",
+        "notepad",
+    }
+)
 
 
 @dataclass
@@ -57,10 +79,9 @@ class AgentResult:
     usage: dict[str, Any] = field(default_factory=dict)
     latency_ms: int = 0
     stopped_because: str = "answered"
-    # Which provider and model actually answered, and why the primary was not used.
+    # Which provider and model actually answered.
     provider: str = ""
     model: str = ""
-    failover_reason: str | None = None
 
 
 def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -71,6 +92,10 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "kpi": payload.get("kpi"),
             "title": payload.get("label"),
             "dimension": payload.get("dimension"),
+            "dimensionLabel": payload.get("dimensionLabel"),
+            "dimensionGrain": payload.get("dimensionGrain"),
+            "partialPeriod": payload.get("partialPeriod"),
+            "dataThrough": payload.get("dataThrough"),
             "unit": payload.get("unit"),
             "format": payload.get("format"),
             "total": payload.get("total"),
@@ -78,7 +103,7 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "caveat": payload.get("dataQualityCaveat"),
             # A ranked category list reads far better horizontally; a date series
             # reads as a line. Picking here means the assistant does not have to.
-            "chart": "line" if _looks_temporal(payload.get("dimension")) else "hbar",
+            "chart": "line" if payload.get("dimensionGrain") or _looks_temporal(payload.get("dimension")) else "hbar",
         }
     if name == "create_dashboard" and payload.get("created"):
         return {
@@ -87,6 +112,38 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "title": payload.get("title"),
             "widgets": payload.get("widgets"),
             "url": payload.get("url"),
+            # "dashboard" or "report": the UI opens a report in its document view.
+            "boardKind": payload.get("kind") or "dashboard",
+        }
+    if name == "check_feasibility" and isinstance(payload.get("items"), list):
+        # What the data can answer, what is one approval away, and what not -
+        # the UI renders it as a checklist with the drafted proposals attached.
+        return {
+            "kind": "feasibility",
+            "intent": payload.get("intent"),
+            "subject": payload.get("subject"),
+            "summary": payload.get("summary"),
+            "items": [
+                {
+                    "status": item.get("status"),
+                    "explanation": item.get("explanation"),
+                    "request": item.get("request"),
+                    "kpi": item.get("kpi"),
+                    "dimension": item.get("dimension"),
+                    "missing": item.get("missing"),
+                    "alternatives": item.get("alternatives"),
+                }
+                for item in payload["items"][:24]
+            ],
+        }
+    if name == "propose_change" and payload.get("proposal"):
+        proposal = payload["proposal"]
+        return {
+            "kind": "proposal",
+            "proposal": {
+                key: proposal.get(key)
+                for key in ("id", "kind", "status", "title", "summary", "dependsOn", "payload")
+            },
         }
     if name in ("search_objects", "aggregate_objects", "traverse_link") and payload.get("rows"):
         return {
@@ -102,14 +159,82 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "status": payload.get("status"),
             "result": payload.get("result"),
         }
-    if name == "get_lineage":
+    # What the assistant built, one card per change, so the reply shows the
+    # ontology growing rather than asking the reader to take the prose's word.
+    if name == "create_object_type" and payload.get("created"):
         return {
-            "kind": "lineage",
-            "subject": payload.get("subject"),
-            "upstreamByLayer": payload.get("upstreamByLayer"),
-            "sourceColumnCount": payload.get("sourceColumnCount"),
+            "kind": "ontologyChange",
+            "change": "objectType",
+            "apiName": payload.get("objectType"),
+            "detail": f"{payload.get('objects')} objects from {payload.get('dataset')}",
+        }
+    if name == "create_link_type" and payload.get("created"):
+        ratio = payload.get("matchRatio") or 0
+        return {
+            "kind": "ontologyChange",
+            "change": "linkType",
+            "apiName": payload.get("link"),
+            "detail": f"{payload.get('matched')}/{payload.get('candidates')} resolve ({ratio:.0%})",
+        }
+    if name == "create_metric" and payload.get("created"):
+        return {
+            "kind": "ontologyChange",
+            "change": "kpi",
+            "apiName": payload.get("metric"),
+            "detail": f"= {payload.get('value')} {payload.get('unit') or ''}".strip(),
+        }
+    if name == "create_action_type" and payload.get("created"):
+        return {
+            "kind": "ontologyChange",
+            "change": "actionType",
+            "apiName": payload.get("action"),
+            "detail": f"on {payload.get('objectType')}",
+        }
+    if name == "create_sync" and payload.get("created"):
+        run = payload.get("run") or {}
+        return {
+            "kind": "ontologyChange",
+            "change": "dataset",
+            "apiName": payload.get("dataset"),
+            "detail": f"{run.get('rows', '?')} rows, {payload.get('schedule')}",
+        }
+    if name == "propose_function" and payload.get("functionProposed"):
+        return {"kind": "functionProposal", "function": payload.get("function")}
+    if name in ("generate_plan", "manage_plan") and payload.get("plan"):
+        return {"kind": "plan", "plan": payload["plan"]}
+    if name == "manage_todo_list":
+        return {"kind": "todos", "todos": payload.get("todos") or []}
+    if name == "change_mode" and payload.get("mode"):
+        return {
+            "kind": "modeChange",
+            "mode": payload.get("mode"),
+            "label": payload.get("label"),
         }
     return None
+
+
+_CHANGE_NOUNS = {
+    "dataset": "Synced",
+    "objectType": "Created object type",
+    "linkType": "Linked",
+    "kpi": "Defined metric",
+    "actionType": "Declared action",
+}
+
+
+def _summarise_changes(artifacts: list[dict[str, Any]]) -> str:
+    """What a turn changed, as a Markdown list, from its artifacts."""
+    lines = [
+        f"- {_CHANGE_NOUNS.get(a.get('change') or '', 'Changed')} `{a.get('apiName')}` ({a.get('detail')})"
+        for a in artifacts
+        if a.get("kind") == "ontologyChange"
+    ]
+    lines += [
+        f"- Proposed function `{(a.get('function') or {}).get('apiName')}`, awaiting approval"
+        for a in artifacts
+        if a.get("kind") == "functionProposal"
+    ]
+    return "\n".join(lines)
 
 
 def _looks_temporal(dimension: str | None) -> bool:
@@ -123,10 +248,10 @@ def _accumulate_usage(
 ) -> dict[str, Any]:
     """Sum token counts across rounds, keeping non-numeric fields from the last.
 
-    The two providers do not report the same keys: Azure sends totalTokens,
-    Ollama sends prompt and completion counts plus a duration. totalTokens is
-    therefore derived when it is missing, so a budget charged on it measures
-    the same thing whichever provider answered.
+    Providers do not all report the same keys: Azure sends totalTokens, others
+    send prompt and completion counts plus a duration. totalTokens is therefore
+    derived when it is missing, so a budget charged on it measures the same
+    thing whichever provider answered.
     """
     merged = dict(total)
     for key, value in latest.items():
@@ -136,9 +261,8 @@ def _accumulate_usage(
             merged[key] = value
 
     # Recomputed from the running prompt/completion totals every round rather
-    # than derived once. Ollama omits totalTokens, so round one derives it and
-    # later rounds have nothing to add to it - which silently froze the total
-    # at the first round's value.
+    # than derived once, so a provider that omits totalTokens on later rounds
+    # cannot silently freeze the total at the first round's value.
     prompt = merged.get("promptTokens") or 0
     completion = merged.get("completionTokens") or 0
     if prompt or completion:
@@ -155,8 +279,16 @@ class Agent:
         user_message: str,
         history: list[dict[str, Any]],
         snapshot: dict[str, Any],
+        state: SessionAgentState | None = None,
     ) -> AgentResult:
         started = time.monotonic()
+        if state is None:
+            # Every caller in main.py passes the session's state; the default
+            # keeps the agent usable standalone (tests, one-off scripts).
+            state = SessionAgentState()
+        # The stateful tools reach the state through this contextvar rather
+        # than arguments, exactly as the token and space travel.
+        current_session_state.set(state)
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -168,7 +300,6 @@ class Agent:
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
 
-        schemas = tool_schemas()
         invocations: list[ToolInvocation] = []
         artifacts: list[dict[str, Any]] = []
         # Accumulated across every round, not replaced by the last one. A turn
@@ -183,11 +314,15 @@ class Agent:
         rounds = 0
         provider_used = ""
         model_used = ""
-        failover_reason: str | None = None
 
         for round_index in range(CONFIG.max_tool_rounds):
             rounds = round_index + 1
             is_final_round = round_index == CONFIG.max_tool_rounds - 1
+
+            # Recomputed every round, not fixed before the loop: change_mode
+            # and enable_capabilities are meant to take effect mid-turn, so
+            # the tool set the model sees has to track the state it mutates.
+            schemas = None if is_final_round else schemas_for(tools_for(state))
 
             if is_final_round:
                 messages.append(
@@ -204,20 +339,30 @@ class Agent:
             try:
                 reply = await self.provider.chat(messages, None if is_final_round else schemas)
             except LlmError as exc:
+                # The rounds already run spent real tokens and may have built
+                # real things, so both are reported: the usage is recorded
+                # against the user, and the reply says what was done before
+                # the model stopped answering rather than only that it did.
+                done = _summarise_changes(artifacts)
                 return AgentResult(
-                    content=f"I could not reach the language model: {exc}",
+                    content=(
+                        f"I could not reach the language model: {exc}"
+                        + (f"\n\nBefore it stopped answering I had done this:\n\n{done}" if done else "")
+                    ),
                     tool_invocations=invocations,
                     artifacts=artifacts,
                     rounds=rounds,
+                    usage=usage,
                     latency_ms=int((time.monotonic() - started) * 1000),
                     stopped_because="llm_error",
+                    provider=provider_used,
+                    model=model_used,
                 )
 
             if reply.usage:
                 usage = _accumulate_usage(usage, reply.usage)
             provider_used = reply.provider or provider_used
             model_used = reply.model or model_used
-            failover_reason = reply.failover_reason or failover_reason
 
             content = reply.content
             calls = list(reply.tool_calls)
@@ -241,7 +386,6 @@ class Agent:
                     stopped_because=stopped_because,
                     provider=provider_used,
                     model=model_used,
-                    failover_reason=failover_reason,
                 )
 
             messages.append(
@@ -264,6 +408,11 @@ class Agent:
 
             for call in calls:
                 payload, ok, duration_ms = await self._invoke(call, cache)
+                if ok and call.name == "manage_context":
+                    # Applied here, where the message list is in hand, and
+                    # before the tool message is appended - so the model's
+                    # own view of what was pruned is accurate.
+                    self._apply_context_operations(state, messages, payload)
                 invocations.append(
                     ToolInvocation(
                         name=call.name,
@@ -303,70 +452,7 @@ class Agent:
                         stopped_because="needs_clarification",
                         provider=provider_used,
                         model=model_used,
-                        failover_reason=failover_reason,
-                    )
-
-                # propose_pipeline is terminal too: a graph that runs writes
-                # real tables the dashboards read, so the turn ends and a
-                # person decides whether it becomes one.
-                if ok and call.name == "propose_pipeline" and payload.get("pipelineProposed"):
-                    drafted = payload.get("pipeline", {})
-                    nodes = len((drafted.get("graph") or {}).get("nodes") or [])
-                    return AgentResult(
-                        content=(
-                            f"I have drafted **{drafted.get('name')}** - a {nodes}-node "
-                            "pipeline. Every node compiles against the published views, "
-                            "but nothing has run."
-                            "\n\n"
-                            "Review the graph and accept it to make it runnable."
-                        ),
-                        tool_invocations=invocations,
-                        artifacts=[
-                            *artifacts,
-                            {
-                                "kind": "pipelineProposal",
-                                "pipeline": drafted,
-                                "compiled": payload.get("compiled", []),
-                            },
-                        ],
-                        rounds=rounds,
-                        usage=usage,
-                        latency_ms=int((time.monotonic() - started) * 1000),
-                        stopped_because="awaiting_pipeline_acceptance",
-                        provider=provider_used,
-                        model=model_used,
-                        failover_reason=failover_reason,
-                    )
-
-                # propose_function is terminal for the same reason. The draft
-                # computes nothing and cannot back a dashboard, so continuing
-                # would only let the model build on a metric nobody has
-                # approved - which is precisely what the proposal step exists
-                # to prevent. The turn ends and the review dialog opens.
-                if ok and call.name == "propose_function" and payload.get("functionProposed"):
-                    proposed = payload.get("function", {})
-                    return AgentResult(
-                        content=(
-                            f"There is no published metric for that, so I have drafted one: "
-                            f"**{proposed.get('name')}**. "
-                            f"{proposed.get('description') or ''}"
-                            "\n\n"
-                            "It is saved as a proposal and computes nothing yet. Review the "
-                            "definition and approve it to start using it."
-                        ),
-                        tool_invocations=invocations,
-                        artifacts=[
-                            *artifacts,
-                            {"kind": "functionProposal", "function": proposed},
-                        ],
-                        rounds=rounds,
-                        usage=usage,
-                        latency_ms=int((time.monotonic() - started) * 1000),
-                        stopped_because="awaiting_function_approval",
-                        provider=provider_used,
-                        model=model_used,
-                        failover_reason=failover_reason,
-                    )
+                        )
 
                 messages.append(
                     {
@@ -377,11 +463,17 @@ class Agent:
                     }
                 )
 
+        done = _summarise_changes(artifacts)
         return AgentResult(
             content=(
-                "I ran out of steps before finishing that. Here is what I gathered: "
-                + ", ".join(f"{i.name}" for i in invocations[-4:])
-                + ". Ask me again more narrowly and I will get further."
+                "I ran out of steps before finishing that. "
+                + (
+                    f"This much is done:\n\n{done}\n\nAsk me to carry on and I will pick up from here."
+                    if done
+                    else "Here is what I gathered: "
+                    + ", ".join(f"{i.name}" for i in invocations[-4:])
+                    + ". Ask me again more narrowly and I will get further."
+                )
             ),
             tool_invocations=invocations,
             artifacts=artifacts,
@@ -391,7 +483,6 @@ class Agent:
             stopped_because="round_budget_exhausted",
             provider=provider_used,
             model=model_used,
-            failover_reason=failover_reason,
         )
 
     async def _invoke(
@@ -411,9 +502,63 @@ class Agent:
         started = time.monotonic()
         payload, ok = await run_tool(call.name, call.arguments)
         duration_ms = int((time.monotonic() - started) * 1000)
-        if ok:
+        if ok and call.name in WRITE_TOOLS:
+            # Something changed, so every answer read before it may be stale:
+            # list_object_types after create_object_type must see the new type.
+            cache.clear()
+        elif ok:
             cache[key] = payload
         log.info(
             "tool %s %s in %dms", call.name, "ok" if ok else "FAILED", duration_ms
         )
         return payload, ok, duration_ms
+
+    def _apply_context_operations(
+        self,
+        state: SessionAgentState,
+        messages: list[dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> None:
+        """Hide or restore tool results named by manage_context, in place.
+
+        Hidden content is stashed on the turn's state keyed by tool_call id,
+        so unhide restores exactly what was hidden and the message dicts
+        themselves never carry extra keys - what reaches the provider stays
+        strictly OpenAI-shaped. Hiding only ever matches results already in
+        the transcript; the result of the manage_context call itself is
+        appended afterwards and is always kept.
+        """
+        applied_hide: list[str] = []
+        applied_unhide: list[str] = []
+
+        for name in state.pending_hide:
+            hidden = 0
+            for message in messages:
+                if (
+                    message.get("role") == "tool"
+                    and message.get("name") == name
+                    and message["tool_call_id"] not in state.stashed
+                ):
+                    state.stashed[message["tool_call_id"]] = message["content"]
+                    message["content"] = (
+                        f"[hidden by manage_context: the {name} result was pruned "
+                        "for the rest of this turn; call manage_context with "
+                        f"unhide=[\"{name}\"] to restore it]"
+                    )
+                    hidden += 1
+            if hidden:
+                applied_hide.append(name)
+
+        for name in state.pending_unhide:
+            for message in messages:
+                if (
+                    message.get("role") == "tool"
+                    and message.get("name") == name
+                    and message["tool_call_id"] in state.stashed
+                ):
+                    message["content"] = state.stashed.pop(message["tool_call_id"])
+                    applied_unhide.append(name)
+
+        state.pending_hide = []
+        state.pending_unhide = []
+        payload["applied"] = {"hidden": applied_hide, "unhidden": applied_unhide}

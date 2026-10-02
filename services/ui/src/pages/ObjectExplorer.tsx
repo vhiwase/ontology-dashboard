@@ -8,6 +8,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
 	type LinkSummary,
 	type ObjectTypeDetail,
@@ -20,6 +21,7 @@ import {
 	round,
 } from "../api";
 import { useSpace } from "../SpaceContext";
+import { NoObjectTypesYet } from "../components/ontology/NoObjectTypesYet";
 import {
 	DataTable,
 	Empty,
@@ -65,7 +67,9 @@ const OP_LABELS: Record<string, string> = {
 
 export function ObjectExplorer() {
 	const [types, setTypes] = useState<ObjectTypeSummary[] | null>(null);
-	const [typeName, setTypeName] = useState<string>("Order");
+	// A link from elsewhere (the home page's model list) can name the type.
+	const [params] = useSearchParams();
+	const [typeName, setTypeName] = useState<string>(() => params.get("type") ?? "Order");
 	const [detail, setDetail] = useState<ObjectTypeDetail | null>(null);
 	const [filters, setFilters] = useState<FilterRow[]>([]);
 	const [search, setSearch] = useState("");
@@ -180,6 +184,7 @@ export function ObjectExplorer() {
 	if (missing)
 		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (!types) return <Spinner label="Loading object types" />;
+	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
 		<div className="col" style={{ gap: 12 }}>

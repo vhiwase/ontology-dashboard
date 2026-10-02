@@ -1,11 +1,16 @@
-/** Overview: what this platform is, what is in it, and how much of it is real. */
+/**
+ * Overview: the one path data takes through this platform, counted for the
+ * space you are in, and the next step along it.
+ *
+ *   connection -> sync (scheduled) -> dataset -> object type -> metrics, actions
+ */
 
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { type PlatformStats, api, isMissingOntology, round } from "../api";
 import { useSpace } from "../SpaceContext";
 import { Chart } from "../components/Chart";
-import { DataTable, ErrorBanner, NoOntologyHere, Spinner } from "../components/common";
+import { Empty, ErrorBanner, NoOntologyHere, Spinner } from "../components/common";
 
 export function Overview() {
 	const [stats, setStats] = useState<PlatformStats | null>(null);
@@ -25,135 +30,126 @@ export function Overview() {
 			);
 	};
 
-	// The summary counts one space's ontology, so it reloads when the space does.
+	// The summary counts one space, so it reloads when the space does.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: load is stable enough here; the space is the input.
 	useEffect(load, [spaceSlug]);
 
-	if (missing)
-		return <NoOntologyHere what="published ontology" spaceName={space?.name ?? spaceSlug} />;
+	if (missing) return <NoOntologyHere what="ontology" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
 	if (!stats) return <Spinner label="Loading platform summary" />;
 
-	const { counts } = stats;
-	const coverage = stats.dataCoverage.map((row) => ({
-		label: row.metric_area,
-		value: row.source_coverage_pct === null ? 0 : Number(row.source_coverage_pct),
-	}));
-	const measuredAreas = stats.dataCoverage.filter(
-		(row) => Number(row.source_coverage_pct ?? 0) >= 100,
-	).length;
+	const { counts, flow } = stats;
+	const valid = stats.ontology.validation?.valid !== false;
+
+	const stages = [
+		{
+			label: "Connections",
+			value: flow.connections,
+			foot: "PostgreSQL sources",
+			to: "/browse/connections",
+		},
+		{
+			label: "Syncs",
+			value: flow.syncs,
+			foot: `${flow.schedules} on a schedule`,
+			to: "/schedules",
+		},
+		{
+			label: "Datasets",
+			value: flow.datasets,
+			foot: flow.lastSyncAt ? `last synced ${new Date(flow.lastSyncAt).toLocaleString()}` : "nothing synced yet",
+			to: "/browse/datasets",
+		},
+		{
+			label: "Object types",
+			value: counts.objectTypes,
+			foot: `${counts.objects.toLocaleString()} objects, ${counts.linkTypes} links`,
+			to: "/ontology",
+		},
+		{
+			label: "Metrics · actions",
+			value: counts.kpis + counts.actionTypes,
+			foot: `${counts.kpis} metrics, ${counts.actionTypes} actions, ${flow.functions} functions`,
+			to: "/browse/metrics",
+		},
+	];
 
 	return (
 		<div className="col" style={{ gap: 14 }}>
 			<div className="card">
 				<div className="card-head">
-					<h3>TMS Transport Management Ontology</h3>
-					<span className="sub">
-						v{stats.ontology.version} · generated {new Date(stats.ontology.createdAt).toLocaleString()}
-					</span>
+					<h3>{stats.ontology.label ?? "TMS Ontology"}</h3>
+					<span className="sub">v{stats.ontology.version}</span>
 				</div>
 				<p className="secondary" style={{ margin: "0 0 10px", maxWidth: 860 }}>
-					{stats.ontology.description}
+					A PostgreSQL connection syncs views into datasets exactly as they are, on the schedule you
+					choose. Object types are created from those datasets, and the links, metrics, actions and
+					functions on them are what dashboards and the AI-FDE answer from.
 				</p>
 				<div className="row" style={{ gap: 6 }}>
-					<span className="chip good">
+					<span className={`chip ${valid ? "good" : "critical"}`}>
 						<span className="dot" aria-hidden />
-						ontology validates
+						{valid ? "ontology validates" : "ontology has validation errors"}
 					</span>
 					<span className="chip">{counts.objectTypes} object types</span>
-					<span className="chip">{counts.linkTypes} link types</span>
+					<span className="chip">{counts.linkTypes} links</span>
 					<span className="chip">{counts.actionTypes} actions</span>
-					<span className="chip">{counts.kpis} KPIs</span>
+					<span className="chip">{counts.kpis} metrics</span>
 				</div>
 			</div>
 
-			<div className="grid grid-4">
-				<Tile label="Objects" value={counts.objects.toLocaleString()} foot={`across ${counts.objectTypes} types`} />
-				<Tile
-					label="Properties"
-					value={counts.properties.toLocaleString()}
-					foot="classified by semantic role"
-				/>
-				<Tile
-					label="Link types"
-					value={String(counts.linkTypes)}
-					foot={`${counts.completeLinks} resolve every reference`}
-				/>
-				<Tile
-					label="Measured metric areas"
-					value={`${measuredAreas} of ${stats.dataCoverage.length}`}
-					foot="the rest are absent from the source, not estimated"
-				/>
+			<div className="grid grid-5">
+				{stages.map((stage, index) => (
+					<Link key={stage.label} to={stage.to} className="card stat" style={{ textDecoration: "none" }}>
+						<div className="label">
+							{index + 1}. {stage.label}
+						</div>
+						<div className="value">{stage.value.toLocaleString()}</div>
+						<div className="foot">{stage.foot}</div>
+					</Link>
+				))}
 			</div>
+
+			<NextStep stats={stats} />
 
 			<div className="grid grid-2">
 				<div className="card">
 					<div className="card-head">
-						<h3>Data coverage</h3>
-						<span className="sub">share of rows that came from the captured TMS payloads</span>
+						<h3>Objects by type</h3>
+						<span className="sub">rows in each type's dataset, as of its last sync</span>
 					</div>
-					<Chart kind="hbar" points={coverage} format="percent" />
-					<p className="muted" style={{ fontSize: 11.5, marginBottom: 0, marginTop: 10 }}>
-						The captured snapshot is a planning snapshot: it records what was intended,
-						not what happened. It carries no arrivals, no distances and no carrier
-						assignments, so the metrics that would need them are not published - an
-						area at 0% is absent at source, not filled in. See{" "}
-						<Link to="/dashboards/data-trust">Data Trust</Link>.
-					</p>
+					{stats.objectTypes.length === 0 ? (
+						<Empty>No object types yet.</Empty>
+					) : (
+						<Chart
+							kind="hbar"
+							points={stats.objectTypes.map((type) => ({ label: type.label, value: type.objects }))}
+							format="integer"
+						/>
+					)}
 				</div>
 
 				<div className="card">
 					<div className="card-head">
-						<h3>Exception worklist</h3>
-						<span className="sub">what an operations lead opens the day with</span>
-					</div>
-					<DataTable
-						columns={[
-							{ key: "exception_type", label: "Exception" },
-							{ key: "object_type", label: "Object" },
-							{ key: "severity", label: "Severity" },
-							{ key: "item_count", label: "Items", numeric: true },
-						]}
-						rows={stats.exceptions as unknown as Array<Record<string, unknown>>}
-						maxHeight={320}
-					/>
-				</div>
-			</div>
-
-			<div className="grid grid-2">
-				<div className="card">
-					<div className="card-head">
-						<h3>Object types by domain</h3>
-					</div>
-					<Chart
-						kind="hbar"
-						points={stats.groups.map((group) => ({ label: group.group, value: group.objects }))}
-						format="integer"
-					/>
-				</div>
-
-				<div className="card">
-					<div className="card-head">
-						<h3>How this was built</h3>
+						<h3>How data gets here</h3>
 					</div>
 					<ol className="secondary" style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.8 }}>
 						<li>
-							Captured TMS REST payloads landed into <code>tms_raw</code> (19 endpoints).
+							A <Link to="/browse/connections">connection</Link> names a PostgreSQL host and the
+							secret its password is in - never the password.
 						</li>
 						<li>
-							Semantic views in <code>tms_views</code> reshaped them into business language.
+							A sync copies one view into a <Link to="/browse/datasets">dataset</Link>, as it is, and
+							a <Link to="/schedules">schedule</Link> refreshes it: every 20 minutes, 2 hours, a day,
+							8 days.
 						</li>
 						<li>
-							The pipeline introspected those views and emitted this ontology: one object
-							type per view, properties classified by role, link types probed against the
-							real data.
+							An <Link to="/ontology">object type</Link> is created from a dataset, a property per
+							column; its primary key is checked unique against the data.
 						</li>
 						<li>
-							A curated KPI catalogue and an action layer were registered on top.
-						</li>
-						<li>
-							A six-layer <Link to="/lineage">lineage graph</Link> records where every
-							figure comes from.
+							Links are measured against the data, metrics are computed once before they are kept,
+							actions are staged, and functions wait for an admin.
 						</li>
 					</ol>
 					<div className="row" style={{ marginTop: 12, gap: 6 }}>
@@ -161,40 +157,62 @@ export function Overview() {
 							Browse the ontology
 						</Link>
 						<Link className="btn primary" to="/assistant">
-							Ask the assistant
+							Ask the AI-FDE
 						</Link>
 					</div>
 				</div>
-			</div>
-
-			<div className="card">
-				<div className="card-head">
-					<h3>Recent pipeline runs</h3>
-				</div>
-				<DataTable
-					columns={[
-						{ key: "generation_run_id", label: "Run", numeric: true },
-						{ key: "status", label: "Status" },
-						{ key: "views_scanned", label: "Views", numeric: true },
-						{ key: "object_types", label: "Object types", numeric: true },
-						{ key: "link_types", label: "Links", numeric: true },
-						{ key: "kpis", label: "KPIs", numeric: true },
-						{ key: "lineage_nodes", label: "Lineage nodes", numeric: true },
-						{ key: "finished_at", label: "Finished" },
-					]}
-					rows={stats.generationRuns}
-				/>
 			</div>
 		</div>
 	);
 }
 
-function Tile({ label, value, foot }: { label: string; value: string; foot: string }) {
+/** The next thing to do, from what this space has and has not got yet. */
+function NextStep({ stats }: { stats: PlatformStats }) {
+	const { flow, counts } = stats;
+	const build = encodeURIComponent(
+		"Create object types from every synced dataset that is not modelled yet, link them, and add " +
+			"the metrics and actions that are useful for running freight operations.",
+	);
+
+	let message: string;
+	let action: { to: string; label: string } | null;
+	if (flow.connections === 0) {
+		message = "Register a PostgreSQL connection to bring data in.";
+		action = { to: "/browse/connections", label: "Add a connection" };
+	} else if (flow.datasets === 0) {
+		message = "Sync a view from a connection: it lands as a dataset, exactly as it is.";
+		action = { to: "/browse/connections", label: "Sync a view" };
+	} else if (counts.objectTypes < flow.datasets) {
+		message =
+			`${flow.datasets} dataset${flow.datasets === 1 ? "" : "s"} synced, ${counts.objectTypes} ` +
+			"object type" +
+			(counts.objectTypes === 1 ? "" : "s") +
+			" made from them. Model the rest - by hand from a dataset's page, or let the AI-FDE build them with links, metrics and actions.";
+		action = { to: `/assistant?prompt=${build}`, label: "Build with the AI-FDE" };
+	} else if (flow.schedules < flow.syncs) {
+		message = `${flow.syncs - flow.schedules} sync(s) run only when someone runs them. Give them a cadence to keep the datasets fresh.`;
+		action = { to: "/browse/connections", label: "Set a schedule" };
+	} else if (counts.kpis === 0) {
+		message = "The ontology has no metrics yet. Define the numbers a dashboard should show.";
+		action = { to: "/assistant", label: "Ask the AI-FDE" };
+	} else {
+		message = "Every dataset is modelled and refreshing on a schedule. Build a dashboard on the metrics.";
+		action = { to: "/dashboards", label: "Open dashboards" };
+	}
+
 	return (
-		<div className="card stat">
-			<div className="label">{label}</div>
-			<div className="value">{value}</div>
-			<div className="foot">{foot}</div>
+		<div className="card">
+			<div className="row" style={{ gap: 10 }}>
+				<strong style={{ fontSize: 13 }}>Next</strong>
+				<span className="secondary" style={{ flex: "1 1 auto" }}>
+					{message}
+				</span>
+				{action && (
+					<Link className="btn primary sm" to={action.to}>
+						{action.label}
+					</Link>
+				)}
+			</div>
 		</div>
 	);
 }

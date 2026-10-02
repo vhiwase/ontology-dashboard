@@ -50,10 +50,8 @@ def rates() -> dict[str, Rate]:
             output_per_m=_rate("COST_AZURE_OUTPUT_PER_M", 8.00),
             source="configured" if os.environ.get("COST_AZURE_INPUT_PER_M") else "list price (verify)",
         ),
-        # Self-hosted: no per-token charge. Not free in reality - it burns
-        # electricity and hardware - but there is no per-call price to attribute,
-        # and inventing one would make the comparison with Azure dishonest.
-        "ollama": Rate(0.0, 0.0, "self-hosted, no per-token charge"),
+        # The built-in planner calls no model, so a turn it answers costs nothing.
+        "builtin": Rate(input_per_m=0.0, output_per_m=0.0, source="no model"),
     }
 
 

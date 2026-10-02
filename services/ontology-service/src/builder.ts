@@ -1,41 +1,35 @@
 /**
- * The Ontology Builder: editing an ontology that a pipeline generates.
+ * The Ontology Builder: editing the authored ontology, and its journal.
  *
- * Those two things are in tension, and resolving it is most of what this
- * module is. The pipeline introspects the views and publishes a NEW
- * ontology_version on every run; nothing carries forward. So writing an edit
- * straight into object_type would work until the next run and then vanish
- * without a word.
+ * The ontology is one living version per space, built from datasets (see
+ * authoring.ts). Every change here is done twice, in one request:
  *
- * Each edit is therefore done twice:
- *
- *   1. applied to the live version, so the UI changes immediately;
- *   2. journalled to platform.ontology_edit, keyed by RID rather than row id,
- *      so the pipeline can replay it onto the next version it publishes.
- *
- * That is what makes a hand-drawn link survive regeneration.
+ *   1. applied to the ontology tables, then published - the document rebuilt,
+ *      the registry reloaded, the workspace cards refreshed (definition.ts);
+ *   2. journalled to platform.ontology_edit, so "who changed this label, when,
+ *      and from what" has an answer, and an edit can be undone.
  *
  * ── what cannot be edited ──────────────────────────────────────────────────
  * api_name, the RID, and source_view are fixed. The first two are how
- * everything else refers to the type — dashboards, saved queries, the
- * assistant, the journal itself. source_view is what the ontology is derived
- * FROM: repointing it would not move the data, it would just make the type
- * describe something it is not.
+ * everything else refers to the type - dashboards, metrics, the assistant,
+ * the journal itself. source_view is the dataset the type was created from:
+ * repointing it would not move the data, it would just make the type describe
+ * something it is not.
  */
 
 import { query, queryOne } from "./db";
-import { clearColumnCache } from "./kpi";
+import { activeVersion, NAMESPACE, publishChange } from "./definition";
 import {
 	BadRequest,
 	currentSpace,
 	getRegistry,
-	loadRegistry,
 	NotFound,
 	quoteIdentifier,
+	quoteQualified,
 	resolveObjectType,
 } from "./registry";
 
-export type EditKind = "objectType" | "property" | "linkType" | "actionType";
+export type EditKind = "objectType" | "property" | "linkType" | "actionType" | "metric";
 
 export interface EditRecord {
 	id: number;
@@ -54,11 +48,10 @@ export interface EditRecord {
  * Fields a caller may set, per kind.
  *
  * An allow-list, not a deny-list. These become column names in an UPDATE, so
- * anything not named here never reaches SQL — the same reasoning as the
- * pipeline compiler, and the reason a request body cannot rename api_name by
- * simply including it.
+ * anything not named here never reaches SQL - and the reason a request body
+ * cannot rename api_name by simply including it.
  */
-const EDITABLE: Record<EditKind, Record<string, string>> = {
+const EDITABLE: Record<Exclude<EditKind, "metric">, Record<string, string>> = {
 	objectType: {
 		label: "label",
 		pluralLabel: "plural_label",
@@ -98,7 +91,7 @@ const EDITABLE: Record<EditKind, Record<string, string>> = {
 };
 
 /** Values that are constrained by a CHECK, validated before they reach it. */
-const ENUMS: Record<string, string[]> = {
+export const ENUMS: Record<string, string[]> = {
 	kind: ["entity", "event", "role", "value"],
 	semantic_role: [
 		"identity",
@@ -115,30 +108,15 @@ const ENUMS: Record<string, string[]> = {
 	default_aggregation: ["sum", "avg", "count", "min", "max"],
 };
 
-const TABLE: Record<EditKind, { table: string; ridColumn: string }> = {
-	objectType: { table: "platform.object_type", ridColumn: "object_type_rid" },
-	property: { table: "platform.object_property", ridColumn: "object_property_rid" },
-	linkType: { table: "platform.link_type", ridColumn: "link_type_rid" },
-	actionType: { table: "platform.action_type", ridColumn: "action_type_rid" },
+const TABLE: Record<EditKind, { table: string; ridColumn: string; versioned: boolean }> = {
+	objectType: { table: "platform.object_type", ridColumn: "object_type_rid", versioned: true },
+	property: { table: "platform.object_property", ridColumn: "object_property_rid", versioned: true },
+	linkType: { table: "platform.link_type", ridColumn: "link_type_rid", versioned: true },
+	actionType: { table: "platform.action_type", ridColumn: "action_type_rid", versioned: true },
+	metric: { table: "platform.kpi_definition", ridColumn: "kpi_rid", versioned: false },
 };
 
 // ── helpers ─────────────────────────────────────────────────────────────────
-
-async function activeVersionId(): Promise<number> {
-	const row = await queryOne<{ ontology_version_id: number }>(
-		`SELECT v.ontology_version_id
-		   FROM platform.ontology_version v
-		   JOIN platform.space s ON s.space_id = v.space_id
-		  WHERE v.is_active AND s.slug = $1`,
-		[currentSpace()],
-	);
-	if (!row) {
-		throw new BadRequest(
-			`No ontology is published in the '${currentSpace()}' space, so there is nothing to edit.`,
-		);
-	}
-	return row.ontology_version_id;
-}
 
 async function spaceId(): Promise<number> {
 	const row = await queryOne<{ space_id: number }>(
@@ -146,21 +124,23 @@ async function spaceId(): Promise<number> {
 		[currentSpace()],
 	);
 	if (!row) throw new NotFound(`No space '${currentSpace()}'.`);
-	return row.space_id;
+	return Number(row.space_id);
 }
 
 /**
  * Turn a caller's field map into columns and values.
  *
- * Returns the SQL column names paired with bound values. A key that is not in
- * the allow-list is refused by name, so a typo is corrected rather than
- * silently ignored — an edit that appears to work and does nothing is the
- * worst outcome here.
+ * A key that is not in the allow-list is refused by name, so a typo is
+ * corrected rather than silently ignored - an edit that appears to work and
+ * does nothing is the worst outcome here.
  */
 export function resolveFields(
 	kind: EditKind,
 	payload: Record<string, unknown>,
 ): Array<{ column: string; value: unknown }> {
+	if (kind === "metric") {
+		throw new BadRequest("A metric is changed by deleting it and creating it again.");
+	}
 	const allowed = EDITABLE[kind];
 	const fields: Array<{ column: string; value: unknown }> = [];
 
@@ -179,9 +159,6 @@ export function resolveFields(
 			);
 		}
 
-		// Arrays and objects are stored as JSON/text[]; everything else binds
-		// directly. Kept explicit so a caller cannot pass an object where a
-		// scalar column is expected and get a confusing driver error.
 		fields.push({ column, value: value === undefined ? null : value });
 	}
 
@@ -204,20 +181,14 @@ async function readPrevious(
 		[rid, versionId],
 	);
 	if (!row) {
-		throw new NotFound(`No ${kind} '${rid}' in the published ontology.`);
+		throw new NotFound(`No ${kind} '${rid}' in this space's ontology.`);
 	}
 	return row;
 }
 
 // ── editing ─────────────────────────────────────────────────────────────────
 
-/**
- * Change fields on an existing ontology object.
- *
- * Applies to the live version and records the intention. Both, or neither:
- * a journal entry whose edit did not land would be replayed onto the next
- * version and re-appear as if from nowhere.
- */
+/** Change fields on an existing ontology object, and record the change. */
 export async function editOntologyObject(
 	kind: EditKind,
 	rid: string,
@@ -225,7 +196,7 @@ export async function editOntologyObject(
 	editedBy: string,
 	note?: string,
 ): Promise<EditRecord> {
-	const versionId = await activeVersionId();
+	const { id: versionId } = await activeVersion();
 	const fields = resolveFields(kind, payload);
 	const previous = await readPrevious(
 		kind,
@@ -246,15 +217,12 @@ export async function editOntologyObject(
 	);
 
 	const record = await journal(kind, rid, "update", payload, previous, editedBy, note);
-
-	// The registry is an in-memory copy of these tables, so it has to be
-	// rebuilt or the UI keeps showing the old label until the next restart.
-	await refresh();
+	await publishChange();
 	return record;
 }
 
-/** Record the intention, so the next publish can re-apply it. */
-async function journal(
+/** Record a change in this space's journal. */
+export async function journal(
 	kind: EditKind,
 	rid: string,
 	operation: "create" | "update" | "delete",
@@ -284,7 +252,7 @@ async function journal(
 	);
 
 	return {
-		id: row?.ontology_edit_id ?? 0,
+		id: Number(row?.ontology_edit_id ?? 0),
 		targetKind: kind,
 		targetRid: rid,
 		operation,
@@ -297,12 +265,7 @@ async function journal(
 	};
 }
 
-async function refresh(): Promise<void> {
-	clearColumnCache();
-	await loadRegistry();
-}
-
-// ── links (§9) ──────────────────────────────────────────────────────────────
+// ── links ───────────────────────────────────────────────────────────────────
 
 export interface CreateLinkRequest {
 	apiName: string;
@@ -313,54 +276,113 @@ export interface CreateLinkRequest {
 	sourceProperty: string;
 	targetProperty: string;
 	cardinality?: string;
+	inverseApiName?: string;
 	inverseLabel?: string;
 }
 
 /**
- * Draw a link by hand.
+ * A camelCase handle for the objects on the other side of a link: from a
+ * Location, its `originOrders`. Relation ids are unique across the whole
+ * ontology, so the plain plural goes to the first link that wants it and later
+ * ones are named for their role (origin, destination), then for the target.
+ */
+export function inverseNameFor(
+	sourceApiName: string,
+	targetApiName: string,
+	linkApiName: string,
+	taken: Set<string>,
+): string {
+	const upper = (text: string) => text.charAt(0).toUpperCase() + text.slice(1);
+	const lower = (text: string) => text.charAt(0).toLowerCase() + text.slice(1);
+	const plural = sourceApiName.endsWith("s") ? `${sourceApiName}es` : `${sourceApiName}s`;
+
+	// orderOriginLocation, from Order to Location, plays the role "origin".
+	let role = linkApiName;
+	if (role.toLowerCase().startsWith(sourceApiName.toLowerCase())) role = role.slice(sourceApiName.length);
+	if (role.toLowerCase().endsWith(targetApiName.toLowerCase())) role = role.slice(0, -targetApiName.length);
+
+	const candidates = [
+		lower(plural),
+		role ? `${lower(role)}${plural}` : "",
+		`${lower(targetApiName)}${plural}`,
+		`${lower(plural)}Via${upper(linkApiName)}`,
+	].filter(Boolean);
+	return candidates.find((name) => !taken.has(name) && name !== linkApiName) ?? candidates[candidates.length - 1]!;
+}
+
+/** How much of a join between two properties actually resolves. */
+export async function measureJoin(
+	source: { sourceView: string },
+	sourceColumn: string,
+	target: { sourceView: string },
+	targetColumn: string,
+): Promise<{ matched: number; candidates: number; matchRatio: number }> {
+	// Both identifiers came from the registry, so they are safe to quote here.
+	const measured = await queryOne<{ candidates: string; matched: string }>(
+		`SELECT count(*)::text AS candidates,
+		        count(*) FILTER (WHERE EXISTS (
+		          SELECT 1 FROM ${quoteQualified(target.sourceView)} t
+		           WHERE t.${quoteIdentifier(targetColumn)}::text = s.${quoteIdentifier(sourceColumn)}::text
+		        ))::text AS matched
+		   FROM ${quoteQualified(source.sourceView)} s
+		  WHERE s.${quoteIdentifier(sourceColumn)} IS NOT NULL`,
+	);
+	const candidates = Number(measured?.candidates ?? 0);
+	const matched = Number(measured?.matched ?? 0);
+	return { matched, candidates, matchRatio: candidates === 0 ? 0 : matched / candidates };
+}
+
+/**
+ * Draw a link between two object types.
  *
  * Both ends are resolved through the registry, so the columns named really
- * exist on the views involved. The match ratio is then MEASURED rather than
- * assumed: a hand-drawn link that resolves 12% of its rows is a different
- * thing from one that resolves all of them, and the person drawing it should
- * find that out here rather than from a half-empty table later.
+ * exist on the datasets involved. The match ratio is then MEASURED rather than
+ * assumed: a link that resolves 12% of its rows is a different thing from one
+ * that resolves all of them, and the person - or the assistant - drawing it
+ * should find that out here. A link where no value matches at all is refused:
+ * it would only ever traverse to nothing.
  */
 export async function createLinkType(
 	request: CreateLinkRequest,
 	createdBy: string,
 ): Promise<{ link: Record<string, unknown>; matchRatio: number; matched: number; candidates: number }> {
-	const versionId = await activeVersionId();
+	const { id: versionId } = await activeVersion();
 
 	const apiName = String(request.apiName ?? "").trim();
 	if (!/^[a-z][A-Za-z0-9]*$/.test(apiName)) {
 		throw new BadRequest(
-			"A link's api name must be camelCase and start with a lowercase letter, e.g. orderPlacedByAccount.",
+			"A link's api name must be camelCase and start with a lowercase letter, e.g. orderAccount.",
 		);
 	}
 
 	const source = resolveObjectType(String(request.sourceObjectType ?? ""));
 	const target = resolveObjectType(String(request.targetObjectType ?? ""));
 
-	// resolveColumn is what keeps this safe: a column name from a form is
-	// matched against the registry and only its real SQL column is used.
-	const sourceProperty = source.propertyByApiName.get(String(request.sourceProperty)) ??
+	const sourceProperty =
+		source.propertyByApiName.get(String(request.sourceProperty)) ??
 		source.propertyBySqlColumn.get(String(request.sourceProperty));
-	const targetProperty = target.propertyByApiName.get(String(request.targetProperty)) ??
+	const targetProperty =
+		target.propertyByApiName.get(String(request.targetProperty)) ??
 		target.propertyBySqlColumn.get(String(request.targetProperty));
 
 	if (!sourceProperty) {
 		throw new BadRequest(
-			`'${request.sourceProperty}' is not a property of ${source.apiName}.`,
+			`'${request.sourceProperty}' is not a property of ${source.apiName}. It has: ` +
+				source.properties.map((p) => p.apiName).join(", "),
 		);
 	}
 	if (!targetProperty) {
 		throw new BadRequest(
-			`'${request.targetProperty}' is not a property of ${target.apiName}.`,
+			`'${request.targetProperty}' is not a property of ${target.apiName}. It has: ` +
+				target.properties.map((p) => p.apiName).join(", "),
 		);
 	}
 
 	const registry = getRegistry();
-	if (registry.linkTypeByApiName.has(apiName)) {
+	const relationIds = new Set(
+		registry.linkTypes.flatMap((link) => [link.apiName, link.inverseApiName ?? ""]),
+	);
+	if (relationIds.has(apiName)) {
 		throw new BadRequest(`A link called '${apiName}' already exists.`);
 	}
 
@@ -371,70 +393,78 @@ export async function createLinkType(
 		);
 	}
 
-	// Measure how much of the join actually resolves. Both identifiers came
-	// from the registry, so they are safe to quote into this query.
-	const measured = await queryOne<{ candidates: string; matched: string }>(
-		`SELECT count(*)::text AS candidates,
-		        count(t.${quoteIdentifier(targetProperty.sqlColumn)})::text AS matched
-		   FROM ${source.sourceView} s
-		   LEFT JOIN ${target.sourceView} t
-		     ON s.${quoteIdentifier(sourceProperty.sqlColumn)}::text
-		      = t.${quoteIdentifier(targetProperty.sqlColumn)}::text
-		  WHERE s.${quoteIdentifier(sourceProperty.sqlColumn)} IS NOT NULL`,
+	const inverseApiName =
+		request.inverseApiName?.trim() || inverseNameFor(source.apiName, target.apiName, apiName, relationIds);
+	if (!/^[a-z][A-Za-z0-9]*$/.test(inverseApiName) || relationIds.has(inverseApiName) || inverseApiName === apiName) {
+		throw new BadRequest(`'${inverseApiName}' cannot be the inverse's name: it is taken or not camelCase.`);
+	}
+
+	const { matched, candidates, matchRatio } = await measureJoin(
+		source,
+		sourceProperty.sqlColumn,
+		target,
+		targetProperty.sqlColumn,
 	);
+	if (candidates > 0 && matched === 0) {
+		throw new BadRequest(
+			`None of the ${candidates} ${source.apiName}.${sourceProperty.apiName} values appear in ` +
+				`${target.apiName}.${targetProperty.apiName}, so this link would never lead anywhere. ` +
+				"Check the two properties hold the same kind of key.",
+		);
+	}
 
-	const candidates = Number(measured?.candidates ?? 0);
-	const matched = Number(measured?.matched ?? 0);
-	const matchRatio = candidates === 0 ? 0 : matched / candidates;
-
-	const rid = `tms:${apiName}`;
+	const rid = `${NAMESPACE}:${apiName}`;
+	const label = request.label?.trim() || target.label;
+	const inverseLabel = request.inverseLabel?.trim() || source.pluralLabel || `${source.label}s`;
 	await query(
 		`INSERT INTO platform.link_type
 		   (link_type_rid, ontology_version_id, api_name, label, description,
 		    source_object_type, target_object_type, source_column, target_column,
-		    cardinality, inverse_label, discovery_method, match_ratio, matched_rows,
-		    candidate_rows, is_verified, is_user_defined)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'manual',$12,$13,$14,false,true)`,
+		    cardinality, inverse_api_name, inverse_label, discovery_method, match_ratio,
+		    matched_rows, candidate_rows, is_verified, is_user_defined)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'manual',$13,$14,$15,$16,true)`,
 		[
 			rid,
 			versionId,
 			apiName,
-			request.label?.trim() || apiName,
+			label,
 			request.description ?? null,
 			source.rid,
 			target.rid,
 			sourceProperty.sqlColumn,
 			targetProperty.sqlColumn,
 			cardinality,
-			request.inverseLabel ?? null,
+			inverseApiName,
+			inverseLabel,
 			matchRatio.toFixed(4),
 			matched,
 			candidates,
+			// A link that resolves every reference is verified by the data itself.
+			candidates > 0 && matched === candidates,
 		],
 	);
 
-	// Journalled with the full definition, because replay has to RE-CREATE this
-	// link on the next version - the pipeline will never discover it.
 	await journal(
 		"linkType",
 		rid,
 		"create",
 		{
 			apiName,
-			label: request.label?.trim() || apiName,
+			label,
 			description: request.description ?? null,
 			sourceObjectType: source.apiName,
 			targetObjectType: target.apiName,
-			sourceProperty: sourceProperty.sqlColumn,
-			targetProperty: targetProperty.sqlColumn,
+			sourceProperty: sourceProperty.apiName,
+			targetProperty: targetProperty.apiName,
 			cardinality,
-			inverseLabel: request.inverseLabel ?? null,
+			inverseApiName,
+			inverseLabel,
 		},
 		{},
 		createdBy,
 	);
 
-	await refresh();
+	await publishChange();
 	const link = getRegistry().linkTypeByApiName.get(apiName);
 	return {
 		link: (link ?? {}) as unknown as Record<string, unknown>,
@@ -444,51 +474,68 @@ export async function createLinkType(
 	};
 }
 
+// ── deleting ────────────────────────────────────────────────────────────────
+
+export type DeletableKind = "objectType" | "linkType" | "actionType" | "metric";
+
+/** What still refers to an object type, which must go before it can. */
+function dependentsOf(typeRid: string): string[] {
+	const registry = getRegistry();
+	return [
+		...registry.linkTypes
+			.filter((link) => link.sourceObjectType === typeRid || link.targetObjectType === typeRid)
+			.map((link) => `link ${link.apiName}`),
+		...registry.actionTypes
+			.filter((action) => action.targetObjectTypes.includes(typeRid))
+			.map((action) => `action ${action.apiName}`),
+		...registry.kpis
+			.filter((kpi) => kpi.relatedObjectTypes.includes(typeRid))
+			.map((kpi) => `metric ${kpi.apiName}`),
+	];
+}
+
 /**
  * Remove an ontology object.
  *
- * Only ones a person created. A pipeline-discovered link describes something
- * that is really in the data, and deleting it here would simply be undone by
- * the next run — so the refusal explains that rather than pretending.
+ * An object type with links, actions or metrics on it is refused with their
+ * names, rather than taking them with it: deleting one card should not quietly
+ * empty three pages. The create in the journal is withdrawn, and the delete
+ * recorded, so the history says what happened.
  */
 export async function deleteOntologyObject(
-	kind: "linkType" | "actionType",
+	kind: DeletableKind,
 	rid: string,
 	deletedBy: string,
 ): Promise<void> {
-	const versionId = await activeVersionId();
-	const { table, ridColumn } = TABLE[kind];
+	const { id: versionId } = await activeVersion();
+	const { table, ridColumn, versioned } = TABLE[kind];
 
-	const row = await queryOne<{ is_user_defined: boolean; api_name: string }>(
-		`SELECT is_user_defined, api_name FROM ${table}
-		  WHERE ${quoteIdentifier(ridColumn)} = $1 AND ontology_version_id = $2`,
-		[rid, versionId],
-	);
-	if (!row) throw new NotFound(`No ${kind} '${rid}'.`);
-
-	if (!row.is_user_defined) {
-		throw new BadRequest(
-			`'${row.api_name}' was discovered by the pipeline from the data itself, so deleting ` +
-				`it here would be undone by the next run. Edit the pipeline, or hide it instead.`,
-		);
+	if (kind === "objectType") {
+		const dependents = dependentsOf(rid);
+		if (dependents.length > 0) {
+			throw new BadRequest(
+				`${rid} is still used by ${dependents.join(", ")}. Delete those first.`,
+			);
+		}
 	}
 
-	await query(
-		`DELETE FROM ${table} WHERE ${quoteIdentifier(ridColumn)} = $1 AND ontology_version_id = $2`,
-		[rid, versionId],
+	const scope = versioned ? "ontology_version_id = $2" : "space_id = $2";
+	const scopeValue = versioned ? versionId : await spaceId();
+	const row = await queryOne<{ api_name: string }>(
+		`DELETE FROM ${table} WHERE ${quoteIdentifier(ridColumn)} = $1 AND ${scope} RETURNING api_name`,
+		[rid, scopeValue],
 	);
+	if (!row) throw new NotFound(`No ${kind} '${rid}' in this space's ontology.`);
 
-	// The create is withdrawn rather than a delete being journalled: replaying
-	// a create followed by a delete would work, but leaves the journal
-	// describing a link that never needed to exist.
 	await query(
 		`UPDATE platform.ontology_edit
 		    SET is_active = false, withdrawn_by = $3, withdrawn_at = now()
 		  WHERE space_id = $1 AND target_rid = $2 AND is_active`,
 		[await spaceId(), rid, deletedBy],
 	);
+	await journal(kind, rid, "delete", {}, { apiName: row.api_name }, deletedBy);
 
-	await refresh();
+	await publishChange();
 }
 
 // ── the journal ─────────────────────────────────────────────────────────────
@@ -516,7 +563,7 @@ export async function listEdits(limit = 50): Promise<EditRecord[]> {
 	);
 
 	return rows.map((row) => ({
-		id: row.ontology_edit_id,
+		id: Number(row.ontology_edit_id),
 		targetKind: row.target_kind,
 		targetRid: row.target_rid,
 		operation: row.operation,
@@ -532,8 +579,8 @@ export async function listEdits(limit = 50): Promise<EditRecord[]> {
 /**
  * Undo an edit.
  *
- * Applies the recorded previous values and withdraws the journal entry, so the
- * change is reversed both now and on every future publish.
+ * An update puts the recorded previous values back; a create deletes what it
+ * created. Either way the entry is withdrawn, so the journal shows it undone.
  */
 export async function undoEdit(editId: number, undoneBy: string): Promise<void> {
 	const row = await queryOne<{
@@ -553,11 +600,17 @@ export async function undoEdit(editId: number, undoneBy: string): Promise<void> 
 	if (!row.is_active) throw new BadRequest("That edit has already been withdrawn.");
 
 	if (row.operation === "create") {
-		await deleteOntologyObject(row.target_kind as "linkType" | "actionType", row.target_rid, undoneBy);
+		if (row.target_kind === "property") {
+			throw new BadRequest("A property is removed with its object type.");
+		}
+		await deleteOntologyObject(row.target_kind, row.target_rid, undoneBy);
 		return;
 	}
+	if (row.operation === "delete") {
+		throw new BadRequest("A delete is undone by creating the object again.");
+	}
 
-	const versionId = await activeVersionId();
+	const { id: versionId } = await activeVersion();
 	const { table, ridColumn } = TABLE[row.target_kind];
 	const columns = Object.keys(row.previous);
 	if (columns.length > 0) {
@@ -578,5 +631,5 @@ export async function undoEdit(editId: number, undoneBy: string): Promise<void> 
 		[editId, undoneBy],
 	);
 
-	await refresh();
+	await publishChange();
 }

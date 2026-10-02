@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
 	type AssistantHealth,
@@ -7,26 +7,34 @@ import {
 	session,
 	setUnauthorizedHandler,
 } from "./api";
-import { useDebounced } from "./components/common";
-import { Actions } from "./pages/Actions";
-import { RepoDetail, RepoList } from "./pages/CodeRepos";
-import { Functions } from "./pages/Functions";
-import { BROWSE_KINDS, RESOURCE_SPECS } from "./components/spaces/resourceKinds";
+import { Spinner, useDebounced } from "./components/common";
+import { BROWSE_KINDS } from "./components/spaces/resourceKinds";
 import { ResourceProvider, useResources } from "./ResourceContext";
-import { ResourceBrowser } from "./pages/ResourceBrowser";
 import { Login } from "./pages/Login";
 import { Assistant } from "./pages/Assistant";
-import { CostAnalysis } from "./pages/CostAnalysis";
-import { DashboardHistory } from "./pages/DashboardHistory";
-import { DashboardDetail, DashboardList } from "./pages/Dashboards";
-import { GraphView } from "./pages/GraphView";
-import { LineagePage } from "./pages/LineagePage";
-import { ObjectExplorer } from "./pages/ObjectExplorer";
-import { PipelineBuilder } from "./pages/PipelineBuilder";
-import { Spaces } from "./pages/Spaces";
 import { SpaceProvider, envTone, useSpace } from "./SpaceContext";
-import { OntologyManager } from "./pages/OntologyManager";
-import { Overview } from "./pages/Overview";
+import { Home } from "./pages/Home";
+
+// Pages past the first screen load on demand, so signing in and the home
+// page do not wait for the graph canvas, the ontology editor and the rest.
+function page<K extends string>(load: () => Promise<Record<K, React.ComponentType>>, name: K) {
+	return lazy(() => load().then((module) => ({ default: module[name] })));
+}
+const Actions = page(() => import("./pages/Actions"), "Actions");
+const Functions = page(() => import("./pages/Functions"), "Functions");
+const ResourceBrowser = page(() => import("./pages/ResourceBrowser"), "ResourceBrowser");
+const CostAnalysis = page(() => import("./pages/CostAnalysis"), "CostAnalysis");
+const DashboardHistory = page(() => import("./pages/DashboardHistory"), "DashboardHistory");
+const DashboardDetail = page(() => import("./pages/Dashboards"), "DashboardDetail");
+const DashboardList = page(() => import("./pages/Dashboards"), "DashboardList");
+const GraphView = page(() => import("./pages/GraphView"), "GraphView");
+const ObjectExplorer = page(() => import("./pages/ObjectExplorer"), "ObjectExplorer");
+const Spaces = page(() => import("./pages/Spaces"), "Spaces");
+const OntologyManager = page(() => import("./pages/OntologyManager"), "OntologyManager");
+const Overview = page(() => import("./pages/Overview"), "Overview");
+const DataSources = page(() => import("./pages/DataSources"), "DataSources");
+const Proposals = page(() => import("./pages/Proposals"), "Proposals");
+const Schedules = page(() => import("./pages/Schedules"), "Schedules");
 
 interface HealthPayload {
 	status: string;
@@ -36,46 +44,88 @@ interface HealthPayload {
 	kpis: number;
 }
 
-const NAV = [
-	{ section: "Workspace" },
-	{ to: "/spaces", label: "Spaces", glyph: "▣" },
+/**
+ * The navigation follows the one path data takes through the platform:
+ * a connection syncs a view into a dataset on a schedule, object types are
+ * created from datasets (or modelled on import), metrics, functions and
+ * actions are defined on them, and dashboards and the assistant use the result.
+ *
+ * An entry with `browse` opens that resource kind's list-and-data page and
+ * carries its count for the current space; `badge` marks a count of its own.
+ */
+type NavEntry =
+	| { section: string }
+	| {
+			to: string;
+			label: string;
+			glyph: string;
+			exact?: boolean;
+			browse?: ResourceKindName;
+			badge?: "approvals";
+	  };
+
+type ResourceKindName = (typeof BROWSE_KINDS)[number]["kind"];
+
+/**
+ * A personal workspace is somebody's own data, so its navigation is the
+ * business path - ask, look, approve - with the model underneath it. SQL
+ * functions read tables by name and are not offered there.
+ */
+const PERSONAL_NAV: NavEntry[] = [
+	{ to: "/", label: "Home", glyph: "⌂", exact: true },
+	{ to: "/assistant", label: "Ask AI", glyph: "✦", exact: true },
+	{ to: "/dashboards", label: "Dashboards & reports", glyph: "▦" },
+	{ to: "/approvals", label: "Approvals", glyph: "✓", badge: "approvals" },
+	{ section: "Your data" },
+	{ to: "/data", label: "Data sources", glyph: "⛁" },
+	{ to: "/schedules", label: "Refresh schedules", glyph: "⏱" },
+	{ to: "/ontology", label: "Business objects", glyph: "◇" },
+	{ to: "/graph", label: "Relationships", glyph: "◉" },
+	{ to: "/explorer", label: "Explore records", glyph: "▤" },
+	{ to: "/functions", label: "SQL functions", glyph: "ƒ" },
+	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ section: "Account" },
+	{ to: "/assistant/cost", label: "AI usage & cost", glyph: "$" },
+];
+
+const NAV: NavEntry[] = [
+	{ section: "Data" },
+	{ to: "/browse/connections", label: "Connections", glyph: "⛁", browse: "connection" },
+	{ to: "/browse/datasets", label: "Datasets", glyph: "▤", browse: "dataset" },
+	{ to: "/schedules", label: "Schedules", glyph: "⏱" },
 	{ section: "Ontology" },
 	{ to: "/", label: "Overview", glyph: "◈", exact: true },
 	{ to: "/ontology", label: "Object types", glyph: "◇" },
 	{ to: "/graph", label: "Graph", glyph: "◉" },
-	{ to: "/lineage", label: "Lineage", glyph: "⑃" },
-	{ to: "/pipeline", label: "Pipeline builder", glyph: "⑄" },
-	// Beside the pipeline builder, because it is the other way of describing
-	// how data becomes an ontology: one is drawn, the other is written down.
-	{ to: "/repos", label: "Repositories", glyph: "⌥" },
-	// One entry per resource kind, each opening a list-and-data page like
-	// Object Explorer. These used to be an inline panel that expanded every
-	// kind under the navigation, which buried it; a kind's name is not the
-	// useful part, its data is.
-	{ panel: "browse" as const },
-	{ section: "Work" },
-	{ to: "/explorer", label: "Object explorer", glyph: "▤" },
-	{ to: "/dashboards", label: "Dashboards", glyph: "▦" },
-	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ to: "/explorer", label: "Object explorer", glyph: "▦" },
+	{ section: "Logic" },
+	{ to: "/browse/metrics", label: "Metrics", glyph: "Σ", browse: "kpi" },
 	{ to: "/functions", label: "Functions", glyph: "ƒ" },
+	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ section: "Apps" },
+	{ to: "/dashboards", label: "Dashboards", glyph: "▥" },
+	{ to: "/approvals", label: "Approvals", glyph: "✓", badge: "approvals" },
 	{ section: "Assistant" },
 	{ to: "/assistant", label: "AI-FDE", glyph: "✦", exact: true },
 	{ to: "/assistant/cost", label: "Cost analysis", glyph: "$" },
+	{ section: "Workspace" },
+	{ to: "/spaces", label: "Spaces", glyph: "▣" },
 ];
 
 const TITLES: Record<string, string> = {
 	"/": "Overview",
+	"/home": "Home",
+	"/data": "Data sources",
+	"/approvals": "Approvals",
 	"/spaces": "Spaces",
 	"/ontology": "Object types",
 	"/graph": "Ontology graph",
-	"/lineage": "Data lineage",
-	"/pipeline": "Pipeline builder",
-	"/repos": "Code repositories",
 	"/explorer": "Object explorer",
 	"/dashboards": "Dashboards",
 	"/dashboards/history": "Dashboard history",
 	"/actions": "Actions",
 	"/functions": "Functions",
+	"/schedules": "Schedules",
 	"/assistant": "AI-FDE assistant",
 	"/assistant/cost": "Assistant cost analysis",
 };
@@ -92,7 +142,8 @@ export function App() {
  */
 function SpaceSwitcher() {
 	const { spaces, space, spaceSlug, setSpaceSlug, loading } = useSpace();
-	if (loading || spaces.length === 0) return null;
+	// One space (a new account's own workspace) needs no switcher.
+	if (loading || spaces.length <= 1) return null;
 	return (
 		<label className={`space-switcher ${envTone(space?.environment)}`}>
 			<span className="muted">Space</span>
@@ -120,83 +171,80 @@ function SpaceSwitcher() {
  * ontology pages had. Both now come from the space itself.
  */
 function RailBrand({ connected }: { connected: boolean }) {
-	const { space, loading } = useSpace();
+	const { space, loading, isPersonal } = useSpace();
 	const ontology = space?.ontology ?? null;
 	return (
 		<div className="rail-brand">
-			<h1>TMS Ontology Workbench</h1>
+			<h1>
+				<span className="brand-mark" aria-hidden>
+					◈
+				</span>
+				Ontology Dashboard
+			</h1>
 			<p>
 				{!connected || loading
 					? "connecting…"
-					: ontology
-						? `v${ontology.version} · ${ontology.objectTypes} object types`
-						: `${space?.name ?? "This space"} · nothing published`}
+					: isPersonal
+						? ontology && ontology.objectTypes > 0
+							? `${space?.name ?? "Your workspace"} · ${ontology.objectTypes} objects`
+							: `${space?.name ?? "Your workspace"} · no data yet`
+						: ontology
+							? `${space?.name ?? ""} · v${ontology.version} · ${ontology.objectTypes} object types`
+							: `${space?.name ?? "This space"} · nothing published`}
 			</p>
 		</div>
 	);
 }
 
-/** A nav badge counting what its link leads to, in the current space. */
-function RailCount({
-	of,
-	title,
-}: {
-	of: "objectTypes" | "linkTypes";
-	title: string;
-}) {
-	const { space } = useSpace();
-	// No badge at all rather than a zero: an empty space has nothing to count,
-	// and a "0" beside every link reads as a failure to load.
-	if (!space?.ontology) return null;
+/** Pending approvals in this space, re-read whenever the space data reloads. */
+function RailApprovals() {
+	const { spaceSlug, spaces } = useSpace();
+	const [count, setCount] = useState<number | null>(null);
+	useEffect(() => {
+		api
+			.get<unknown[]>("/api/proposals?status=pending")
+			.then((rows) => setCount(rows.length))
+			.catch(() => setCount(null));
+	}, [spaceSlug, spaces]);
+	if (!count) return null;
 	return (
-		<span className="count" title={title}>
-			{space.ontology[of]}
+		<span className="count attention" title={`${count} waiting for approval`}>
+			{count}
 		</span>
 	);
 }
 
-/**
- * The resource kinds in the nav, each with a count for the current space.
- *
- * The count is omitted while loading rather than shown as 0: a badge reading
- * "Datasets 0" for half a second reads as "you have no datasets".
- */
-function RailBrowse() {
-	const { counts, projectName } = useResources();
-	return (
-		<>
-			<div className="rail-subsection" title="The resources registered in this space">
-				{projectName ?? "Workspace"}
-			</div>
-			{BROWSE_KINDS.map((item) => (
-				<NavLink
-					key={item.slug}
-					to={`/browse/${item.slug}`}
-					className={({ isActive }) => `rail-link rail-link-sub ${isActive ? "active" : ""}`}
-				>
-					<span className="glyph" aria-hidden style={{ color: RESOURCE_SPECS[item.kind].accent }}>
-						{RESOURCE_SPECS[item.kind].glyph}
-					</span>
-					<span>{item.label}</span>
-					{counts && (counts[item.kind] ?? 0) > 0 && (
-						<span className="count">{counts[item.kind]}</span>
-					)}
-				</NavLink>
-			))}
-		</>
-	);
+/** A nav badge counting what its link leads to, in the current space. */
+function RailCount({ entry }: { entry: Extract<NavEntry, { to: string }> }) {
+	const { space } = useSpace();
+	const { counts } = useResources();
+	// No badge rather than a zero: an empty space has nothing to count, and a
+	// "0" beside every link reads as a failure to load.
+	const count = entry.browse
+		? (counts?.[entry.browse] ?? 0)
+		: entry.to === "/ontology"
+			? (space?.ontology?.objectTypes ?? 0)
+			: entry.to === "/graph"
+				? (space?.ontology?.linkTypes ?? 0)
+				: 0;
+	if (!count) return null;
+	return <span className="count">{count}</span>;
 }
 
 function AppShell() {
-	const location = useLocation();
 	const [user, setUser] = useState<SessionUser | null>(() =>
 		session.token() ? session.user() : null,
 	);
 	const [health, setHealth] = useState<HealthPayload | null>(null);
 	const [assistantHealth, setAssistantHealth] = useState<AssistantHealth | null>(null);
-	const [theme, setTheme] = useState<"dark" | "light">(
-		() => (localStorage.getItem("tms-theme") as "dark" | "light") ?? "dark",
-	);
+	const [theme, setTheme] = useState<"dark" | "light">(() => {
+		try {
+			// Light for a first visit: reports are read on paper and in meetings.
+			return (localStorage.getItem("tms-theme") as "dark" | "light") ?? "light";
+		} catch {
+			return "light";
+		}
+	});
 
 	useEffect(() => {
 		document.documentElement.setAttribute("data-theme", theme);
@@ -231,35 +279,65 @@ function AppShell() {
 	}, [user]);
 
 	if (!user) return <Login onSignedIn={setUser} />;
+	return (
+		<SpaceProvider>
+			<ResourceProvider>
+				<Shell
+					user={user}
+					health={health}
+					assistantHealth={assistantHealth}
+					theme={theme}
+					setTheme={setTheme}
+					signOut={signOut}
+				/>
+			</ResourceProvider>
+		</SpaceProvider>
+	);
+}
+
+function Shell({
+	user,
+	health,
+	assistantHealth,
+	theme,
+	setTheme,
+	signOut,
+}: {
+	user: SessionUser;
+	health: HealthPayload | null;
+	assistantHealth: AssistantHealth | null;
+	theme: "dark" | "light";
+	setTheme: (update: (current: "dark" | "light") => "dark" | "light") => void;
+	signOut: () => void;
+}) {
+	const location = useLocation();
+	const { isPersonal } = useSpace();
+	const nav = isPersonal ? PERSONAL_NAV : NAV;
 	// From here on there is a token, so the space provider can load.
 
 	const browseKind = location.pathname.startsWith("/browse/")
 		? BROWSE_KINDS.find((item) => item.slug === location.pathname.slice("/browse/".length))
 		: undefined;
 	const title =
-		TITLES[location.pathname] ??
+		(location.pathname === "/" && isPersonal ? "Home" : TITLES[location.pathname]) ??
 		browseKind?.label ??
-		(location.pathname.startsWith("/dashboards/") ? "Dashboard" : "TMS Ontology");
+		(location.pathname.startsWith("/dashboards/") ? "Dashboard" : "Ontology Dashboard");
 
 	return (
-		<SpaceProvider>
-		<ResourceProvider>
 		<div className="shell">
 			<nav className="rail">
 				<RailBrand connected={health !== null} />
 
 				<div className="rail-nav">
-					{NAV.map((entry, index) =>
-						"panel" in entry ? (
-							<RailBrowse key={`panel-${index}`} />
-						) : "section" in entry ? (
+					{nav.map((entry, index) =>
+						"section" in entry ? (
 							<div className="rail-section" key={`section-${index}`}>
 								{entry.section}
 							</div>
 						) : (
 							<NavLink
 								key={entry.to}
-								to={entry.to!}
+								to={entry.to}
 								end={entry.exact}
 								className={({ isActive }) => `rail-link ${isActive ? "active" : ""}`}
 							>
@@ -267,11 +345,8 @@ function AppShell() {
 									{entry.glyph}
 								</span>
 								<span>{entry.label}</span>
-								{/* Each badge counts the thing its own link leads to. The
-								    dashboards badge used to show health.kpis, so it read as
-								    "31 dashboards" when 31 was the number of metrics. */}
-								{entry.to === "/ontology" && <RailCount of="objectTypes" title="Object types" />}
-								{entry.to === "/graph" && <RailCount of="linkTypes" title="Link types" />}
+								<RailCount entry={entry} />
+								{entry.badge === "approvals" && <RailApprovals />}
 							</NavLink>
 						),
 					)}
@@ -297,7 +372,9 @@ function AppShell() {
 								? assistantHealth.llm.reachable
 									? assistantHealth.llm.modelPresent === false
 										? "model not pulled"
-										: "model ready"
+										: assistantHealth.provider === "builtin"
+											? "AI: built-in planner"
+											: "AI model ready"
 									: "model offline"
 								: "checking…"}
 						</span>
@@ -328,24 +405,19 @@ function AppShell() {
 					<GlobalSearch />
 				</header>
 
-				{/* The builder is a full-bleed canvas: it needs the padding and the
-				    max-width off, and its own scrolling rather than the page's. */}
-				<div className={`content${location.pathname === "/pipeline" ? " content-flush" : ""}`}>
+				<div className="content">
 					<div
 						className="content-wide"
-						style={{
-							height:
-								location.pathname === "/assistant" || location.pathname === "/pipeline"
-									? "100%"
-									: undefined,
-						}}
+						style={{ height: location.pathname === "/assistant" ? "100%" : undefined }}
 					>
+						<Suspense fallback={<Spinner />}>
 						<Routes>
-							<Route path="/" element={<Overview />} />
+							<Route path="/" element={isPersonal ? <Home /> : <Overview />} />
+							<Route path="/home" element={<Home />} />
+							<Route path="/data" element={<DataSources />} />
+							<Route path="/approvals" element={<Proposals />} />
 							<Route path="/ontology" element={<OntologyManager />} />
 							<Route path="/graph" element={<GraphView />} />
-							<Route path="/lineage" element={<LineagePage />} />
-							<Route path="/pipeline" element={<PipelineBuilder />} />
 							<Route path="/spaces" element={<Spaces />} />
 							<Route path="/explorer" element={<ObjectExplorer />} />
 							<Route path="/dashboards" element={<DashboardList />} />
@@ -354,8 +426,7 @@ function AppShell() {
 							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
 							<Route path="/actions" element={<Actions />} />
 							<Route path="/functions" element={<Functions />} />
-							<Route path="/repos" element={<RepoList />} />
-							<Route path="/repos/:slug" element={<RepoDetail />} />
+							<Route path="/schedules" element={<Schedules />} />
 							<Route path="/browse/:kind" element={<ResourceBrowser />} />
 							<Route path="/assistant" element={<Assistant />} />
 							{/* Before nothing else, but listed after /assistant so the exact
@@ -363,12 +434,11 @@ function AppShell() {
 							<Route path="/assistant/cost" element={<CostAnalysis />} />
 							<Route path="*" element={<Navigate to="/" replace />} />
 						</Routes>
+						</Suspense>
 					</div>
 				</div>
 			</div>
 		</div>
-		</ResourceProvider>
-		</SpaceProvider>
 	);
 }
 
@@ -406,7 +476,7 @@ function GlobalSearch() {
 	return (
 		<div style={{ position: "relative" }}>
 			<input
-				placeholder="Find an order, shipment, carrier…"
+				placeholder="Search your records…"
 				value={term}
 				onChange={(event) => setTerm(event.target.value)}
 				onFocus={() => setOpen(true)}

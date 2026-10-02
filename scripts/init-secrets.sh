@@ -65,8 +65,8 @@ write_secret database_url \
 
 # ── Azure OpenAI ───────────────────────────────────────────────────────────
 # Carried over from .env if it is there, so an existing working key is not
-# lost. An empty file is valid: it means "no Azure", and LLM_PROVIDER=ollama
-# then runs the stack entirely offline.
+# lost. An empty file is valid: the assistant is the only thing that needs it,
+# and it reports exactly that at /health until the key is set.
 AZURE_KEY=""
 if [ -f .env ]; then
     AZURE_KEY=$(grep -E '^AZURE_OPENAI_KEY=' .env | head -1 | cut -d= -f2- || true)
@@ -79,9 +79,15 @@ else
     if [ -n "$AZURE_KEY" ]; then
         echo "  + azure_openai_key taken from .env"
     else
-        echo "  + azure_openai_key written empty (set it, or run Ollama only)"
+        echo "  + azure_openai_key written empty (the built-in planner answers until it is set)"
     fi
 fi
+
+# ── credential vault ───────────────────────────────────────────────────────
+# Encrypts the database passwords people type into the connect form. Kept
+# apart from jwt_secret so rotating the signing key does not make every stored
+# connection password unreadable. 64 hex characters = 32 bytes.
+write_secret credential_key "$(openssl rand -hex 32)" "AES-256 key for stored connection passwords"
 
 echo
 echo "Done. Next:"

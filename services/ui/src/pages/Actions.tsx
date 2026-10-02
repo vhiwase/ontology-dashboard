@@ -60,7 +60,7 @@ export function Actions() {
 	const [error, setError] = useState<string | null>(null);
 	const [audit, setAudit] = useState<Array<Record<string, unknown>> | null>(null);
 	const [missing, setMissing] = useState(false);
-	const { spaceSlug, space } = useSpace();
+	const { spaceSlug, space, isPersonal } = useSpace();
 
 	const loadAudit = () => {
 		api
@@ -84,10 +84,8 @@ export function Actions() {
 				setActions(actionRows);
 				setRoles(roleRows);
 				// A read-only action first when there is one, because it is the one
-				// a visitor can actually run. There are none today — all three
-				// were withdrawn with the generated execution data they computed
-				// from — so this falls back to the first action rather than
-				// opening the page with nothing selected.
+				// a visitor can actually run; otherwise the first action, rather
+				// than opening the page with nothing selected.
 				setSelected(
 					(current) =>
 						current ?? actionRows.find((a) => a.isReadOnly)?.apiName ?? actionRows[0]?.apiName ?? null,
@@ -225,12 +223,23 @@ export function Actions() {
 								{entry.requiresApproval && <span className="count">approval</span>}
 							</button>
 						))}
-					{!actions.some((entry) => entry.isReadOnly) && (
-						<p className="muted" style={{ fontSize: 11, margin: "10px 4px 2px" }}>
-							Every action here is staged rather than run. The three read-only ones —
-							a rate what-if, an on-time projection, a cost recalculation — computed
-							from generated execution data and were withdrawn with it.
+					{isPersonal ? (
+						<p className="muted" style={{ fontSize: 11.5, margin: "10px 4px 2px" }}>
+							{actions.length === 0
+								? "No actions yet. Ask the assistant for one - “let managers reassign an order to another employee” - and approve it. "
+								: ""}
+							Your tables are synced copies, so a run is validated, permission-checked and recorded with its exact
+							payload, then staged rather than written back to your database.
 						</p>
+					) : (
+						!actions.some((entry) => entry.isReadOnly) && (
+							<p className="muted" style={{ fontSize: 11, margin: "10px 4px 2px" }}>
+								Every action here is staged: validated, permission-checked and recorded,
+								but not written back, because an object's data is a synced copy of its
+								source. Actions are declared on an object type, from its page or by the
+								AI-FDE.
+							</p>
+						)
 					)}
 				</div>
 

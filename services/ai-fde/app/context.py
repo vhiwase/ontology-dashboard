@@ -14,6 +14,10 @@ credential, and a tool that runs without one simply has no token to send.
 from __future__ import annotations
 
 from contextvars import ContextVar
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .modes import SessionAgentState
 
 # The raw bearer token of the request being served, or None outside a request.
 current_token: ContextVar[str | None] = ContextVar("current_token", default=None)
@@ -26,9 +30,28 @@ current_token: ContextVar[str | None] = ContextVar("current_token", default=None
 current_request_id: ContextVar[str | None] = ContextVar("current_request_id", default=None)
 
 # The space the conversation belongs to. The ontology is per-space — object
-# types, links, actions, metrics and lineage are published by a pipeline that
-# ran in one space — so a tool call that does not name one reads the sandbox's
+# types, links, actions and metrics are built from that space's datasets — so
+# a tool call that does not name one reads the sandbox's
 # and answers a question about the wrong environment. Held here for the same
 # reason as the token: every tool reaches the ontology through one client, and
 # this is the one place that has to know.
 current_space: ContextVar[str] = ContextVar("current_space", default="sandbox")
+
+# The conversation's agent state - active mode, enabled capabilities, plan and
+# todos. The stateful tools (change_mode, generate_plan, notepad, ...) read and
+# mutate it through here rather than taking it as an argument, for the same
+# reason the token travels this way: every tool would otherwise carry it, and
+# each asyncio task gets its own copy so concurrent chats cannot bleed state.
+current_session_state: ContextVar["SessionAgentState | None"] = ContextVar(
+    "current_session_state", default=None
+)
+
+# The signed-in username the conversation runs as. Tools that write something
+# the user owns - notepad documents especially - need the principal without
+# every implementation threading it through.
+current_user: ContextVar[str | None] = ContextVar("current_user", default=None)
+
+
+# The conversation a turn belongs to, so what the assistant creates - a
+# dashboard, a proposal - records which conversation it came from.
+current_session: ContextVar[int | None] = ContextVar("current_session", default=None)

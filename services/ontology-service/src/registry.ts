@@ -3,9 +3,9 @@ import type { OntologyDefinition } from "@ontograph/core";
 import { query, queryOne } from "./db";
 
 /**
- * The in-memory view of the published ontology.
+ * The in-memory view of each space's ontology.
  *
- * Loaded once at boot and refreshable on demand. Everything that builds SQL goes
+ * Loaded at boot and reloaded after every authoring change (definition.ts). Everything that builds SQL goes
  * through this registry, and only through it: a column name reaches a query only
  * after being matched against a property this registry knows about. That is the
  * single defence against injection in the whole service, so it is deliberately
@@ -45,6 +45,10 @@ export interface ObjectTypeMeta {
 	group: string | null;
 	rowCount: number;
 	displayOrder: number;
+	/** pipeline (generated), modelled (from a connected table) or combination (a join). */
+	origin: string;
+	/** False when the key column is not unique on every row. */
+	keyIsUnique: boolean;
 	properties: PropertyMeta[];
 	propertyByApiName: Map<string, PropertyMeta>;
 	propertyBySqlColumn: Map<string, PropertyMeta>;
@@ -108,7 +112,13 @@ export interface KpiMeta {
 	relatedObjectTypes: string[];
 	dependsOnSimulation: boolean;
 	coverageNote: string | null;
+	/** Equality conditions always applied: {sql_column: value | values}. */
+	conditions: Record<string, unknown>;
 	displayOrder: number;
+	/** catalogue (pipeline), modelled (from a connected table) or proposal (approved). */
+	origin: string;
+	/** The object type a workspace metric measures. */
+	objectTypeRid: string | null;
 }
 
 export interface Registry {
@@ -135,19 +145,19 @@ export interface Registry {
 }
 
 /**
- * Raised when a space has no published ontology.
+ * Raised when a space has no ontology loaded.
  *
- * Distinct from "not loaded yet": an empty Staging is a NORMAL state with a
- * sensible answer ("nothing has been promoted here"), not a server fault. It
- * carries a 409 so routes render an empty state rather than a 500.
+ * Every space is given an (initially empty) ontology at boot, so this means a
+ * space created since - a normal state, not a server fault. It carries a 409
+ * so routes render an empty state rather than a 500.
  */
 export class NoOntologyInSpace extends Error {
 	readonly status = 409;
 
 	constructor(readonly spaceSlug: string) {
 		super(
-			`No ontology has been published in the '${spaceSlug}' space. ` +
-				"Run a pipeline in this space, or promote one from the sandbox.",
+			`The '${spaceSlug}' space has no ontology loaded yet. ` +
+				"Create an object type from one of its datasets to start one.",
 		);
 	}
 }
@@ -188,6 +198,88 @@ export function spacesWithOntology(): string[] {
 	return [...registries.keys()].sort();
 }
 
+// ── interfaces ──────────────────────────────────────────────────────────────
+// InterfaceDefinitions in the document, and the types declaring `implements`
+// for them. The authored ontology declares none yet; this is the read side
+// for the day it does.
+
+export interface InterfaceMeta {
+	rid: string;
+	apiName: string;
+	label: string;
+	description: string | null;
+	/** Attributes every implementor carries, resolved to property names. */
+	requiredAttributes: Array<{ apiName: string; label: string; required: boolean }>;
+	/** Object types declaring `implements` for this interface, by api name. */
+	implementors: string[];
+}
+
+function localizedText(value: unknown): string {
+	if (typeof value === "string") return value;
+	if (value && typeof value === "object") {
+		const record = value as Record<string, string>;
+		return record.en ?? Object.values(record)[0] ?? "";
+	}
+	return "";
+}
+
+export function interfacesOf(registry: Registry): InterfaceMeta[] {
+	const interfaces = registry.definition.interfaces ?? [];
+	if (!interfaces.length) return [];
+
+	// Attributes are shared across object types (462 properties collapse to
+	// 238 attribute definitions), so one property per rid is enough to resolve
+	// every requiredAttributes ref to a named property.
+	const propertyByRid = new Map<string, { apiName: string; label: string }>();
+	for (const type of registry.objectTypes) {
+		for (const prop of type.properties) {
+			if (!propertyByRid.has(prop.rid)) {
+				propertyByRid.set(prop.rid, { apiName: prop.apiName, label: prop.label });
+			}
+		}
+	}
+
+	const entityTypes = [
+		...(registry.definition.entityTypes ?? []),
+		...(registry.definition.eventTypes ?? []),
+		...(registry.definition.roleTypes ?? []),
+	];
+	// Entity @ids are RIDs ("ri.object.main.location"), not api names, so the
+	// implementors are translated through the registry — the same lookup the
+	// link endpoints do — with the raw id as the fallback for a type the
+	// registry has not shredded.
+	const apiNameByRid = new Map(registry.objectTypes.map((type) => [type.rid, type.apiName]));
+
+	return interfaces.map((iface) => {
+		const refs = (iface.requiredAttributes ?? []) as Array<{
+			ref?: string;
+			required?: boolean;
+		}>;
+		return {
+			rid: iface["@id"],
+			apiName: iface["@id"].split(":").pop() ?? iface["@id"],
+			label: localizedText(iface.label),
+			description: iface.description ? localizedText(iface.description) : null,
+			requiredAttributes: refs.map((ref) => {
+				const prop = propertyByRid.get(ref.ref ?? "");
+				return {
+					apiName: prop?.apiName ?? ref.ref ?? "",
+					label: prop?.label ?? "",
+					required: Boolean(ref.required),
+				};
+			}),
+			implementors: entityTypes
+				.filter((entity) => (entity.implements ?? []).includes(iface["@id"]))
+				.map(
+					(entity) =>
+						apiNameByRid.get(entity["@id"]) ??
+						entity["@id"].split(":").pop() ??
+						entity["@id"],
+				),
+		};
+	});
+}
+
 export function hasOntology(spaceSlug: string): boolean {
 	return registries.has(spaceSlug);
 }
@@ -204,7 +296,13 @@ const registries = new Map<string, Registry>();
  * because a half-published ontology in staging should not take the sandbox
  * down with it.
  */
-export async function loadRegistry(): Promise<Registry> {
+export async function loadRegistry(onlySpace?: string): Promise<Registry> {
+	// One space's change reloads that space; everything else is left as it is.
+	if (onlySpace) {
+		registries.set(onlySpace, await loadRegistryForSpace(onlySpace));
+		return registries.get(onlySpace)!;
+	}
+
 	const spaces = await query<{ slug: string }>(
 		`SELECT s.slug
 		   FROM platform.space s
@@ -230,12 +328,30 @@ export async function loadRegistry(): Promise<Registry> {
 
 	const first = registries.get(DEFAULT_SPACE) ?? [...registries.values()][0];
 	if (!first) {
-		throw new Error(
-			"No active ontology in any space. Run the pipeline: " +
-				"docker compose run --rm pipeline python -m pipeline.run",
-		);
+		throw new Error("No active ontology in any space; ensureOntologies() runs before this at boot.");
 	}
 	return first;
+}
+
+/**
+ * Reload one space's registry, leaving every other space's untouched.
+ *
+ * Modelling a table into a personal workspace changes that workspace's
+ * ontology and nobody else's; reloading every space for it would make each
+ * user's edit cost as much as the whole platform's.
+ */
+export async function reloadSpace(spaceSlug: string): Promise<Registry | null> {
+	try {
+		const registry = await loadRegistryForSpace(spaceSlug);
+		registries.set(spaceSlug, registry);
+		return registry;
+	} catch (error) {
+		if (error instanceof NoOntologyInSpace) {
+			registries.delete(spaceSlug);
+			return null;
+		}
+		throw error;
+	}
 }
 
 async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
@@ -276,6 +392,8 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		group_name: string | null;
 		row_count: string;
 		display_order: number;
+		origin: string | null;
+		key_is_unique: boolean | null;
 	}>(
 		`SELECT * FROM platform.object_type
 		  WHERE ontology_version_id = $1
@@ -354,6 +472,8 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 			group: row.group_name,
 			rowCount: Number(row.row_count),
 			displayOrder: row.display_order,
+			origin: row.origin ?? "pipeline",
+			keyIsUnique: row.key_is_unique ?? true,
 			properties,
 			propertyByApiName: new Map(properties.map((p) => [p.apiName, p])),
 			propertyBySqlColumn: new Map(properties.map((p) => [p.sqlColumn, p])),
@@ -437,9 +557,8 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		tags: row.tags ?? [],
 	}));
 
-	// The catalogue is per-space (0012), so it is filtered by slug rather than
-	// by ontology version: the pipeline upserts it outside the version it
-	// publishes, so there is no version id on these rows to join through.
+	// The metric catalogue is per-space (0012), so it is filtered by slug
+	// rather than by ontology version: kpi_definition has no version column.
 	const kpiRows = await query<Record<string, any>>(
 		`SELECT k.*
 		   FROM platform.kpi_definition k
@@ -472,7 +591,10 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		relatedObjectTypes: row.related_object_types ?? [],
 		dependsOnSimulation: row.depends_on_simulation,
 		coverageNote: row.coverage_note,
+		conditions: row.conditions ?? {},
 		displayOrder: row.display_order,
+		origin: row.origin ?? "catalogue",
+		objectTypeRid: row.object_type_rid ?? null,
 	}));
 
 	const linksBySourceRid = new Map<string, LinkTypeMeta[]>();

@@ -1,42 +1,54 @@
 # TMS Ontology Workbench
 
-A Palantir-Foundry-shaped ontology platform over a real 3PL transport management
-system, with an AI-FDE assistant that answers business questions and builds
-dashboards from it.
+A Palantir-Foundry-shaped ontology platform: connect a PostgreSQL database, get
+an ontology of your own tables, and ask for the charts, KPIs, dashboards and
+reports you need. An AI-FDE assistant builds and extends the ontology and checks
+every request against the data first - ready, one approval away, or not possible.
+Anyone can sign up and gets a private workspace. A captured 3PL transport
+management snapshot ships as an optional demo source.
 
 Built on [`openshuyi/ontograph-core`](https://github.com/openshuyi/ontograph-core)
-(vendored in `vendor/`, compiled from source), Postgres, and an LLM that is either
-a local open-source model via Ollama or the Azure AI Foundry deployment already in
-use elsewhere in this repo.
+(vendored in `vendor/`, compiled from source), Postgres, and the Azure AI Foundry
+deployment already in use elsewhere in this repo.
 
 ```
 docker compose up -d --build        # or ./scripts/bootstrap.sh
-open http://127.0.0.1:3000
+open https://127.0.0.1:3000
 ```
 
 ---
 
 ## What this is
 
-The captured REST payloads in `../api_responses` describe a working TMS: orders,
-shipments, transports, stops, a party master, and the configuration behind them.
-This project turns that into an **ontology** — named object types with typed
-properties, discovered links between them, a verb layer of actions, and a metric
-catalogue — and then puts three things on top:
+One path, from a database to answers:
 
-| | |
-|---|---|
-| **Ontology workbench** | Browse object types, properties classified by semantic role, link types with their real match ratios, and export the model as OWL, SHACL, Mermaid, DOT, ER or JSON Schema. |
-| **Object explorer** | Query any object type with filters built from its own properties, open one object, and walk its links. Shows the SQL it ran. |
-| **AI-FDE assistant** | Ask a question in freight language; get an answer, a chart, or a saved dashboard. Every answer shows which ontology queries produced it. |
+```
+PostgreSQL connection ──sync──▶ dataset ──▶ object type ──▶ links, actions, metrics, functions
+                         ▲       (as it is)                          │
+                     schedule                                        ▼
+            every 20 min, 2 h, 1 day, 8 days …           explorer · graph · dashboards · AI-FDE
+```
 
-Plus a six-layer **lineage graph** that traces any figure back to the HTTP
-endpoint it came from, and an **action layer** with role-based permissions and an
-audit trail.
+| Step | What it is | Where |
+|---|---|---|
+| **Connection** | a PostgreSQL host, database, user and the *name* of the secret holding the password | Connections |
+| **Sync** | a copy of one view (or table) from the connection into a dataset, **exactly as it is** | a connection's page |
+| **Schedule** | how often a sync runs: manual, 20m, 1h, 2h, 6h, 12h, 1d, 8d, or any `<n><m\|h\|d\|w>` | Schedules, or beside the sync |
+| **Dataset** | the landed copy, `connection_raw.<table>`, rebuilt on every run | Datasets |
+| **Object type** | created *from* a dataset, one property per column, with a primary key checked against the data | a dataset's page, or the AI-FDE |
+| **Links, actions, metrics, functions** | defined on object types, each checked against the data before it is stored | the AI-FDE, the workbench |
+
+The sandbox comes with one connection already registered: the platform's own
+database, whose `tms_views` schema presents the captured TMS data as views
+(`v_order`, `v_shipment`, `v_transport`, …). Syncing those is the first step.
+
+The **AI-FDE** does the modelling when asked — *"create object types from my
+datasets, link them, and add the metrics and actions dispatchers need"* — through
+the same checked routes a person's form uses.
 
 ### The honest part
 
-The captured snapshot is a **planning** snapshot. Verified against
+The TMS data behind the connection is a **planning** snapshot. Verified against
 `api_responses/orders_viewType1.json`, it contains:
 
 - 0 of 61 transports with an `actualStart` or `actualEnd`
@@ -46,33 +58,117 @@ The captured snapshot is a **planning** snapshot. Verified against
 - 14 of 61 shipments with a charge
 
 So on-time performance, transit time, dwell, distance, cost per kilometre,
-carrier scorecards and margin **cannot be computed from it**.
+carrier scorecards and margin **cannot be computed from it**. Profiling a dataset
+flags those columns as *empty in every row*, and the assistant is instructed to
+say a figure is not measured rather than estimate it.
 
-They were, once. The pipeline generated execution actuals into a separate
-`tms_sim` schema so the KPI catalogue had something to display, and 17 of 31
-KPIs -- every cost-per-kilometre and on-time figure on the dashboards -- rested
-on invented numbers while looking authoritative. That is gone. Migration 0018
-dropped the generated columns, the three KPI views composed wholly of them and
-the `tms_sim` schema itself, and the pipeline's second stage now **reports the
-coverage gaps instead of filling them**:
+Nothing on this platform is simulated. An earlier version generated execution
+data into a `tms_sim` schema so a metric catalogue had something to show; migration
+0018 removed it, and `ALLOW_SIMULATED_DATA=false` remains as a lock that refuses
+anything flagged as resting on generated data.
 
-```
-Coverage of the captured snapshot:
-    Carrier assignment   0 of 61  from source   no carrierId anywhere in the payload
-    Execution actuals    0 of 61  from source   no actualStart / actualEnd
-    Leg distance         0 of 61  from source   every captured leg reports 0 m
-```
+## Your data, your workspace
 
-Columns that could become real are kept and read NULL -- `actual_start_at`,
-`total_distance_km` and `charge_per_kg` fill themselves the day the TMS starts
-sending actuals. Columns that could only ever have been invented are gone.
-`PIPELINE_SIMULATE_EXECUTION=true` now **refuses loudly** rather than
-regenerating: the schema has to be restored and the views re-pointed on
-purpose, which is the point of dropping it.
+Every account has a **private workspace**: its own connections, model,
+dashboards, reports, approvals and conversations. Nobody else can open it.
+With `ALLOW_SELF_REGISTRATION=true` (the default) anyone who can reach the UI
+can create an account from the sign-in page and is taken straight to theirs.
 
-Measured, with no caveat needed: order volume and weight, the party and location
-master, planning rate, the shipment status funnel, accessorial counts, and every
-exception count.
+### From a table to a dashboard
+
+1. **Connect** a PostgreSQL database (Home -> *Connect your database*). The
+   connection is tested before it is saved; the password goes to the
+   workspace's encrypted vault (AES-256-GCM, key in `./secrets/credential_key`)
+   and the connection keeps only a reference to it. Read-only access is enough:
+   nothing is ever written back.
+2. **Choose tables.** Each is copied into the workspace (a snapshot you can
+   refresh from *Data sources*, or on a schedule from *Refresh schedules*), and the source's primary, unique and foreign
+   keys are read.
+3. **A model, not a dump.** Each table becomes an object type whose columns are
+   profiled into measures, dimensions, dates and identifiers; foreign keys (and
+   columns named for another table's key, verified against the data) become
+   links with their measured match ratio; every type gets its metrics - counts,
+   sums and averages of its measures, distinct counts of its references, each
+   sliceable by its dimensions and by day, week, month, quarter and year.
+4. **Ask.** "Revenue by country per month", "build me a sales dashboard",
+   "write a report on orders I can share", "what can I build?",
+   "link employees to us states on region = state_abbr",
+   "combine order details with their products and categories".
+
+### Ready, one approval away, or not possible
+
+Every request goes through a **feasibility check** against the workspace's
+ontology first:
+
+| Answer | What happens |
+|---|---|
+| **Ready** | An existing metric answers it. The chart, KPI, dashboard or report is built. |
+| **Needs approval** | One more building block is needed - a **link** (found by column name or by values, or named by you), a **combined dataset** (rows of one type with fields from the types they point at, plus derived columns such as `revenue = unit_price * quantity * (1 - discount)`, `days_between(order_date, shipped_date)` or `(shipped_date <= required_date) * 100`), a **metric**, or an **action type**. It is drafted and measured - match ratio, preview value, sample rows - and waits in *Approvals*. Nothing changes until you approve. |
+| **Not possible** | The data does not hold what is needed. You are told what is missing and offered the nearest questions it can answer. |
+
+A dashboard asked for on data that cannot support a good one (no timeline,
+little to slice, or not the figure asked for) becomes a proposal for one wide,
+analysis-ready dataset - and the board is **built the moment you approve it**.
+
+Being on time is a figure no column holds but two dates do. "On-time delivery
+rate by month" or "how many orders shipped late" on rows with a promised date
+and an actual one (`required_date` and `shipped_date`, say) proposes a
+*Timing* dataset: each row flagged on time or late, with its days late and
+days to complete, measured as **On-time rate** and **Late orders** and
+sliceable by whatever the rows point at. Rows with no actual date yet count as
+neither. Data without both dates is told so - it is never estimated.
+
+### Dashboards and reports
+
+- **Dashboards** are live grids: filters read from the data (with date presets
+  measured from where the data ends), click a bar, slice or row to filter the
+  whole board by it, download any widget (or the whole board) as CSV, see the
+  SQL behind any tile. Stat tiles show the change over the last *complete*
+  period; a period the data stops part-way through is drawn dashed and never
+  compared.
+- **Reports** are the same widgets laid out as a document - key figures,
+  highlights written from the numbers on the page, captioned sections - with
+  *Print / save PDF*.
+
+### Settings
+
+| Variable | Default | |
+|---|---|---|
+| `ALLOW_SELF_REGISTRATION` | `true` | `false` = accounts by administrators only |
+| `REGISTRATION_DEFAULT_ROLE` | `analyst` | or `viewer` |
+| `REGISTRATION_MAX_PER_HOUR` | `5` | sign-ups per address per hour |
+| `BLOCK_PRIVATE_CONNECTION_HOSTS` | `false` | `true` = personal workspaces may connect to public addresses only (cloud deployments). Link-local metadata addresses and the platform's own database are always refused. |
+| `SCHEDULE_TICK_SECONDS` | `20` | how often due sync schedules are fired; `0` disables them |
+
+**Upgrading an existing install:** re-run `./scripts/init-secrets.sh` - it adds
+`credential_key` without touching the existing secrets - then
+`docker compose up -d --build`. The pipeline applies the pending migrations at
+start (workspaces, proposals and per-workspace audit are 0032-0034, after the
+dataset-ontology migrations 0027-0031).
+
+A question that names a value - "revenue in Germany", "orders shipped via
+Speedy Express", "customers in Mexico" - is answered for that value. The
+value is found in the workspace's own category columns (never guessed) and
+placed on the column that holds it as asked: "shipped to France" on the ship
+country, "customers in Brazil" on the customer's country. When the figure's
+own rows do not carry that column, the same figure on a combined dataset with
+one row per record answers instead; when nothing carries it, you are told so
+and offered the combination that would - never the unfiltered number.
+
+**New and returning customers** are told apart by the order of each
+customer's rows: "new vs returning customers per month" proposes an *Order
+History* dataset that numbers every order within its customer
+(`sequence_of(customer_id, order_date, order_id)`). A customer is new in the
+period of their first order and returning in any period they order again.
+
+### SQL functions in a personal workspace
+
+Every workspace's synced tables share one schema, so a function written in a
+personal workspace may read only that workspace's own synced tables - checked
+by the planner, which reports a combined dataset as the tables under it - and
+is checked again at every run. Functions that run SQL handed to them as text
+(`ts_stat`, `*_to_xml`) and queries carried inside a string are refused
+everywhere. The workspace's owner approves its functions.
 
 ---
 
@@ -81,8 +177,10 @@ exception count.
 ### Requirements
 
 - Docker with Compose v2 (tested on Docker Desktop 29.1.3 / Compose 2.40.3)
-- ~8 GB free disk (4.7 GB of that is the Ollama model, only if you use it)
-- The sibling `../api_responses` directory, mounted read-only by the pipeline
+- ~2 GB free disk
+- Optional: the sibling `../api_responses` directory, mounted read-only by the
+  pipeline - the TMS demo snapshot. Without it the stack starts empty and every
+  user works from the databases they connect.
 
 ### The quick path
 
@@ -95,23 +193,21 @@ cp .env.example .env
 echo "BOOTSTRAP_ADMIN_PASSWORD=$(openssl rand -base64 18)" >> .env
 
 docker compose up -d --build
-docker compose logs -f pipeline      # migrations -> ingest -> ontology -> users
+docker compose logs -f pipeline      # migrations -> land the TMS snapshot -> users
 ```
 
-Then open **https://127.0.0.1:3000** and sign in as `admin` with that password.
-
+Then open **https://127.0.0.1:3000** and either **create an account** (you land
+in your own empty workspace: *Connect your database*) or sign in as `admin` with
+that password.
 The certificate is self-signed on first run, so the browser will warn once.
 Mount a real one over `/etc/nginx/certs` for anything public.
 
-### The path that picks the right LLM for your hardware
+Then, in order:
 
-```bash
-./scripts/bootstrap.sh
-```
-
-It runs `nvidia-smi`, writes the LLM configuration into `.env` accordingly, and
-brings the stack up with the GPU overlay if there is a GPU. See
-[Choosing the LLM](#choosing-the-llm).
+1. **Connections** → `tms_ontology` → **Sync a view** → pick `tms_views.v_order`,
+   choose *Every 20 minutes*, keep *Copy it now*.
+2. **Datasets** → `v_order` → **Create object type** (or *Ask the AI-FDE to model it*).
+3. Repeat for the views you need, or ask the AI-FDE to do all of it.
 
 ### Ports
 
@@ -126,931 +222,464 @@ the port, which is why the services authenticate rather than relying on it.
 | Ontology service | http://127.0.0.1:4000/api/stats | needs a bearer token |
 | AI-FDE | http://127.0.0.1:4100/health | liveness only; detail needs a token |
 | Postgres | `127.0.0.1:55432` | password in `secrets/postgres_password` |
-| Ollama | `127.0.0.1:11435` | moved off 11434; see below |
-
-> The HTTPS redirect on port 3080 targets the standard 443, which is right
-> wherever the stack is published on 443 and wrong locally, where compose maps
-> container 443 to host 3000 and nginx cannot learn that external port. In
-> development, go to `https://127.0.0.1:3000` directly.
 
 > **Use `127.0.0.1`, not `localhost`, from the host.** On Windows `localhost`
 > resolves to `::1` first, and Docker Desktop's IPv6 proxy accepts the connection
 > and then hangs until libpq times out. Measured on this project: **130.6 s with
-> `localhost` versus 6.9 s with `127.0.0.1`** for an identical pipeline run.
-
-> **Ollama is on 11435** because a native Ollama install on the host already
-> listens on 11434, and Docker cannot bind a port twice. Services inside the
-> compose network always reach it as `ollama:11434`, so this only affects access
-> from the host. Change it with `OLLAMA_PORT`.
+> `localhost` versus 6.9 s with `127.0.0.1`**.
 
 ---
 
-## Choosing the LLM
+## The language model
 
-Two backends, one interface. `LLM_PROVIDER=auto` (the default) decides from the
-hardware:
+One model backend: the **Azure OpenAI** deployment configured in `.env`
+(`AZURE_OPENAI_ENDPOINT`, deployment name, and the key in
+`./secrets/azure_openai_key`).
 
-| Hardware | Primary | Fallback | Why |
-|---|---|---|---|
-| NVIDIA GPU present | `ollama` | `azure_openai` | Local, no keys, nothing leaves the machine |
-| CPU only | `azure_openai` | `ollama` | A 7B model with a 15-tool schema takes minutes per call on CPU, and the agent makes several calls per question |
+Until those are set, the **built-in planner** answers: it needs no model, runs
+the same tools - the feasibility check, metrics, proposals, boards - and says on
+every answer that no model wrote it, so a fresh install is usable at once.
+`LLM_PROVIDER=builtin` selects it on purpose (tests, demos); any value other
+than `azure_openai` or `builtin` fails loudly at startup. Each answer shows what
+it cost; planner turns are free.
 
-**This is not a preference, it is a measured constraint.** On the CPU-only machine
-this was built on, `qwen2.5:7b-instruct` did not return within 300 s for a single
-tool-calling round. The same question answered in **7.2 s** against `gpt-4.1`.
-
-### Automatic failover
-
-`LLM_FALLBACK_PROVIDER` enables failover, with a **circuit breaker**: after the
-primary fails it is skipped for `LLM_FALLBACK_COOLDOWN` seconds rather than
-retried on every tool round. Without the breaker one question would pay the
-primary's timeout up to eight times.
-
-Measured with Ollama primary and a 45 s timeout:
-
-```
-first question  : 52.4 s   (45 s Ollama timeout, then Azure answered)
-second question :  7.4 s   (breaker open, straight to Azure)
-```
-
-The UI shows a note when it is running on the fallback, and each answer's footer
-says which model produced it.
-
-### Running on a GPU
-
-The official `ollama/ollama` image ships **CUDA and ROCm backends only**. Apply
-the overlay to pass an NVIDIA device through:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
-```
-
-Confirm offload actually happened — a GPU that exists on the host but was not
-passed through looks identical until you check:
-
-```bash
-curl -s http://127.0.0.1:11435/api/ps    # size_vram > 0 means layers are on the GPU
-```
-
-Intel Iris Xe / Arc and Apple Silicon are **not** covered by that image and will
-run on CPU. That is the case `auto` detects and routes around.
-
-### Fully offline
-
-```bash
-# .env
-LLM_PROVIDER=ollama
-LLM_FALLBACK_PROVIDER=
-AZURE_OPENAI_KEY=
-```
-
-Expect slow answers without a GPU. Everything except the assistant works with no
-model at all.
+A turn may take up to `AI_FDE_MAX_TOOL_ROUNDS` rounds (default **16**: building
+an ontology from several datasets takes around ten). A rate-limited call (HTTP
+429) is retried after the delay Azure asks for, at most three times; if the model
+still stops answering part way, the reply lists what was already built.
 
 ---
 
 ## Architecture
 
 ```
-  api_responses/*.json                 19 captured TMS REST endpoints
+  api_responses/*.json                 the captured TMS REST payloads
+          │  services/pipeline (Python): migrate → land → users → retention
+          ▼
+  tms_raw.*  ──(db/init/04,05)──▶  tms_views.v_*      THE SOURCE: views over the snapshot
           │
-          ▼  services/pipeline  (Python)
-  tms_raw.*                            landing tables, faithful to the payload
+          │  PostgreSQL connection (any host; the sandbox's points at this database)
+          ▼  sync, on a schedule — services/ontology-service
+  connection_raw.<table>                              datasets, copied as they are
           │
-          │  services/ontology-service  (on demand, not on a schedule)
-  connection_raw.*                     tables pulled through a registered source
-  repo_out.*                           tables a code repository built
-          │
-          ▼  db/init/04,05_*.sql
-  tms_views.v_*                        20 semantic object views + 11 metric views
-          │                            ← THE CONTRACT: the ontology is generated
-          │                              from this schema
-          ▼  services/pipeline
-  platform.ontology_version            the OntologyDefinition document
-  platform.object_type / _property     shredded for querying
-  platform.link_type                   discovered joins, with match ratios
-  platform.kpi_definition              curated metric catalogue
-  platform.lineage_node / _edge        six-layer provenance graph
+          ▼  created from datasets — by a person or the AI-FDE
+  platform.object_type / object_property              one living ontology per space
+  platform.link_type · action_type · kpi_definition   checked against the data
+  platform.function                                   proposed → approved by an admin
+  platform.ontology_edit                              every change, with what it replaced
           │
           ├─▶ services/ontology-service  (Node + @ontograph/core)
-          │     object sets · KPIs · actions · lineage · exports
-          │
-          ├─▶ services/ai-fde            (Python + FastAPI)
-          │     15 tools over the ontology · Ollama or Azure OpenAI
-          │
+          │     connections · syncs · scheduler · authoring · object sets · metrics · actions
+          ├─▶ services/ai-fde            (Python + FastAPI, Azure OpenAI)
+          │     modes and tools over the service's API, as the signed-in user
           └─▶ services/ui                (React + Vite, nginx)
-                workbench · explorer · graph · lineage · dashboards · chat
 ```
 
-### How the ontology is generated
+### How the ontology is built
 
-`tms_views` is the contract. The pipeline introspects it and derives everything:
+There is no generator. Every space starts with an **empty** ontology, and each
+piece is authored against a dataset:
 
-1. **One object type per `v_*` view.** `v_order` → `tms:Order`. Views prefixed
-   `v_kpi_` are registered as metric views instead.
-2. **One property per column, classified by semantic role** — identity, title,
-   measure, dimension, temporal, geo, flag, or provenance. This is the important
-   step: a column's SQL type says it is numeric, not whether summing it means
-   anything. `gross_weight_kg` sums; `latitude` does not; `status_code` is an
-   identifier that happens to be an integer. The ontology service **refuses** to
-   sum a non-measure, with an error naming the columns you can sum.
-3. **Link types from three signals**, combined in order:
-   - *naming convention* — a column ending `_key` that is not the view's own key
-     points at the view whose key it matches by suffix
-   - *party fallback* — the TMS keeps one party master projected into role views,
-     so a reference named for one role is also probed against the master
-   - *value overlap* — every candidate is probed against the real data and kept
-     with its **match ratio**, because a 90 % join is a real modelling fact and
-     hiding it behind a clean arrow is how a lossy join gets mistaken for a
-     complete one
-4. **Attributes are shared when they agree.** 462 properties collapse to 238
-   attribute definitions; a name is type-qualified only where two views genuinely
-   disagree on its datatype.
-5. **Actions, roles, constraints and KPIs are authored**, not derived — a business
-   rule is not discoverable from a schema.
+1. **Profile the dataset.** Real distinct and null counts per column, sample
+   values, the columns that could be a primary key (unique and never null in the
+   data as it stands), and a suggested role per column. A column's SQL type says
+   it is numeric, not whether adding it up means anything: `gross_weight_kg` is a
+   measure, `origin_latitude` is geo, `status_code` and `order_key` are
+   dimensions, `max_unit_weight_kg` aggregates with `max`, `planned_transit_days`
+   with `avg`. Columns empty in every row are flagged.
+2. **Create the object type.** One property per column, typed from the dataset's
+   catalogue. Refused, with the counts, when the chosen key is not unique and
+   non-null; a measure must be numeric.
+3. **Link object types.** Suggestions are columns named for another type's key
+   (`origin_location_key` → `Location.location_key`), each **measured**: the
+   match ratio is the share of values that really resolve, stored on the link. A
+   link where nothing resolves is refused. Inverse names follow the link's role
+   (`Location → originOrders`, `destinationOrders`).
+4. **Metrics.** An aggregation over one object type — count, count_distinct, sum,
+   avg, min, max, or ratio (sum over sum, never an average of per-row ratios) —
+   with the dimensions it can be sliced by and, optionally, a fixed condition:
+   `unplanned_orders` counts orders **where** `is_unplanned`. A new metric is
+   computed once before it is kept.
+5. **Actions.** A verb on an object type with typed parameters and the roles that
+   may run it; the object's key is always the first parameter. Every action is
+   **staged**: validated, permission-checked and recorded, never written back,
+   because a dataset is a copy of its source.
+6. **Functions.** One SELECT over datasets for what a metric cannot express. See
+   *Functions* below.
 
-Current output: **20 object types, 462 properties, 40 link types, 80 relation
-types** (each link plus its inverse), 238 attributes, 9 value types, 8
-constraints, 3 interfaces, 3 logic rules, 9 actions, 5 roles, 14 KPIs, and a
-140-node lineage graph. It validates against ontograph's own `OntologyValidator`
-with **0 errors and 0 warnings**, and generates 37 SHACL shapes.
-
-The KPI count was 31 and the action count 12 before migration 0018: 17 metrics
-and 3 read-only actions rested on generated execution data and were withdrawn
-with it.
-
-Five references are honestly reported as **unresolved** rather than dropped:
-`service_level_key`, `shipment_type_key`, `payment_term_key` and `nmfc_key` point
-at configuration objects the snapshot never fetched, and `v_order.carrier_key` is
-null in all 90 orders.
+After every change the ontograph `OntologyDefinition` document is rebuilt from
+the tables, validated with ontograph's own `OntologyValidator`, and the registry
+reloaded — so exports (OWL, SHACL, Mermaid, DOT, ER, JSON Schema), validation and
+action role checks always describe what is actually there. Ontology roles
+(`AdminRole`, `OperationsManagerRole`, `DispatcherRole`, `FinanceRole`,
+`AnalystRole`) are fixed; which actions each may run comes from each action.
 
 ---
 
 ## Using it
 
-### Ontology workbench (`/ontology`)
+### Connections and syncs (`/browse/connections`)
 
-Object types grouped by domain. For each: properties with their semantic role and
-SQL column, links with match ratio and how they were discovered, and the actions
-declared against it.
+A **connection** records the host, port, database, user and the **name** of an
+environment variable or the **path** of a Docker secret holding the password —
+never the password. It is tested before it is stored.
 
-### Object explorer (`/explorer`)
+A connection's page lists what it can read (views first) and its **syncs**. A sync
+copies one view into `connection_raw.<connection>__<schema>__<view>`:
 
-Filter operators are narrowed by datatype, so you cannot compose a filter the
-service rejects. Click a row to open the object; click a link to walk it. A link
-below 100 % shows a banner saying how much it misses. **Show SQL** reveals the
-query — an ontology layer should make the query derivable, not hide it.
+- **As it is.** Same columns, same rows. Remote types map through a fixed table;
+  a type with no local equivalent (an enum, a domain, PostGIS geometry) lands as
+  `text` and is named in the run's report.
+- **A snapshot every time.** The table is rebuilt from the source on every run,
+  inside one transaction, so a failure leaves the previous copy in place and the
+  dataset never keeps rows the source has deleted.
+- **Bounded.** A run reads at most its row limit (50,000 by default, 1,000,000
+  max) and says `truncated` when it stopped there.
+- **It refreshes what is built on it.** The object types on the dataset get their
+  new counts, and a property whose column the source dropped is named in the run.
 
-### Graph (`/graph`) and lineage (`/lineage`)
+On the platform's own database the `platform` and `connection_raw` schemas are
+hidden and refused as a sync source: they hold users' password hashes and the
+platform's bookkeeping, not source data.
 
-The ontology graph is a force layout; dashed edges are partial joins. The lineage
-graph is laid out in pipeline columns because it *is* a pipeline. Pick any object
-type or KPI to trace it upstream to the source endpoints and the exact base
-columns it reads — read from `pg_depend`, so it is the catalogue's own record of
-the dependency rather than a guess from parsing SQL.
+### Schedules (`/schedules`)
+
+One row per sync, with its cadence beside it. Choose *Manual only*, *Every 20
+minutes* … *Every 8 days*, or *Custom…* for anything like `45m`, `3d`, `2w`
+(at least a minute, at most a year).
+
+- **One cadence per sync**, enforced by a unique index: two schedules on one
+  dataset would each rebuild it under the other.
+- **A scheduled run is a normal run** — the same function as *Run now* — and lands
+  in the same run history.
+- **The claim is the fire.** `next_run_at` moves forward inside the same `UPDATE`
+  that records the firing, so two ticks can never double-run a sync.
+- **Failure keeps the cadence**, and failing syncs lead the page.
+
+The loop ticks every `SCHEDULE_TICK_SECONDS` (default 20; `0` disables it).
+
+```bash
+# Every 2 hours; "manual" removes the schedule
+curl -X POST -H "authorization: Bearer $TOKEN" -d '{"every":"2h"}' .../api/syncs/3/schedule
+```
+
+### Datasets (`/browse/datasets`)
+
+Each synced view, with where it came from, when it was last synced, what it is
+modelled as, and its rows. **Create object type** opens the profile as a form:
+every column kept, each with its suggested role, the key chosen from the columns
+that qualify — a person corrects rather than composes. **Ask the AI-FDE to model
+it** hands the same request to the assistant.
+
+### The workbench (`/`, `/ontology`, `/graph`, `/explorer`)
+
+- **Overview** counts the five stages for the space you are in and names the next
+  step (sync something, model what is synced, give a sync a cadence, …).
+- **Object types** shows each type's properties with their semantic role and
+  column, its links with their match ratios, its actions and metrics, and the
+  change history — every creation, edit and deletion, with who made it and what
+  it replaced, and an undo.
+- **Graph** is a force layout of the types and links; dashed edges are partial
+  joins. Export the ontology as OWL, SHACL, Mermaid, DOT, ER or JSON Schema.
+- **Object explorer** queries any type with filters built from its properties,
+  opens one object and walks its links, and shows the SQL it ran.
+
+### Metrics (`/browse/metrics`), functions (`/functions`), actions (`/actions`)
+
+A **metric**'s page shows its definition and the rows it is computed from.
+
+A **function** is drafted — by a person or the assistant — and lands as
+`proposed`: it computes nothing and nothing may use it until an **admin**
+approves it. Its SQL is restricted in three layers:
+
+1. one `SELECT`/`WITH`, comments stripped first so `-- x` cannot hide a second
+   statement, and no server function that reaches outside the data
+   (`pg_read_file`, `dblink`, `set_config`, …);
+2. every relation it reads is resolved **by the planner** (`EXPLAIN`) and must be
+   a synced dataset in `connection_raw` — a read of `platform.app_user`, even one
+   hidden behind an `information_schema` view, is refused by name;
+3. it runs as a subquery inside a `READ ONLY` transaction with a 30-second limit.
+
+**Actions** — pick one, fill the form, run it. The ontology role decides what is
+permitted through ontograph's `AccessController` with **default-deny**. Every
+action returns **`staged`** and writes an audit row with the exact payload that
+would be sent. The Business Analyst role may run none.
 
 ### Dashboards (`/dashboards`)
 
-Five seeded boards plus anything the assistant builds. A widget names a **KPI from
-the catalogue** and how to slice it; it never carries SQL. That is what makes a
-generated dashboard reviewable — the worst a bad generation can do is pick the
-wrong metric, not run the wrong query.
-
-### Actions (`/actions`)
-
-Pick a role, fill the form, run it. The role decides what is permitted, through
-ontograph's `AccessController` with **default-deny** (its own default is allow,
-which for an action layer is the wrong reading of "no rule").
-
-All nine actions return **`staged`**: validated, permission-checked, recorded in
-the audit trail with the exact payload that would be sent to the TMS, but **not
-sent**, because this platform reads the TMS through a captured snapshot and has
-no write-back endpoint. A dashboard that says a shipment was held when nothing
-was held is worse than one that says the request was staged.
-
-There were three **read-only** actions that genuinely executed and returned a
-number — a rate what-if, an on-time projection and a cost recalculation. Every
-figure all three produced came from the generated execution data in `tms_sim`:
-a cost the snapshot does not carry, a carrier it does not name, a distance
-recorded as 0 m on every leg. Migration 0018 dropped that schema, so they could
-only answer 409, and they have been withdrawn rather than left as three menu
-entries that can only fail. The machinery for a read-only action is intact —
-declare one, register its implementation, and it executes — which is what
-should happen the day the TMS starts sending actuals.
-
-This is also why the Business Analyst role, which the assistant runs as, now
-carries **no action permission at all**: everything left in the catalogue
-mutates, and the assistant may not run any of it.
+A widget names a **metric** and how to slice it; it never carries SQL, so the
+worst a bad generation can do is pick the wrong metric, not run the wrong query.
+`/dashboards/history` shows where each board came from and lets you rename, back
+up to a file and restore — a restore validates every widget against the
+**current** metrics and skips one whose metric no longer exists.
 
 ### The AI-FDE assistant (`/assistant`)
 
-Named after Palantir's forward deployed engineer: the person who sits with a
-business user and turns "am I losing money on the Chicago lane" into a working
-artefact.
+Named after Palantir's forward deployed engineer. It has **no database
+connection** and calls the ontology service **as the signed-in user**, so it can
+create exactly what that user may create (analyst and above) and delete only if
+they are an admin.
 
-It has **15 tools and no database connection**. It cannot write SQL — it can only
-ask questions the ontology already knows how to answer, so a wrong answer is a
-wrong choice of metric, not a wrong query.
+**Modes** decide which tools it sees, per the Palantir AI-FDE prompt
+(`secrets/prompt`), following the platform's path:
+
+| Mode | For | Tools include |
+|---|---|---|
+| `dataConnection` | bringing data in | list connections and their views, create a sync with a cadence, run, schedule |
+| `ontologyEditing` | building | list and profile datasets, create object types, suggest and create links, create metrics and actions, propose functions |
+| `functionsEditing` | functions | profile datasets, draft functions, create metrics |
+| `exploration` (default) | answering | describe, search, aggregate, traverse links, compute metrics |
+| `applicationBuilding` | dashboards | compute metrics, create metrics and dashboards |
+| `governance`, `platformQna` | permissions, the platform itself | roles, audit, documentation |
+
+Capabilities (`notepad`, plans, todos, `viewPermissions`, `filesystem`) survive a
+mode switch. Gating is enforced twice: the schemas a turn receives are filtered
+by mode, and `run_tool` checks the same set, answering a stray call with the mode
+to switch to.
+
+For a build it writes a **plan** first (a live checklist in the chat), profiles
+each dataset, creates the types, draws the links the data supports (at least
+50 % resolving), defines metrics and actions, and ends with what it built — a
+**Built in this turn** card, the metric values, and a Mermaid diagram. A read
+made before a write in the same turn is never served from its duplicate-call
+cache, so it sees what it just created.
 
 Try:
 
-- *"Which carriers have the worst on-time performance, and how much do we spend
-  with them?"*
-- *"Build a freight finance dashboard showing revenue, cost, margin and anything
-  still unbilled."*
-- *"Which parts of this snapshot are measured, and what is missing at source?"*
-- *"What happens to cost and margin if we cut rates on the BMW account by 8 %?"*
-- *"Trace where the shipped weight figure comes from, back to the source API."*
-
-Every answer shows the tool calls behind it, expandable to their arguments and
-results. When it runs a KPI you get the chart; when it builds a dashboard you get
-a link to it.
+- *"Create object types from every synced dataset, link them, and add the metrics
+  and actions that are useful for running freight operations."*
+- *"Sync tms_views.v_transport from the TMS database and refresh it every 20 minutes."*
+- *"Profile the order dataset and tell me which columns the source does not carry."*
+- *"How many orders have no route yet, for which accounts?"*
+- *"Build a dashboard for a transport operations manager."*
 
 ---
 
 ## Operating it
 
 ```bash
-# Re-run the pipeline (idempotent)
-docker compose run --rm pipeline python -m pipeline.run
-
-# Re-land the snapshot from scratch
+# Re-land the captured snapshot from scratch (tms_raw; the views follow it)
 docker compose run --rm pipeline python -m pipeline.run --force
 
-# Regenerate only the ontology layers, leaving tms_raw alone
-docker compose run --rm pipeline python -m pipeline.run --skip-ingest
-
-# Regenerate the ontology without re-landing the snapshot
-docker compose run --rm pipeline python -m pipeline.run --skip-ingest
-
-# See what would happen, write nothing
-docker compose run --rm pipeline python -m pipeline.run --dry-run
-
-# Rebuild the view layer after editing 04/05_*.sql, then regenerate
+# Rebuild the source views after editing db/init/04,05_*.sql, then re-run the
+# syncs of the views that changed
 ./scripts/reload-views.sh
-docker compose run --rm pipeline python -m pipeline.run --skip-ingest
-docker compose restart ontology-service
 ```
-
-`CREATE OR REPLACE VIEW` cannot rename or reorder a column, which is why
-`reload-views.sh` drops and replays the schema rather than replacing views in
-place.
 
 ### Schema changes
 
-`db/init/*.sql` runs **only when the Postgres data directory is empty**, so it
-is the bootstrap for a fresh database and nothing else. Anything that has to
-change a database which already holds data goes in `db/migrations/` as
-`NNNN_name.sql`, and is applied by `pipeline.migrate` on every pipeline run:
-
-```bash
-# Apply anything pending (the pipeline does this automatically at startup)
-docker compose run --rm pipeline python -m pipeline.migrate
-
-# Show applied and pending without changing anything
-docker compose run --rm pipeline python -m pipeline.migrate --status
-```
-
-Each migration runs in its own transaction and is recorded in
-`platform.schema_migration` with a checksum, so editing one after it has been
-applied is reported rather than silently skipped. Migrations are immutable once
+`db/init/*.sql` runs **only when the Postgres data directory is empty**. Anything
+that changes a database which already holds data goes in `db/migrations/` as
+`NNNN_name.sql`, applied by `pipeline.migrate` on every pipeline run, each in its
+own transaction and recorded with a checksum. Migrations are immutable once
 applied: add a new one instead.
 
-`docker compose down -v` still rebuilds from `db/init` — but it **destroys the
-volume**, including every AI-built dashboard and chat conversation. Take a
-backup first:
+```bash
+docker compose run --rm pipeline python -m pipeline.migrate            # apply pending
+docker compose run --rm pipeline python -m pipeline.migrate --status   # show only
+```
+
+**Init is the post-migration truth, not a historical snapshot**:
+`services/pipeline/tests/test_init_matches_migrations.py` fails if an init script
+defines a view the migrations drop without rebuilding. `07_verify.sql` fails
+loudly if an expected object is missing, because a failed init otherwise comes
+back "healthy" with half a schema.
+
+### Backups
 
 ```bash
 ./scripts/backup.sh dump              # everything
-./scripts/backup.sh dump --user-only  # just the work people did
+./scripts/backup.sh dump --user-only  # what people made (below)
 ./scripts/backup.sh restore backups/user-<timestamp>.sql.gz
 ```
 
-`07_verify.sql` runs last and fails loudly if any expected object is missing. This
-matters because of a trap worth knowing: if an init script errors, the container
-exits, the restart policy brings it straight back, it finds a populated `PGDATA`,
-prints *"Skipping initialization"* and comes up reporting **healthy** — with half
-a schema. The pipeline also checks for a complete schema before doing anything and
-tells you to run `down -v`.
+`--user-only` keeps what nothing can rebuild: connections, syncs and schedules,
+the ontology (types, links, actions, metrics and their change history),
+functions, dashboards, notes, chats, the audit trail and users. It leaves out
+what can: the TMS snapshot (the pipeline re-lands it) and the datasets (their
+syncs re-run). Restore one into a freshly **migrated** database before the
+ontology service first starts — the script's header gives the four commands.
 
 ### Troubleshooting
 
 | Symptom | Cause |
 |---|---|
 | Pipeline: "database schema is incomplete" | An init script failed on first boot. `docker compose down -v && docker compose up -d`. |
-| Ontology service waits forever at boot | No published ontology. Run the pipeline. |
-| Assistant: "language model is not ready" | Check `/health`. With Ollama, the model may not be pulled: `docker compose exec ollama ollama pull qwen2.5:7b-instruct`. |
-| Assistant is very slow, then answers | Ollama primary on CPU, timing out and failing over. Set `LLM_PROVIDER=azure_openai`, or use a GPU. |
-| "ports are not available … 11434" | A native Ollama on the host. Change `OLLAMA_PORT`. |
+| Ontology service waits at boot | Migrations not applied. Check `docker compose logs pipeline`. |
+| A sync fails with "not readable" | The view was renamed or the connection's user lost `SELECT` on it. |
+| An object type's queries fail after a sync | The source dropped a column; the sync's run names the property. |
+| Assistant: "language model is not ready" | Check `/health`; usually the Azure endpoint or key. Everything else works without it. |
 | Anything from the host takes ~130 s | `localhost` resolving to `::1`. Use `127.0.0.1`. |
 
 ---
 
 ## Spaces, projects and resources
 
-`/spaces` is the workspace: where things live and how they are found.
-
-```
-space  ->  project  ->  folder (nestable)  ->  resource
-```
-
-A **space** is environment-scoped, and one exists for each environment from the
-start — **Sandbox, Development, Staging, Production** — because the environment
-list is fixed and a missing space is just a hole someone has to fill by hand.
-Separating them is the point: a pipeline promoted to production must not share
-a namespace with the sandbox copy someone is experimenting on. Each space card
-carries an environment tone, so acting on the wrong one is harder to do by
-accident.
-
-A **resource** is the addressable unit. Nine kinds:
-
-| Kind | Points at | Preview shows |
-|---|---|---|
-| Connection | a PostgreSQL host or a REST API | what the source reports about itself, and its syncs |
-| Repository | a code repository | kind, branch, files, commits, last build |
-| Dataset | a view, or a table a sync or a build wrote | schema, live sample rows, row count, lineage |
-| Object Type | an ontology type | properties, links, actions, row count |
-| Link Type | a discovered link | cardinality, key mapping, match ratio |
-| Action Type | an ontology action | parameters, permissions, targets |
-| Metric | a KPI in the catalogue | category, unit, the view it reads |
-| Pipeline | a pipeline slug | version, node/edge count, validation status |
-| Dashboard | a dashboard slug | widget count, provenance |
-
-Opening one shows a **preview window** with the same anatomy every time —
-header, tabs, body — so the shape of the answer does not change with the kind
-of thing being asked about. Only tabs with content appear: a link type has no
-rows to preview, and an empty tab is worse than no tab.
-
-### Filling the sandbox
-
-```bash
-# Idempotent: does nothing once the sandbox has a project
-curl -X POST -H "authorization: Bearer $TOKEN" .../api/spaces/sandbox/seed
-```
-
-or press **Fill from the ontology** in the UI. It creates a *TMS Platform*
-project with `/Connections`, `/Code`, `/Datasets`, `/Ontology/{Object types,
-Links,Action Types,Metrics}` and `/Outputs`, then registers a resource for the
-live connection, one for each code repository, one dataset per source view, and
-every object type, link, action, metric, dashboard and pipeline — about 100
-resources, all pointing at something real.
-
-The connection it registers is a usable one: it carries the host, port,
-database and user parsed from the DSN the service is already running against,
-plus the *path* of the Docker secret holding the password. It can be tested and
-synced through, rather than being a card describing a database it has no way to
-reach.
-
-### Datasets
-
-A dataset is the artefact the platform was missing: a pipeline could describe
-how data becomes an ontology, but produced nothing anyone could open, share or
-build on.
-
-Register one from the explorer (**Register dataset**) or straight from the
-canvas — select an Object Type node in the pipeline builder and press **Create
-dataset from this node**. Either way the backing view is checked against the
-published ontology first, so a dataset always points at something real; a view
-the ontology does not expose is refused with the reason.
-
-### Connections, and getting data through one
-
-A connection used to be a business card. You could register a PostgreSQL
-source, press **Test connection**, be told it answered — and that was the whole
-of it. Nothing could come through it, and the panel that claimed to list "every
-table this connection can read" was querying the *platform's own* `pg_class`
-over three hardcoded schemas, so a source on another host was described with
-this platform's tables. Both are fixed.
-
-The model is Foundry's:
-
-```
-connection resource  ──▶  sync  ──▶  connection_raw.<table>  ──▶  dataset
-        (host, credential      (one table,        (landed here)     (a card you
-         REFERENCE)             re-runnable)                         can open)
-```
-
-**Two connectors.** Create one from **Connections** in the nav, or from inside a
-project in `/spaces` — both open the same dialog.
-
-| Connector | A sync names | Notes |
-|---|---|---|
-| **PostgreSQL** | a schema and a table | the source's catalogue is listed for you, so a sync cannot name a table its user cannot read |
-| **REST API** | a path, and where the records sit in the response | every payload this platform was built from came from one of these |
-
-A REST source has no catalogue to list — there is no standard way to ask an
-HTTP API what it exposes — so the path is typed and checked by fetching it
-before the sync is stored. Its **records path** matters more than it looks:
-
-```
-POST a sync on /api/tags with no records path
-→ The response is an object, not a list of records. Its records look like
-  they are at 'models' — set the records path to one of those. Without it
-  this would land the whole document as a single row.
-```
-
-Guessing which key holds the rows is how a sync lands one row containing the
-whole document and reports a clean run, so it refuses and says where the
-records appear to be. JSON keys are normalised to column names (`orderNumber`
-→ `order_number`) and every rename is reported; two keys that normalise the
-same way both survive, suffixed, because dropping one silently is worse.
-
-A **sync** is a named pull from one table on the source. Two modes:
-
-| Mode | What it does | When it is wrong |
-|---|---|---|
-| `snapshot` | drops the landing table and rebuilds it | never, but it re-reads everything each run |
-| `incremental` | appends rows past the last cursor value | if the source edits rows in place without moving the cursor |
-
-An incremental sync without a cursor column is refused — by the service *and*
-by a `CHECK` constraint — because without one every run would re-read the whole
-table and append it, silently doubling the dataset.
-
-Declare one from the connection's preview window, or commit a `*.sync.json`
-file to a transforms repository. Either way the source table is checked against
-the far side's catalogue first, so a sync cannot name a table the connection's
-user cannot read.
-
-**What a run reports.** Rows read, rows before, rows after, the cursor it moved
-to, and `truncated` when it stopped at the row limit — because a partial table
-reported as complete is the failure mode worth designing against. Columns whose
-remote type has no local equivalent (an enum, a domain, PostGIS geometry) land
-as `text` and are listed by name, so a number arriving as text is explained
-rather than discovered.
-
-**What is never stored.** The password. A connection records the *name* of an
-environment variable or the *path* of a Docker secret, resolved at the moment of
-use. A credential in `platform.resource` would be readable by anyone who can
-read the workspace and would land in every backup.
-
-**On the reader being bounded.** A run reads up to `rowLimit` rows into memory
-and then writes them, in batches sized from the column count so a statement
-never exceeds PostgreSQL's parameter limit. That bound is why the limit exists
-and why reaching it is reported rather than hidden.
-
-### Stale references
-
-Resources point at the rest of the platform **by api_name or slug, not by
-foreign key**, because the pipeline replaces every row in the ontology tables
-on each run. A real foreign key would either block regeneration or cascade a
-user's whole workspace away with it.
-
-The cost is that a reference can go stale, so a resource whose target no longer
-exists is marked `unresolved` and says why, rather than rendering an empty
-window as though nothing were wrong.
-
-### Row counts
-
-The connection preview reports **planner estimates**, not exact counts: an
-exact count over every table would be a table scan per table on every panel
-open. Tables Postgres has never analysed are shown as `+N?` rather than folded
-into the total — `reltuples` is `-1` for those, and summing them produced
-negative row counts.
-
-## Code repositories
-
-`/repos`. Before this there was nowhere to keep work: a pipeline was a canvas, a
-function was one definition pasted into a dialog, and neither had a file, a
-history, or a way to publish several related changes as one reviewed act.
-
-Three kinds, because the three jobs produce different things:
-
-| Kind | Files it acts on | Building produces |
-|---|---|---|
-| **python** | `transforms/*.py` | runs them; each must write a dataset in `repo_out` |
-| **transforms** | `*.sync.json`, `transforms/*.sql` | syncs that run, and tables in `repo_out` |
-| **functions** | `functions/*.sql`, `.py`, `.ts` | entries in the function catalogue, as **proposed** |
-
-Three are seeded in the sandbox, and all three build:
-
-```
-TMS Python Transforms  transforms/order_exception_scores.py  90 rows in repo_out
-TMS Data Ingestion     syncs/orders.sync.json                90 rows through the connection
-                       transforms/order_volume_by_lane.sql   67 lanes in repo_out
-TMS Functions          functions/avg_weight_per_piece.sql    averageWeightPerPiece
-                       functions/orders_by_mode.sql          ordersByTransportationMode
-```
-
-### Python transforms
-
-Foundry's shape, and they really run:
-
-```python
-from transforms.api import transform, Input, Output
-
-
-@transform(
-    output=Output("repo_out.order_exception_scores"),
-    orders=Input("tms_views.v_order"),
-)
-def compute(orders, output):
-    scored = []
-    for order in orders:
-        reasons = []
-        if order["is_unplanned"]:
-            reasons.append("no route planned")
-        if order["has_implausible_weight"]:
-            reasons.append("implausible weight")
-        scored.append({"order_number": order["order_number"],
-                       "reasons": "; ".join(reasons) or None})
-    output.write(scored)
-```
-
-`Input` arrives as a list of dicts; `output.write(rows)` takes a list of dicts
-back. Column types are inferred from the values — a column is only given a
-narrow type when every non-null value in it fits, so one string among the
-numbers makes the whole column `text` rather than failing. Numbers arrive as
-numbers: `bigint` and `numeric` cross the driver as strings, and they are
-converted back **using the column's real type**, so a text column that happens
-to hold digits is not silently turned into one.
-
-**A transform must produce a dataset.** This is the rule that makes the kind
-coherent, and it is enforced two ways:
-
-```
-transforms/no_output_at_all.py -> failed
-  declares no Output, so it can produce no dataset.
-  Add one: @transform(output=Output("repo_out.<table>"), ...).
-
-transforms/forgot_to_write.py -> failed
-  compute() never wrote to its Output. Call output.write(rows) with a list
-  of dicts, or return the rows from the function.
-```
-
-The build is marked **failed** and names both files — while the working
-transform in the same build still produced its 90 rows, because a broken file
-should not hide three working ones.
-
-**Where the code runs.** A `python3` subprocess inside the ontology service,
-with an empty environment, a 60-second limit, row caps in and out, and **no
-database handle**: the relations it declared are read by the service, against
-the same allow-list a dataset is checked against, and handed over as data. A
-transform may read `tms_views.*` and the schemas the platform writes itself,
-and may write only into `repo_out` — the view layer is the contract the
-ontology is generated from and is not a build's to overwrite.
-
-It is **not** a sandbox against a determined adversary. It shares a container
-with the service, so anyone who can commit and press Build can run code there.
-That is the same trust as writing a SQL node and it is gated at the same role,
-but it is a larger surface, and pretending otherwise would be the dishonest
-half of the feature.
-
-### What a SQL or function file declares
-
-A header of `key: value` comment lines, in whichever comment syntax the
-language uses. A decorator would be closer to Foundry, but a decorator is code,
-and nothing here executes code.
-
-```sql
--- @output repo_out.order_volume_by_lane
-SELECT lane, count(*) AS orders FROM connection_raw.… GROUP BY lane
-```
-
-```sql
--- name: Average Weight Per Piece
--- businessQuestion: How heavy is an average piece of freight we move?
--- returns: scalar
--- unit: kg
-SELECT round(avg(gross_weight_kg / nullif(piece_count, 0))::numeric, 2) …
-```
-
-### What a build will not do
-
-- **SQL never becomes arbitrary code.** A SQL transform goes through the same
-  compiler a pipeline node does — one statement, `SELECT` or `WITH` only — and
-  is materialised by `CREATE TABLE … AS SELECT * FROM (<sql>)`. Wrapping it in a
-  subquery is what makes "read-only" structural rather than merely checked: a
-  non-SELECT is a syntax error in that position, and PostgreSQL rejects a
-  data-modifying CTE anywhere but the top level. (A **python** repository is the
-  deliberate exception, described above.)
-- **It will not write outside `repo_out`.** The view layer is the contract the
-  ontology is generated from; a build that could replace a view could silently
-  change every object type built on it.
-- **It will not approve a function.** Publishing puts a definition in the
-  catalogue as `proposed`, which computes nothing and which no dashboard may
-  use. Approving is a separate admin act on `/functions` — the whole point of
-  the proposed/active split is that the two are not the same click.
-- **It will not replace an active definition.** That file is reported as
-  `skipped`, with what to do instead. An active function is what a dashboard
-  already renders, and a build is not a review.
-- **A Python or TypeScript file under `functions/` is published, not run.**
-  A function is something a dashboard calls, which is a different contract from
-  a transform that runs once at build time: the catalogue executes SQL, and the
-  other two languages are stored, reviewable, and reported as not executable.
-
-### Editing
-
-`/repos/<slug>` is a file tree, an editor and a toolbar. **New file** starts
-from a template for the repository's kind rather than an empty buffer, Tab
-indents, Ctrl+S saves, and **Commit** snapshots the tree with a message.
-Deleting a file removes it from the working tree; the last commit still has it.
-
-### Builds build a commit
-
-Not the editor. A build of uncommitted edits would produce a number nobody
-could reproduce, and reproducing a number is most of what a repository is for.
-One artifact is recorded per file, so a build that half worked says exactly
-which half: a failing transform does not hide three working ones, and the run
-is marked failed with every file named.
-
-## Pipeline builder
-
-`/pipeline` is a canvas where a pipeline is drawn — sources, transforms, the
-object types they produce, the links and actions on those, and the dashboards
-at the end.
-
-It is not a drawing tool that resembles a data platform. Every node is
-validated against the **published ontology**: an Object Type node naming a type
-the registry does not have is an error, and a Link node whose cardinality
-contradicts the one the pipeline discovered in the data is an error too. The
-palette is the real ontology — 20 object types, 40 links, 9 actions, 14 KPIs —
-so a node is configured by choosing something that exists rather than by typing
-a name.
-
-| Node group | Kinds |
-|---|---|
-| Data | Data Source, Dataset |
-| Transform | Filter, Join, Aggregate, SQL, Python |
-| Ontology | Object Type, Link Type, Action Type |
-| AI | LLM |
-| Output | Output, Dashboard, Validation |
-
-Which groups may feed which kinds is part of the model, so an illegal
-connection is refused with a reason rather than drawn.
-
-**Validation** runs server-side as the graph is edited. Errors block a run;
-warnings do not — "this object type does not exist" makes the pipeline
-meaningless, "this node has no description" only makes it rude. Every issue
-carries the node it belongs to, so clicking one in the bottom panel focuses
-that card.
-
-**Runs** really run (migration 0014). Each node compiles to one SELECT and is
-materialised as a table in `pipeline_out`, so every row count, duration and
-error the panel shows comes from the database having done the work rather than
-from a ratio. Before that a run estimated — a filter was assumed to keep 60 %,
-an aggregate to collapse 50:1 — and every run was stored with
-`is_simulated = true`; runs now record `is_simulated = false` and name the
-table each node wrote.
-
-**Versions** are kept on every save (`platform.pipeline_version`), and
-restoring an old one creates a new version rather than rewriting history.
-
-Keyboard: `N` add node · `Ctrl/Cmd+S` save · `Ctrl/Cmd+Z` undo ·
-`Ctrl/Cmd+Shift+Z` redo · `Delete` remove the selected node · `F` fit.
-
-```bash
-# The palette the builder offers, straight from the published ontology
-curl -H "authorization: Bearer $TOKEN" .../api/pipelines/palette
-
-# Validate a graph without saving it
-curl -X POST -H "authorization: Bearer $TOKEN" -d '{"graph":{…}}' .../api/pipelines/validate
-```
-
-Editing a pipeline needs the `analyst` role; deleting one needs `admin`.
-Reading, validating and the palette are `viewer`.
-
-## Choosing the model per conversation
-
-The assistant's composer has a model picker. **Ollama is the default** where it
-is usable; the option falls back to whatever is actually available, because a
-default that cannot answer is not a default.
-
-An explicit choice is honoured exactly, with **no failover**: someone who
-picked the local model should be told it is unreachable rather than have the
-hosted one answer — and be billed for it — without saying so. `Automatic`
-keeps the server's configured chain and its failover.
-
-The picker reports live availability, and flags Ollama as **slow (CPU)** when
-no GPU offload is detected. That is not cosmetic: a 7B model with this
-fifteen-tool schema needs minutes per round on CPU, and on hardware without a
-GPU it will usually exhaust `OLLAMA_TIMEOUT` (default 300s) before answering.
-With a GPU it is the better choice; without one, Azure answers in seconds.
-
-## Dashboard history and backup
-
-`/dashboards/history` shows every dashboard with where it came from: the
-conversation that built it, the prompt it was built from, and every rename it
-has been through.
-
-- **Search** matches the name, description, prompt, creator and *previous*
-  names — people look for a board by what they asked for, or by what it used to
-  be called.
-- **Rename** gives a generated board a name of your own. The slug follows the
-  title (so the URL stays readable), the old name and slug are recorded, and a
-  clash with an existing name is refused rather than silently resolved.
-- **Back up to file** downloads every dashboard as JSON to your machine, which
-  is the copy that survives `docker compose down -v`. **Restore** reads one back.
-
-A restore validates each dashboard against the **current** ontology before
-writing it: a backup taken before the KPI catalogue changed can name metrics
-that no longer exist, and importing those would put a permanently broken widget
-on someone's screen. Such a dashboard is skipped with its reason and the rest
-still land.
-
-A dashboard outlives the chat that made it — retention purges conversations and
-the foreign key is `ON DELETE SET NULL` — so the history says *purged* rather
-than implying the board never had a conversation.
+`/spaces` is the workspace: `space → project → folder → resource`. **Sandbox,
+Development, Staging and Production** exist from the start, each with its own
+connections, syncs, datasets, ontology, functions, dashboards and conversations.
+The sandbox is set up at boot with a *TMS Platform* project (`/Connections`,
+`/Datasets`, `/Ontology`, `/Outputs`) and the platform-database connection.
+
+A **resource** is the addressable card. Seven kinds: connection, dataset, object
+type, link type, action type, metric and dashboard. Datasets are filed by their
+sync; ontology cards are kept in step with the ontology after every change. Cards
+point at what they describe by api name or relation, not by foreign key, so a
+card whose target was deleted is marked `unresolved` rather than rendering empty.
+
+---
 
 ## Security and operations
 
 ### Authentication
 
-Every API route requires a bearer token except `/health`, which the compose
-healthcheck probes and which carries no detail. The ontology service is the
-only thing that issues a token; the assistant verifies the same token with the
-shared `AUTH_JWT_SECRET`, so one sign-in works across both APIs.
+Every API route requires a bearer token except `/health`. The ontology service
+issues tokens; the assistant verifies them with the shared `AUTH_JWT_SECRET`, so
+one sign-in works across both APIs.
 
-Two role concepts, deliberately separate:
-
-| | What it decides | Values |
+| | Decides | Values |
 |---|---|---|
 | `role` | which API routes are reachable | `viewer`, `analyst`, `admin` |
-| `ontology_role` | which **actions** may be executed | the roles declared in the ontology |
-
-A dispatcher and a finance user are both `analyst` on the platform but may run
-different actions, which one column could not express.
+| `ontology_role` | which **actions** may be executed | the five ontology roles |
 
 | Route | Needs |
 |---|---|
-| reads: object types, objects, KPIs, lineage, dashboards | `viewer` |
-| dashboard create / validate, action validate / apply | `analyst` |
-| audit trail, registry reload, dashboard delete | `admin` |
+| reads: object types, objects, metrics, datasets, profiles, dashboards | `viewer` |
+| connections, syncs, schedules; object types, links, actions, metrics; function proposals; dashboards | `analyst` |
+| deleting anything, approving functions, the audit trail, registry reload | `admin` |
 
-Anything under `/api` added later is authenticated by default and needs at
-least `viewer`: the guard is mounted once, ahead of the routes, so forgetting
-about a new route makes it *demand a login* rather than leaving it anonymous.
+Anything under `/api` added later needs at least `viewer`: the guard is mounted
+once, ahead of the routes.
 
 ```bash
 docker compose run --rm pipeline python -m pipeline.users list
-docker compose run --rm pipeline python -m pipeline.users add jo analyst '<password>'     --ontology-role tms:DispatcherRole
-docker compose run --rm pipeline python -m pipeline.users passwd jo '<password>'
+docker compose run --rm pipeline python -m pipeline.users add jo analyst '<password>' --ontology-role tms:DispatcherRole
 docker compose run --rm pipeline python -m pipeline.users revoke jo   # kills issued tokens
 ```
 
 Passwords are scrypt, in a format both Python and Node derive from their
-standard library, so neither service carries a hashing dependency.
-
-The assistant calls the ontology service **as the signed-in user**, forwarding
-their token, so its queries are bound by their permissions and the audit trail
-names a person rather than the assistant.
+standard library.
 
 ### Secrets
 
 `./scripts/init-secrets.sh` writes `./secrets/*`, which compose mounts at
-`/run/secrets` and each service reads through a `*_FILE` variable. They are not
-plain `environment:` values, which `docker inspect` prints to anyone who can
-run it. `./secrets` is gitignored.
+`/run/secrets`; each service reads them through a `*_FILE` variable, not plain
+`environment:` values that `docker inspect` would print. `./secrets` is
+gitignored.
 
 | File | Used by |
 |---|---|
 | `jwt_secret` | both APIs, to sign and verify tokens |
-| `postgres_password` | Postgres |
+| `postgres_password` | Postgres, and the sandbox connection's credential reference |
 | `database_url` | all three services |
 | `azure_openai_key` | the assistant |
 
 ### Cost controls
 
-`/api/assistant/chat` reaches a paid model for up to `AI_FDE_MAX_TOOL_ROUNDS`
-rounds, so two limits apply per user: a request rate
-(`CHAT_RATE_PER_MINUTE`, `CHAT_RATE_BURST`) and a rolling 24-hour token budget
-(`CHAT_DAILY_TOKEN_BUDGET`). Both are **per process** — running more than one
-`ai-fde` replica multiplies them, and the service logs that warning at startup.
+`/api/assistant/chat` has a per-user request rate (`CHAT_RATE_PER_MINUTE`,
+`CHAT_RATE_BURST`) and a rolling 24-hour token budget (`CHAT_DAILY_TOKEN_BUDGET`),
+both per process. Every turn's tokens and price are recorded — including a turn
+the model stopped part way through — and shown on the turn and at
+`/assistant/cost`.
 
-### Simulated data
-
-There is none. The `tms_sim` schema and every metric that rested on it were
-removed in migration 0018, and `PIPELINE_SIMULATE_EXECUTION=true` refuses
-rather than regenerating. 14 KPIs remain, each computable from the captured
-payload.
-
-`ALLOW_SIMULATED_DATA=false` stays in the compose file as a second lock: it
-refuses any KPI, widget or action still flagged `depends_on_simulation` with a
-**409** and an explanation. Nothing carries that flag today, so it currently
-gates nothing — which is the state it is meant to be in.
-
-### Retention
+### Retention and logs
 
 `CHAT_RETENTION_DAYS` purges conversations idle longer than the window on each
-pipeline run; `0` disables it. Set a real window if answers can quote customer
-data. A session can be exempted with `platform.chat_session.is_retained`, and
-each purge is recorded in `platform.retention_run`.
-
-### Logs
-
-Both services emit one JSON line per request carrying a `requestId`, and the
-assistant forwards that id to the ontology service, so a single chat turn and
-every query it caused share one value:
-
-```bash
-docker compose logs ai-fde ontology-service | grep '<request-id>'
-```
-
-A 5xx returns only `{"error": "Internal server error.", "requestId": "..."}`;
-the message, type and stack stay in the log under that id.
+pipeline run (`0` disables it). Both services emit one JSON line per request
+carrying a `requestId`, forwarded from the assistant to the ontology service, so
+one chat turn and every query it caused share one value. A 5xx returns only the
+request id; the detail stays in the log.
 
 ### Tests
 
 ```bash
-cd services/ontology-service && npm test          # 47 tests
-cd services/ai-fde          && pytest tests/ -q   # 19 tests
-cd services/pipeline        && pytest tests/ -q   # 19 tests
+cd services/ontology-service && npm test          # unit tests (vitest)
+cd services/ai-fde          && pytest tests/ -q
+cd services/pipeline        && pytest tests/ -q
+cd e2e && npm test                                # browser journey, against a running stack
 ```
 
-The TypeScript tests cover the dynamic SQL builders in `objectSet.ts` and
-`kpi.ts` — identifiers allowlisted, every value bound, limits clamped and
-coerced. `.github/workflows/ci.yml` runs all of it plus a typecheck, an
-`nginx -t` and a full image build.
+They cover the SQL builders (identifiers allowlisted, values bound, limits
+clamped), the function guard, the interval parser, dataset profiling's role
+suggestions, the definition builder (held to ontograph's own validator and
+`AccessController`), link naming, the assistant's mode gating, tool schemas,
+write-aware cache and failure summaries, and - for workspaces - role inference,
+request parsing, feasibility decisions, derived expressions, proposals and
+follow-ups, registration, space roles, connection address classes, the vault
+and the built-in planner. `e2e/` drives a browser through sign-up, connect,
+import, ask, approve and the built board (see `e2e/README.md`). `.github/workflows/ci.yml` runs all of
+it plus typechecks, an `nginx -t` and a full image build.
 
 ### Known limits
 
-- Rate limiting, the token budget and the ontology registry are all in-process,
-  so horizontal scaling needs a shared store and a cache-invalidation story.
-- The pipeline reads a relative host path (`../api_responses`) and runs once.
-  There is no schedule, no incremental ingest and no late-data handling;
-  production needs the real TMS API or object storage behind it.
+- Rate limiting, the token budget, the registry and the scheduler are
+  in-process; horizontal scaling needs a shared store (the scheduler's claim
+  `UPDATE` already prevents double-firing).
+- A sync reads its rows into memory, bounded by its row limit; there is no
+  streaming or incremental mode.
+- Actions are staged; there is no write-back to a source.
 - No metrics or tracing, only structured logs.
 
 ## Layout
 
 ```
-db/init/              01 raw schema · 02 reference data · 03 simulation schema
-                      04 semantic views · 05 KPI views · 06 platform · 07 verify
-                      (03 replays on a fresh volume and is dropped again by
-                       migration 0018; nothing reads the schema it creates)
+db/init/              01 raw schema · 02 reference data · 03 (dropped by 0018)
+                      04 source views · 05 source KPI views · 06 platform · 07 verify
 db/migrations/        NNNN_name.sql, applied once each by pipeline.migrate
-services/pipeline/    ingest · simulate (coverage report only) · introspect
-                      relationships · ontology_gen · kpi_catalog · actions
-                      lineage_gen · dashboards
-services/ontology-service/  registry · objectSet · kpi · actions · lineage · dashboards
-                      connections (sources, syncs) · repos (files, commits, builds)
-services/ai-fde/      llm (providers + failover) · tools · agent · prompts · store
-services/ui/          pages: Overview, OntologyManager, ObjectExplorer, GraphView,
-                      LineagePage, Dashboards, Actions, Assistant
+services/pipeline/    migrate · ingest (the TMS snapshot) · users · retention
+services/ontology-service/src/
+                      connections (sources, syncs) · schedules (the loop)
+                      authoring (profile, object types, suggestions, actions, metrics)
+                      builder (edits, links, deletes, history) · definition (document, cards)
+                      functions + sqlGuard · objectSet · kpi · actions · dashboards
+                      spaces · resourceData · documentation · registry · auth
+services/ai-fde/app/  llm (Azure OpenAI) · modes · tools · capability_tools
+                      agent · prompts · store · ontology_client
+services/ui/src/      pages: Overview, OntologyManager, ObjectExplorer, GraphView,
+                      ResourceBrowser (connections, datasets, metrics), Schedules,
+                      Functions, Actions, Dashboards, Assistant, Spaces
 vendor/ontograph-core/      the vendored library — see below
-scripts/              bootstrap.sh · reload-views.sh
-docker-compose.gpu.yml      NVIDIA overlay
+scripts/              bootstrap · init-secrets · backup · reload-views
 ```
 
 ### Changes to the vendored library
 
 `vendor/ontograph-core` is a clone of
 [`openshuyi/ontograph-core`](https://github.com/openshuyi/ontograph-core) with two
-minimal, documented changes, both needed to consume it from Node rather than Bun:
+minimal changes, both needed to consume it from Node rather than Bun:
 
-1. **`tsconfig.build.json` added.** The upstream build emits ESM with
-   extensionless relative imports (`./action-auditor`), which Bun resolves and
-   Node does not, and with `composite: true` the output lands at `dist/src/` while
-   `package.json` points at `dist/index.js`. The added config emits CommonJS with
-   `rootDir: "src"`, so the declared entry point is the real one.
-2. **Two root re-exports added to `src/index.ts`.** `OWLExporter` and
-   `SHACLExporter` exist in `src/exporters/` but are not re-exported from the root
-   index, making them unreachable under CommonJS resolution.
+1. **`tsconfig.build.json` added**, emitting CommonJS with `rootDir: "src"` so the
+   declared entry point `dist/index.js` is the real one.
+2. **Two root re-exports added to `src/index.ts`** for `OWLExporter` and
+   `SHACLExporter`, which were unreachable under CommonJS resolution.
 
-No behaviour was changed. The library's own `OntologyValidator`,
-`ActionValidator`, `AccessController`, `SHACLShapeGenerator` and exporters do the
-real work in the ontology service.
+No behaviour was changed.
 
 ### Charts
 
 Hand-built SVG, not a chart library, so the mark specs are enforceable: 2 px
-surface gaps between fills, 4 px rounded data-ends anchored to the baseline, 2 px
-lines, direct value labels rather than a value axis, recessive grid, crosshair and
-tooltip by default.
-
-The categorical palette is the eight-hue validated order, with separately stepped
-light and dark values — validated against these exact surfaces (`#141416` dark,
-`#fbfbfa` light) rather than one mode being an inversion of the other. Donuts cap
-at three hues plus a neutral "Other", because the all-pairs colour-vision gate
-only clears for the first three slots; a six-slice donut would put
-indistinguishable hues side by side.
+surface gaps between fills, rounded data-ends anchored to the baseline, direct
+value labels, recessive grid. The categorical palette is validated separately
+against the dark (`#141416`) and light (`#fbfbfa`) surfaces, and donuts cap at
+three hues plus "Other".
 
 ---
 
 ## Data notes
 
-Things found in the captured data that shape the model:
+Things found in the captured TMS data that a model built on it should know:
 
-- **20 orders carry an implausible handling-unit weight.** One is 530 units ×
-  77,936 lb = 18,736 t in a single handling unit, roughly 500× a legal truckload.
-  The figures are computed faithfully; the platform flags them as a
-  high-severity exception and exposes `has_implausible_weight` as a property so an
-  analysis can exclude them rather than be silently skewed.
+- **20 orders carry an implausible handling-unit weight** — one is 530 units ×
+  77,936 lb = 18,736 t in a single handling unit. The source view flags them as
+  `has_implausible_weight`, so a metric can exclude them with a condition.
 - **The demo coordinates are not geographically coherent.** Great-circle distance
-  between origin and destination has a median of 5,594 km and a maximum of
-  18,948 km, against planned transit windows of 0.06 to 3.4 days; only 28 of 61
-  transports fall in a plausible road range. Road distance was once derived from
-  the planned transit window to work around this; that derivation went with
-  `tms_sim` in migration 0018, and `total_distance_km` now reads NULL — which is
-  what the snapshot actually supports.
-- **Shipment status reaches 11 and transport status reaches 8**, beyond the enums
-  documented in `../scripts/tms_models.py`. Labels for the undocumented codes are
-  inferred from conventional TMS lifecycle naming and carry `is_inferred = true`
-  all the way into the ontology.
-- **`users_permissions.json` is not ingested.** Despite the name it is the
-  front-end module and route registry — micro-frontend paths and ports — not TMS
-  business data.
-- **`businessentities_entityType_0_None.json` is not ingested** because the API
-  returns HTTP 400 for `entityType=0`.
+  between origin and destination has a median of 5,594 km against planned transit
+  windows of 0.06 to 3.4 days. `total_distance_km` reads NULL, which is what the
+  snapshot supports.
+- **Shipment status reaches 11 and transport status reaches 8**, beyond the
+  documented enums; the inferred labels carry `status_label_is_inferred = true`.
+- **`users_permissions.json` is not ingested** (it is the front-end route
+  registry), and **`businessentities_entityType_0_None.json` is not ingested**
+  (the API returns HTTP 400 for `entityType=0`).
 - **Every party is nearly a location**: 738 of 743 parties hold `LocationRole`,
-  which is why the party-fallback link probe finds the role projections already
-  resolve every reference and prunes itself.
+  which is why `v_location` has 738 rows.

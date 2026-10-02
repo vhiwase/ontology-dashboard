@@ -17,7 +17,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("./db", () => ({ query: vi.fn(async () => []), queryOne: vi.fn(async () => null) }));
 vi.mock("./kpi", () => ({ clearColumnCache: vi.fn() }));
 
-import { resolveFields } from "./builder";
+import { inverseNameFor, resolveFields } from "./builder";
 
 describe("editable fields", () => {
 	it("maps a camelCase field to its SQL column", () => {
@@ -103,5 +103,28 @@ describe("per-kind allow-lists are distinct", () => {
 		expect(() => resolveFields("actionType", { cardinality: "ONE_TO_ONE" })).toThrow(
 			/not an editable field/,
 		);
+	});
+});
+
+describe("inverse link names", () => {
+	it("takes the plain plural when it is free", () => {
+		expect(inverseNameFor("Order", "Account", "orderAccount", new Set())).toBe("orders");
+	});
+
+	it("names a second inverse for the role the link plays", () => {
+		const taken = new Set(["orders"]);
+		expect(inverseNameFor("Order", "Location", "orderOriginLocation", taken)).toBe("originOrders");
+		expect(inverseNameFor("Order", "Location", "orderDestinationLocation", taken)).toBe("destinationOrders");
+	});
+
+	it("falls back to the target when the link has no role in its name", () => {
+		expect(inverseNameFor("Shipment", "Account", "shipmentAccount", new Set(["shipments"]))).toBe(
+			"accountShipments",
+		);
+	});
+
+	it("never returns a name already taken while a free one exists", () => {
+		const taken = new Set(["orders", "originOrders", "locationOrders"]);
+		expect(taken.has(inverseNameFor("Order", "Location", "orderOriginLocation", taken))).toBe(false);
 	});
 });

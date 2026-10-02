@@ -3,7 +3,7 @@
 #  Back up and restore the Postgres volume.
 #
 #      ./scripts/backup.sh dump                 write ./backups/<timestamp>.sql.gz
-#      ./scripts/backup.sh dump --user-only     dashboards, chats and audit only
+#      ./scripts/backup.sh dump --user-only     what people made (see below)
 #      ./scripts/backup.sh restore <file>       load a dump back in
 #      ./scripts/backup.sh list                 show what is in ./backups
 #      ./scripts/backup.sh prune [keep]         delete all but the newest N
@@ -12,10 +12,20 @@
 #  documented step here, so the only copy of a dashboard someone built lived in
 #  a volume that a routine command destroys.
 #
-#  The pipeline can regenerate everything it derives from the source payloads.
-#  What it cannot regenerate is what people made: AI-built dashboards, chat
-#  history and the action audit trail. --user-only captures exactly that, and
-#  is small enough to keep often.
+#  What can be rebuilt is left out of --user-only: the captured TMS snapshot
+#  (the pipeline re-lands it) and the synced datasets (their syncs re-run).
+#  What cannot be rebuilt is kept: the connections, syncs and schedules, the
+#  ontology built from the datasets (object types, links, actions, metrics and
+#  their change history), functions, dashboards, notes, chats, the action
+#  audit trail and users. It is small enough to keep often.
+#
+#  Restore a --user-only dump into a freshly MIGRATED database, before the
+#  ontology service first starts - it creates an empty ontology per space at
+#  boot, which a restored one would collide with:
+#      docker compose down -v && docker compose up -d postgres
+#      docker compose run --rm pipeline python -m pipeline.migrate
+#      ./scripts/backup.sh restore backups/user-<timestamp>.sql.gz
+#      docker compose up -d        # then re-run each sync to refill its dataset
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -36,13 +46,32 @@ running() {
     }
 }
 
-# The tables holding work that no pipeline run can reproduce.
+# The tables holding work nothing can reproduce. Parents before children, so a
+# data-only restore satisfies each foreign key as it goes.
 USER_TABLES=(
+    platform.app_user
+    platform.project
+    platform.folder
+    platform.resource
+    platform.connection_sync
+    platform.connection_sync_run
+    platform.schedule
+    platform.schedule_run
+    platform.ontology_version
+    platform.object_type
+    platform.object_property
+    platform.link_type
+    platform.action_type
+    platform.kpi_definition
+    platform.ontology_edit
+    platform.function
+    platform.function_run
     platform.dashboard
+    platform.dashboard_rename
+    platform.notepad_document
     platform.chat_session
     platform.chat_message
     platform.action_audit
-    platform.app_user
 )
 
 cmd_dump() {
@@ -86,8 +115,9 @@ cmd_restore() {
     else
         compose exec -T "$SERVICE" psql -U "$PG_USER" -d "$PG_DB" < "$file"
     fi
-    echo "Restored. Reload the ontology service so it re-reads the registry:"
-    echo "  docker compose restart ontology-service"
+    echo "Restored. Start (or restart) the services so the ontology is re-read,"
+    echo "then run each sync once to refill the datasets it lands:"
+    echo "  docker compose up -d && docker compose restart ontology-service"
 }
 
 cmd_list() {
@@ -120,7 +150,7 @@ case "${1:-}" in
     list)    cmd_list ;;
     prune)   shift; cmd_prune "$@" ;;
     *)
-        sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac

@@ -33,6 +33,24 @@ interface ChartProps {
 	height?: number;
 	/** Axis title for the value axis. */
 	valueLabel?: string;
+	/** Click a bar, slice or point to filter by it (cross-filtering). */
+	onSelect?: (label: string) => void;
+	/** The label currently filtered on: drawn at full strength, the rest dimmed. */
+	selected?: string | null;
+	/** How a category or period label reads: "1997-04-01" -> "Apr 1997". */
+	formatLabel?: (label: string) => string;
+	/** A period the data stops part-way through: drawn dashed, not as a fall. */
+	partialLabel?: string | null;
+	/**
+	 * Whether the parts add up to a whole. A donut of averages has no total,
+	 * so its centre stays empty rather than showing a sum of averages.
+	 */
+	additive?: boolean;
+}
+
+/** Opacity for a mark: everything full until something is selected. */
+function markOpacity(label: string, selected: string | null | undefined): number {
+	return selected === null || selected === undefined || selected === label ? 1 : 0.32;
 }
 
 const SERIES = [
@@ -160,6 +178,9 @@ function HorizontalBars({
 	unit,
 	target,
 	width,
+	onSelect,
+	selected,
+	formatLabel = (label) => label,
 }: ChartProps & { points: Point[]; width: number }) {
 	const { tooltip, show, hide } = useTooltip();
 	const rowHeight = 26;
@@ -216,22 +237,24 @@ function HorizontalBars({
 								textAnchor="end"
 								className="chart-label"
 							>
-								{shortLabel(point.label, Math.max(8, Math.floor(labelWidth / 6.2)))}
+								{shortLabel(formatLabel(point.label), Math.max(8, Math.floor(labelWidth / 6.2)))}
 							</text>
 							<rect
-								className="chart-mark"
+								className={`chart-mark${onSelect ? " selectable" : ""}`}
 								x={x}
 								y={y + gap}
 								width={Math.max(barLength, 2)}
 								height={rowHeight - gap * 2}
 								rx={4}
 								fill={SERIES[0]}
+								opacity={markOpacity(point.label, selected)}
+								onClick={onSelect ? () => onSelect(point.label) : undefined}
 								onMouseMove={(event) =>
-									show(event, point.label, formatValue(value, format, unit))
+									show(event, formatLabel(point.label), formatValue(value, format, unit))
 								}
 								onMouseLeave={hide}
 							>
-								<title>{`${point.label}: ${formatValue(value, format, unit)}`}</title>
+								<title>{`${formatLabel(point.label)}: ${formatValue(value, format, unit)}`}</title>
 							</rect>
 							{/* Direct value labels, not a value axis: this is the relief the
 							    light-mode contrast warning requires, and it reads faster. */}
@@ -259,6 +282,10 @@ function VerticalBars({
 	target,
 	height = 210,
 	width,
+	onSelect,
+	selected,
+	formatLabel = (label) => label,
+	partialLabel,
 }: ChartProps & { points: Point[]; width: number }) {
 	const { tooltip, show, hide } = useTooltip();
 	const padding = { top: 16, right: 12, bottom: 34, left: 56 };
@@ -312,19 +339,27 @@ function VerticalBars({
 					return (
 						<g key={`${point.label}-${index}`}>
 							<rect
-								className="chart-mark"
+								className={`chart-mark${onSelect ? " selectable" : ""}`}
 								x={x}
 								y={y}
 								width={barWidth}
 								height={Math.max(barHeight, 2)}
 								rx={4}
 								fill={SERIES[0]}
+								opacity={point.label === partialLabel ? 0.45 : markOpacity(point.label, selected)}
+								strokeDasharray={point.label === partialLabel ? "3 2" : undefined}
+								stroke={point.label === partialLabel ? SERIES[0] : undefined}
+								onClick={onSelect ? () => onSelect(point.label) : undefined}
 								onMouseMove={(event) =>
-									show(event, point.label, formatValue(value, format, unit))
+									show(
+										event,
+										formatLabel(point.label) + (point.label === partialLabel ? " (incomplete)" : ""),
+										formatValue(value, format, unit),
+									)
 								}
 								onMouseLeave={hide}
 							>
-								<title>{`${point.label}: ${formatValue(value, format, unit)}`}</title>
+								<title>{`${formatLabel(point.label)}: ${formatValue(value, format, unit)}`}</title>
 							</rect>
 							{/* Labels only when they will not collide. */}
 							{points.length <= 12 && (
@@ -334,7 +369,7 @@ function VerticalBars({
 									textAnchor="middle"
 									className="chart-axis"
 								>
-									{shortLabel(point.label, Math.max(6, Math.floor(slot / 7)))}
+									{shortLabel(formatLabel(point.label), Math.max(6, Math.floor(slot / 7)))}
 								</text>
 							)}
 						</g>
@@ -362,6 +397,8 @@ function LineChart({
 	kind,
 	height = 210,
 	width,
+	formatLabel = (label) => label,
+	partialLabel,
 }: ChartProps & { points: Point[]; width: number }) {
 	const gradientId = useId().replace(/:/g, "");
 	const svgRef = useRef<SVGSVGElement>(null);
@@ -383,12 +420,21 @@ function LineChart({
 			: padding.left + (index / (points.length - 1)) * plotWidth;
 	const scaleY = (value: number) => padding.top + plotHeight - ((value - min) / span) * plotHeight;
 
-	const path = points
+	// A last period the data stops part-way through is drawn dashed: it is not
+	// a fall, it is a month with six days in it.
+	const partialLast = points.length > 1 && partialLabel !== null && partialLabel !== undefined &&
+		points[points.length - 1]!.label === partialLabel;
+	const solid = partialLast ? points.slice(0, -1) : points;
+	const path = solid
 		.map((point, index) => `${index === 0 ? "M" : "L"}${scaleX(index)},${scaleY(point.value as number)}`)
 		.join(" ");
+	const partialPath = partialLast
+		? `M${scaleX(points.length - 2)},${scaleY(points[points.length - 2]!.value as number)} L${scaleX(points.length - 1)},${scaleY(points[points.length - 1]!.value as number)}`
+		: null;
+	// The fill ends with the solid line: the incomplete period is only dashed.
 	const areaPath =
 		kind === "area"
-			? `${path} L${scaleX(points.length - 1)},${scaleY(min)} L${scaleX(0)},${scaleY(min)} Z`
+			? `${path} L${scaleX(solid.length - 1)},${scaleY(min)} L${scaleX(0)},${scaleY(min)} Z`
 			: null;
 
 	const ticks = niceTicks(min, max, 4);
@@ -408,7 +454,12 @@ function LineChart({
 		const clamped = Math.max(0, Math.min(points.length - 1, index));
 		setHoverIndex(clamped);
 		const point = points[clamped];
-		if (point) show(event, point.label, formatValue(point.value, format, unit));
+		if (point)
+			show(
+				event,
+				formatLabel(point.label) + (point.label === partialLabel ? " (incomplete)" : ""),
+				formatValue(point.value, format, unit),
+			);
 	};
 
 	return (
@@ -461,6 +512,9 @@ function LineChart({
 
 				{areaPath && <path d={areaPath} fill={`url(#${gradientId})`} />}
 				<path d={path} fill="none" stroke="var(--series-1)" strokeWidth={2} strokeLinejoin="round" />
+				{partialPath && (
+					<path d={partialPath} fill="none" stroke="var(--series-1)" strokeWidth={2} strokeDasharray="4 4" opacity={0.7} />
+				)}
 
 				{hoverIndex !== null && points[hoverIndex] && (
 					<>
@@ -504,7 +558,7 @@ function LineChart({
 							textAnchor="middle"
 							className="chart-axis"
 						>
-							{shortLabel(point.label, 12)}
+							{shortLabel(formatLabel(point.label), 12)}
 						</text>
 					) : null,
 				)}
@@ -527,7 +581,16 @@ function LineChart({
  * all-pairs CVD gate only clears for the first three categorical slots - a
  * six-slice donut would put indistinguishable hues side by side.
  */
-function Donut({ points, format, unit, height = 210 }: ChartProps & { points: Point[] }) {
+function Donut({
+	points,
+	format,
+	unit,
+	height = 210,
+	onSelect,
+	selected,
+	formatLabel = (label) => label,
+	additive = true,
+}: ChartProps & { points: Point[] }) {
 	const { tooltip, show, hide } = useTooltip();
 
 	const sorted = [...points].sort((a, b) => (b.value as number) - (a.value as number));
@@ -577,38 +640,50 @@ function Donut({ points, format, unit, height = 210 }: ChartProps & { points: Po
 		<>
 			<div style={{ display: "flex", gap: 18, alignItems: "center", flexWrap: "wrap" }}>
 				<svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" style={{ flex: "0 0 auto" }}>
-					{arcs.map((arc) => (
-						<path
-							key={arc.label}
-							className="chart-mark"
-							d={arc.path}
-							fill={arc.color}
-							// 2px surface-coloured ring so adjacent fills never touch.
-							stroke="var(--surface-1)"
-							strokeWidth={2}
-							onMouseMove={(event) =>
-								show(
-									event,
-									arc.label,
-									`${formatValue(arc.value, format, unit)} · ${round(arc.fraction * 100, 1)}%`,
-								)
-							}
-							onMouseLeave={hide}
-						>
-							<title>{`${arc.label}: ${formatValue(arc.value, format, unit)}`}</title>
-						</path>
-					))}
-					<text
-						x={center}
-						y={center - 3}
-						textAnchor="middle"
-						style={{ fontSize: 17, fontWeight: 600, fill: "var(--ink-primary)" }}
-					>
-						{formatValue(total, format === "percent" ? "number" : format, null)}
-					</text>
-					<text x={center} y={center + 14} textAnchor="middle" className="chart-axis">
-						total
-					</text>
+					{arcs.map((arc, index) => {
+						// "Other" folds several categories, so it is not one to filter on.
+						const selectable = Boolean(onSelect) && index < DONUT_MAX_SLICES;
+						return (
+							<path
+								key={arc.label}
+								className={`chart-mark${selectable ? " selectable" : ""}`}
+								d={arc.path}
+								fill={arc.color}
+								opacity={markOpacity(arc.label, selected)}
+								// 2px surface-coloured ring so adjacent fills never touch.
+								stroke="var(--surface-1)"
+								strokeWidth={2}
+								onClick={selectable ? () => onSelect?.(arc.label) : undefined}
+								onMouseMove={(event) =>
+									show(
+										event,
+										formatLabel(arc.label),
+										additive
+											? `${formatValue(arc.value, format, unit)} · ${round(arc.fraction * 100, 1)}%`
+											: formatValue(arc.value, format, unit),
+									)
+								}
+								onMouseLeave={hide}
+							>
+								<title>{`${formatLabel(arc.label)}: ${formatValue(arc.value, format, unit)}`}</title>
+							</path>
+						);
+					})}
+					{additive && (
+						<>
+							<text
+								x={center}
+								y={center - 3}
+								textAnchor="middle"
+								style={{ fontSize: 17, fontWeight: 600, fill: "var(--ink-primary)" }}
+							>
+								{formatValue(total, format === "percent" ? "number" : format, null)}
+							</text>
+							<text x={center} y={center + 14} textAnchor="middle" className="chart-axis">
+								total
+							</text>
+						</>
+					)}
 				</svg>
 
 				{/* Legend is always present for more than one slice: identity is never
@@ -617,8 +692,10 @@ function Donut({ points, format, unit, height = 210 }: ChartProps & { points: Po
 					{arcs.map((arc) => (
 						<span className="legend-item" key={arc.label}>
 							<span className="legend-swatch" style={{ background: arc.color }} />
-							<span>{shortLabel(arc.label, 26)}</span>
-							<span className="muted num">{round(arc.fraction * 100, 1)}%</span>
+							<span>{shortLabel(formatLabel(arc.label), 26)}</span>
+							<span className="muted num">
+								{additive ? `${round(arc.fraction * 100, 1)}%` : formatValue(arc.value, format, unit)}
+							</span>
 						</span>
 					))}
 				</div>

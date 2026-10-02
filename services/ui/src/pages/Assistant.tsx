@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { FunctionReview } from "../components/functions/FunctionReview";
 import { useSpace } from "../SpaceContext";
@@ -23,10 +23,15 @@ import {
 	type ChatArtifact,
 	type ChatResponse,
 	type ChatToolCall,
+	type FeasibilityItem,
+	type ProposalRecord,
 	api,
+	formatPeriod,
 	formatValue,
+	grainOf,
 } from "../api";
 import { Chart, type ChartKind } from "../components/Chart";
+import { ProposalCard } from "../components/ProposalCard";
 import { DataTable, ErrorBanner, Markdown, Spinner, useScrollToBottom } from "../components/common";
 
 interface Turn {
@@ -39,10 +44,11 @@ interface Turn {
 		latencyMs: number;
 		model: string;
 		stoppedBecause: string;
-		failoverReason?: string | null;
 		tokens?: number;
 		costUsd?: number;
 		priced?: boolean;
+		/** The operational mode the conversation is in after this turn. */
+		agentMode?: string;
 	};
 }
 
@@ -57,21 +63,22 @@ interface ProviderOption {
 	model: string;
 	configured: boolean;
 	available: boolean;
-	/** Usable, but slow enough to warn about — a CPU-only local model. */
-	slow: boolean;
 	detail: string | null;
 }
 
 interface ProviderCatalogue {
 	providers: ProviderOption[];
 	auto: { id: string; label: string; resolvedTo: string | null; reason: string | null };
-	/** Which option to preselect; the server yields off Ollama if it is not usable. */
+	/** Which option to preselect. */
 	default: string;
 }
 
 export function Assistant() {
 	const [turns, setTurns] = useState<Turn[]>([]);
-	const [input, setInput] = useState("");
+	// ?prompt= pre-fills the composer - how "Ask the AI-FDE to model it" hands a
+	// request over. It is never sent on its own; the person reads it first.
+	const [searchParams] = useSearchParams();
+	const [input, setInput] = useState(() => searchParams.get("prompt") ?? "");
 	const [busy, setBusy] = useState(false);
 	const [sessionId, setSessionId] = useState<number | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -82,7 +89,11 @@ export function Assistant() {
 	// Pinned per conversation rather than per turn, so a thread does not
 	// silently change model half way through.
 	const [provider, setProvider] = useState<string | null>(null);
-	const { spaceSlug } = useSpace();
+	const { spaceSlug, isPersonal, reload } = useSpace();
+	// A question handed over from elsewhere (the home page's ask box, a
+	// suggestion) arrives as ?q= and is asked once, then cleared from the URL.
+	const [params, setParams] = useSearchParams();
+	const handedOver = useRef<string | null>(params.get("q"));
 	// The resource a chip in a reply opened. An answer that names an object
 	// type should be able to show it, not just spell it.
 	const [previewId, setPreviewId] = useState<number | null>(null);
@@ -107,10 +118,6 @@ export function Assistant() {
 			.then(setHealth)
 			.catch(() => setHealth(null));
 		api
-			.get<{ starters: Starter[] }>("/api/assistant/starters")
-			.then((body) => setStarters(body.starters))
-			.catch(() => setStarters([]));
-		api
 			.get<ProviderCatalogue>("/api/assistant/providers")
 			.then((body) => {
 				setCatalogue(body);
@@ -120,6 +127,14 @@ export function Assistant() {
 			})
 			.catch(() => setCatalogue(null));
 	}, []);
+
+	// Suggestions are written from this space's own metrics, so they follow it.
+	useEffect(() => {
+		api
+			.get<{ starters: Starter[] }>(`/api/assistant/starters?space=${spaceSlug}`)
+			.then((body) => setStarters(body.starters))
+			.catch(() => setStarters([]));
+	}, [spaceSlug]);
 
 	const selected = catalogue?.providers.find((p) => p.id === provider) ?? null;
 
@@ -190,10 +205,10 @@ export function Assistant() {
 						latencyMs: response.latencyMs,
 						model: response.model,
 						stoppedBecause: response.stoppedBecause,
-						failoverReason: response.failoverReason,
 						tokens: response.cost?.totalTokens,
 						costUsd: response.cost?.usd,
 						priced: response.cost?.priced,
+						agentMode: response.agentMode,
 					},
 				},
 			]);
@@ -205,45 +220,34 @@ export function Assistant() {
 		}
 	};
 
-	const llmDown = health && !health.llm.reachable;
-	const modelMissing = health?.llm.reachable && health.llm.modelPresent === false;
-	// The primary can be in cooldown while the fallback answers fine. That is a
-	// working state, not an error, so it gets a note rather than a red banner.
-	const onFallback = Boolean(
-		health?.llm.breakerOpen ||
-			(health?.configuredProvider && health.configuredProvider !== "auto" &&
-				health.provider !== health.configuredProvider),
-	);
+	// Ask the handed-over question once the model catalogue has settled, so it
+	// goes to the same provider the picker shows.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: fire once
+	useEffect(() => {
+		const question = handedOver.current;
+		if (!question || !catalogue) return;
+		handedOver.current = null;
+		params.delete("q");
+		setParams(params, { replace: true });
+		const trimmed = question.trim();
+		// A prompt that ends mid-sentence ("Build me a dashboard about ") is a
+		// starting point to finish, not a question to send.
+		if (/\s$/.test(question) || trimmed.endsWith(" about")) {
+			setInput(question);
+			textareaRef.current?.focus();
+		} else {
+			void send(trimmed);
+		}
+	}, [catalogue]);
 
+	const llmDown = health && !health.llm.reachable;
 	return (
 		<div className="chat">
 			<div className="chat-scroll" ref={scrollRef}>
-				{(llmDown || modelMissing) && (
+				{llmDown && (
 					<div className="banner error" style={{ marginBottom: 12 }}>
 						<strong>The language model is not ready.</strong>{" "}
-						{llmDown ? (
-							<>
-								{health?.provider === "ollama"
-									? "Ollama is not reachable. "
-									: "The configured provider is not reachable. "}
-								{health?.llm.detail}
-							</>
-						) : (
-							<>
-								Ollama is up but the model <code>{health?.model}</code> has not been pulled
-								yet. Run{" "}
-								<code>docker compose exec ollama ollama pull {health?.model}</code> and
-								reload. Everything else in this workbench works without it.
-							</>
-						)}
-					</div>
-				)}
-
-				{onFallback && !llmDown && (
-					<div className="banner" style={{ marginBottom: 12 }}>
-						<strong>Running on the fallback model.</strong>{" "}
-						{health?.llm.lastFailoverReason ?? health?.providerReason}{" "}
-						Answers are unaffected; only which model produces them has changed.
+						The configured provider is not reachable. {health?.llm.detail}
 					</div>
 				)}
 
@@ -260,14 +264,23 @@ export function Assistant() {
 								{health.providerReason}
 							</p>
 						)}
-						<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
-							I know this TMS ontology: {" "}
-							<Link to="/ontology">object types</Link>, their links, the{" "}
-							<Link to="/dashboards">KPI catalogue</Link> and the action layer. Ask me a
-							question about the freight book, or tell me what dashboard you need and I
-							will build it. Every figure I show is measured from your TMS snapshot; where
-							the snapshot does not carry something, I will say so rather than estimate it.
-						</p>
+						{isPersonal ? (
+							<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
+								I work from your <Link to="/ontology">data model</Link>: the tables you imported, the links
+								between them and the <Link to="/dashboards#metrics">metrics</Link> defined on them. Ask for a
+								chart, a KPI, a dashboard or a report. If your data can answer it, you get it; if it needs a
+								new link, a combined dataset or a metric, I draft that for you to approve; if the data cannot
+								answer it, I say what is missing. I never estimate a number.
+							</p>
+						) : (
+							<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
+								I build the ontology from this space's <Link to="/browse/datasets">datasets</Link> - object
+								types, the links between them, metrics and actions - and then answer from it. Ask me to sync a
+								view, to model what has been synced, a question about the data, or to build a dashboard. Every
+								figure I show is measured from the synced data; where the source does not carry something, I
+								will say so rather than estimate it.
+							</p>
+						)}
 						<div className="starters">
 							{starters.map((starter) => (
 								<button key={starter.label} className="starter" onClick={() => void send(starter.prompt)}>
@@ -286,6 +299,50 @@ export function Assistant() {
 						onCitation={openCitation}
 						onAnswer={(answer) => void send(answer)}
 						onReviewFunction={setReviewFunction}
+						onApproved={(settled) => {
+							reload();
+							// Say what changed, in the conversation where it was asked for.
+							const built = settled
+								.map((entry) => entry.result?.built)
+								.find((entry): entry is { kind: "dashboard" | "report"; slug: string; title: string; widgets: number } =>
+									Boolean(entry && "slug" in entry),
+								);
+							if (built) {
+								setTurns((current) => [
+									...current,
+									{
+										role: "assistant",
+										content: `Approved and built: **${built.title}**, a ${built.kind} with ${built.widgets} widgets.`,
+										artifacts: [{ kind: "dashboard", slug: built.slug, title: built.title, widgets: built.widgets, boardKind: built.kind }],
+									},
+								]);
+								return;
+							}
+							// Nothing to open: the question that asked for this can be
+							// answered now, one click away rather than retyped.
+							const asked = turns
+								.slice(0, index)
+								.reverse()
+								.find((entry) => entry.role === "user")?.content;
+							const applied = settled.filter((entry) => entry.status === "applied").map((entry) => entry.title);
+							if (asked && applied.length > 0) {
+								setTurns((current) => [
+									...current,
+									{
+										role: "assistant",
+										content: `Approved: ${applied.join(", ")}.`,
+										artifacts: [
+											{
+												kind: "clarification",
+												question: `Approved: ${applied.join(", ")}. Ask again now?`,
+												options: [{ label: asked, detail: "answered from what you just approved" }],
+												allowFreeText: false,
+											},
+										],
+									},
+								]);
+							}
+						}}
 					/>
 				))}
 
@@ -315,7 +372,11 @@ export function Assistant() {
 					<textarea
 						ref={textareaRef}
 						value={input}
-						placeholder="Ask about orders, carriers, lanes, margin — or ask for a dashboard."
+						placeholder={
+							isPersonal
+								? "Ask for a chart, a KPI, a dashboard or a report — “revenue by country per month”."
+								: "Ask about the data — or ask for a dashboard."
+						}
 						onChange={(event) => setInput(event.target.value)}
 						onKeyDown={(event) => {
 							// Enter sends; Shift+Enter is a newline. Standard for a chat box, and
@@ -345,7 +406,7 @@ export function Assistant() {
 							{catalogue?.providers.map((option) => (
 								<option key={option.id} value={option.id} disabled={!option.available}>
 									{option.label}
-									{!option.available ? " — unavailable" : option.slow ? " — slow (CPU)" : ""}
+									{!option.available ? " — unavailable" : ""}
 								</option>
 							))}
 							{catalogue && (
@@ -357,9 +418,9 @@ export function Assistant() {
 						</select>
 					</label>
 					{selected && <span className="mono">{selected.model}</span>}
-					{selected?.detail && (selected.slow || !selected.available) && (
+					{selected?.detail && !selected.available && (
 						<span className="model-warn" title={selected.detail}>
-							⚠ {selected.slow ? "CPU-only — answers take minutes" : selected.detail}
+							⚠ {selected.detail}
 						</span>
 					)}
 					<span>Enter to send · Shift+Enter for a new line</span>
@@ -445,6 +506,7 @@ function TurnView({
 	onCitation,
 	onAnswer,
 	onReviewFunction,
+	onApproved,
 }: {
 	turn: Turn;
 	/** Opens the workspace resource a :resource[...] chip names. */
@@ -455,6 +517,8 @@ function TurnView({
 	onAnswer: (answer: string) => void;
 	/** Opens the review dialog for a metric the assistant drafted. */
 	onReviewFunction?: (apiName: string) => void;
+	/** A proposal in this turn was approved (with whatever it settled). */
+	onApproved?: (settled: ProposalRecord[]) => void;
 }) {
 	// A clarification arrives as an artifact rather than prose, so the options
 	// stay structured instead of being parsed back out of a sentence.
@@ -512,13 +576,21 @@ function TurnView({
 
 				{turn.artifacts && turn.artifacts.length > 0 && (
 					<div className="col" style={{ gap: 10, marginTop: 10 }}>
-						{turn.artifacts.map((artifact, index) => (
-							<ArtifactView
-								key={index}
-								artifact={artifact}
-								onReviewFunction={onReviewFunction}
-							/>
-						))}
+						<ChangesCard
+							changes={turn.artifacts.filter((artifact) => artifact.kind === "ontologyChange")}
+							onResource={onResource}
+						/>
+						{turn.artifacts
+							.filter((artifact) => artifact.kind !== "ontologyChange")
+							.map((artifact, index) => (
+								<ArtifactView
+									key={index}
+									artifact={artifact}
+									onReviewFunction={onReviewFunction}
+									onApproved={onApproved}
+									onAsk={onAnswer}
+								/>
+							))}
 					</div>
 				)}
 
@@ -562,8 +634,8 @@ function TurnView({
 					<div className="muted" style={{ fontSize: 11, marginTop: 7 }}>
 						{turn.meta.rounds} round{turn.meta.rounds === 1 ? "" : "s"} ·{" "}
 						{(turn.meta.latencyMs / 1000).toFixed(1)}s · {turn.meta.model}
+						{turn.meta.agentMode && ` · mode: ${turn.meta.agentMode}`}
 						{turn.meta.stoppedBecause !== "answered" && ` · ${turn.meta.stoppedBecause}`}
-						{turn.meta.failoverReason && " · answered by the fallback model"}
 						{/* Tokens and cost per turn, so the price of a question is visible
 						    where the question was asked rather than only in a report.
 						    A turn on an unpriced provider says so instead of showing $0. */}
@@ -580,124 +652,153 @@ function TurnView({
 	);
 }
 
+const CHANGE_LABELS: Record<string, { verb: string; glyph: string }> = {
+	dataset: { verb: "Synced", glyph: "▤" },
+	objectType: { verb: "Object type", glyph: "◈" },
+	linkType: { verb: "Link", glyph: "↔" },
+	kpi: { verb: "Metric", glyph: "Σ" },
+	actionType: { verb: "Action", glyph: "⚡" },
+};
+
 /**
- * The decision card for a drafted pipeline.
+ * Everything a turn created, as one card.
  *
- * Its own component because it holds state - a card that has been accepted
- * should say so rather than keep offering the button, and the artifact list
- * re-renders around it.
+ * A build turn creates a dozen things; a card each would bury the answer. One
+ * list, each entry opening the resource it names, is what the reader needs to
+ * check the work.
  */
-function PipelineProposalCard({
-	pipeline,
-	compiled,
+function ChangesCard({
+	changes,
+	onResource,
 }: {
-	pipeline: {
-		slug: string;
-		name: string;
-		description: string | null;
-		graph: { nodes: Array<{ id: string; kind: string; name: string }> };
-		acceptedBy: string | null;
-	};
-	compiled: Array<{ node: string; ok: boolean; detail: string }>;
+	changes: ChatArtifact[];
+	onResource: (kind: string, ref: string) => void;
 }) {
-	const [state, setState] = useState<"pending" | "accepted" | "rejected">(
-		pipeline.acceptedBy ? "accepted" : "pending",
-	);
-	const [busy, setBusy] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-	const nodes = pipeline.graph?.nodes ?? [];
-
-	async function decide(action: "accept" | "reject") {
-		setBusy(true);
-		setError(null);
-		try {
-			if (action === "accept") {
-				await api.post(`/api/pipelines/${pipeline.slug}/accept`);
-				setState("accepted");
-			} else {
-				await api.del(`/api/pipelines/${pipeline.slug}`);
-				setState("rejected");
-			}
-		} catch (exc) {
-			setError((exc as Error).message);
-		} finally {
-			setBusy(false);
-		}
-	}
-
+	if (changes.length === 0) return null;
 	return (
-		<div className="card fn-proposal-card">
-			<div className="row" style={{ gap: 8, alignItems: "flex-start" }}>
-				<span className="rp-glyph" aria-hidden>
-					⑄
-				</span>
-				<div style={{ minWidth: 0, flex: "1 1 auto" }}>
-					<div className="row" style={{ gap: 6 }}>
-						<strong>{pipeline.name}</strong>
-						<span className={`chip ${state === "accepted" ? "good" : state === "rejected" ? "bad" : "warn"}`}>
-							{state === "accepted" ? "accepted" : state === "rejected" ? "rejected" : "proposed"}
-						</span>
-						<span className="chip mono">{nodes.length} nodes</span>
-					</div>
-					<p className="muted" style={{ margin: "3px 0 0", fontSize: 11.5 }}>
-						{pipeline.description || "No description."}
-					</p>
-
-					{/* The graph as a line, which is how a pipeline reads. */}
-					<p className="mono" style={{ margin: "6px 0 0", fontSize: 11 }}>
-						{nodes.map((node) => node.name).join("  →  ")}
-					</p>
-
-					{/* Anything the compiler flagged. A node that compiles but
-					    computes nothing is the failure worth surfacing here. */}
-					{compiled
-						.filter((entry) => !entry.ok || entry.detail.includes("computes nothing"))
-						.map((entry) => (
-							<p
-								key={entry.node}
-								className="muted"
-								style={{ margin: "4px 0 0", fontSize: 11 }}
-							>
-								⚠ {entry.node}: {entry.detail}
-							</p>
-						))}
-
-					{error && (
-						<p className="muted" style={{ margin: "5px 0 0", fontSize: 11, color: "var(--bad)" }}>
-							{error}
-						</p>
-					)}
-
-					<p className="muted" style={{ margin: "5px 0 0", fontSize: 11 }}>
-						{state === "accepted"
-							? "Accepted. You can run it from the Pipeline builder."
-							: state === "rejected"
-								? "Rejected and removed."
-								: "Nothing has run. Accepting makes it runnable."}
-					</p>
-				</div>
-
-				<div className="col" style={{ gap: 5, marginLeft: "auto" }}>
-					{state === "pending" && (
-						<>
-							<button className="btn sm primary" onClick={() => decide("accept")} disabled={busy}>
-								Accept
-							</button>
-							<Link className="btn sm" to="/pipeline">
-								Edit
-							</Link>
-							<button className="btn sm ghost" onClick={() => decide("reject")} disabled={busy}>
-								Reject
-							</button>
-						</>
-					)}
-					{state === "accepted" && (
-						<Link className="btn sm primary" to="/pipeline">
-							Open
-						</Link>
-					)}
-				</div>
+		<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card-head">
+				<h3>Built in this turn</h3>
+				<span className="sub">{changes.length} change{changes.length === 1 ? "" : "s"}</span>
 			</div>
+			<ul className="rb-lineage-list" style={{ margin: 0 }}>
+				{changes.map((change, index) => {
+					const kind = String(change.change);
+					const label = CHANGE_LABELS[kind] ?? { verb: "Changed", glyph: "▫" };
+					const ref = String(change.apiName);
+					return (
+						<li key={`${kind}-${ref}-${index}`}>
+							<span aria-hidden>{label.glyph}</span> <span className="muted">{label.verb}</span>{" "}
+							<button type="button" className="res-chip" onClick={() => onResource(kind, ref)}>
+								{kind === "dataset" ? ref.split(".").pop() : ref}
+							</button>
+							{change.detail ? <span className="muted"> · {String(change.detail)}</span> : null}
+						</li>
+					);
+				})}
+			</ul>
+		</div>
+	);
+}
+
+/** A proposal from the conversation, read in full so the evidence shows. */
+function ProposalArtifact({
+	id,
+	onApproved,
+}: {
+	id: number;
+	onApproved?: (settled: ProposalRecord[]) => void;
+}) {
+	const [proposal, setProposal] = useState<ProposalRecord | null>(null);
+	const [missing, setMissing] = useState(false);
+	useEffect(() => {
+		api
+			.get<ProposalRecord>(`/api/proposals/${id}`)
+			.then(setProposal)
+			.catch(() => setMissing(true));
+	}, [id]);
+	if (missing) return null;
+	if (!proposal) return <Spinner label="Loading the proposal" />;
+	return (
+		<ProposalCard
+			proposal={proposal}
+			compact
+			onSettled={(settled) => {
+				if (settled.some((entry) => entry.status === "applied")) onApproved?.(settled);
+			}}
+		/>
+	);
+}
+
+const STATUS_MARK: Record<string, { mark: string; tone: string; label: string }> = {
+	ready: { mark: "✓", tone: "good", label: "Ready" },
+	needs_approval: { mark: "◐", tone: "warning", label: "Needs approval" },
+	not_possible: { mark: "✕", tone: "critical", label: "Not possible" },
+};
+
+/** What the data can answer, one approval away, or not at all. */
+function FeasibilityArtifact({
+	items,
+	onAsk,
+}: {
+	items: FeasibilityItem[];
+	onAsk?: (text: string) => void;
+}) {
+	const [open, setOpen] = useState(false);
+	if (items.length === 0) return null;
+	const counts = items.reduce<Record<string, number>>((acc, item) => {
+		acc[item.status] = (acc[item.status] ?? 0) + 1;
+		return acc;
+	}, {});
+	return (
+		<div className="feasibility">
+			<button className="feasibility-head" onClick={() => setOpen((value) => !value)}>
+				<span className="muted">Checked against your data:</span>
+				{(["ready", "needs_approval", "not_possible"] as const).map((status) =>
+					counts[status] ? (
+						<span key={status} className={`chip ${STATUS_MARK[status]!.tone}`}>
+							{STATUS_MARK[status]!.mark} {counts[status]} {STATUS_MARK[status]!.label.toLowerCase()}
+						</span>
+					) : null,
+				)}
+				<span className="muted" style={{ marginLeft: "auto" }}>
+					{open ? "hide" : "details"}
+				</span>
+			</button>
+			{open && (
+				<ul className="feasibility-list">
+					{items.map((item, index) => {
+						const status = STATUS_MARK[item.status] ?? STATUS_MARK.ready!;
+						return (
+							<li key={index} className={`feasibility-item ${item.status}`}>
+								<span className={`feasibility-mark ${status.tone}`} aria-label={status.label}>
+									{status.mark}
+								</span>
+								<div>
+									<div>{item.explanation}</div>
+									{item.missing && item.missing.length > 0 && (
+										<div className="muted" style={{ fontSize: 12 }}>
+											Missing: {item.missing.join("; ")}
+										</div>
+									)}
+									{item.alternatives && item.alternatives.length > 0 && (
+										<div className="row" style={{ gap: 5, marginTop: 4 }}>
+											<span className="muted" style={{ fontSize: 12 }}>
+												Try instead:
+											</span>
+											{item.alternatives.slice(0, 4).map((alternative) => (
+												<button key={alternative} className="starter sm" onClick={() => onAsk?.(alternative)}>
+													{alternative}
+												</button>
+											))}
+										</div>
+									)}
+								</div>
+							</li>
+						);
+					})}
+				</ul>
+			)}
 		</div>
 	);
 }
@@ -705,29 +806,25 @@ function PipelineProposalCard({
 function ArtifactView({
 	artifact,
 	onReviewFunction,
+	onApproved,
+	onAsk,
 }: {
 	artifact: ChatArtifact;
 	onReviewFunction?: (apiName: string) => void;
+	onApproved?: (settled: ProposalRecord[]) => void;
+	onAsk?: (text: string) => void;
 }) {
-	// A drafted pipeline. Accept / Edit / Reject, as §18 asks - and the graph
-	// is summarised inline so the decision can be made without leaving the
-	// conversation for a canvas.
-	if (artifact.kind === "pipelineProposal") {
-		const pipeline = artifact.pipeline as {
-			slug: string;
-			name: string;
-			description: string | null;
-			graph: { nodes: Array<{ id: string; kind: string; name: string }> };
-			acceptedBy: string | null;
-		};
-		const compiled = (artifact.compiled as Array<{ node: string; ok: boolean; detail: string }>) ?? [];
-		return (
-			<PipelineProposalCard pipeline={pipeline} compiled={compiled} />
-		);
+	if (artifact.kind === "feasibility") {
+		return <FeasibilityArtifact items={(artifact.items as FeasibilityItem[]) ?? []} onAsk={onAsk} />;
 	}
 
-	// A drafted metric. Deliberately not rendered as a finished result: it
-	// computes nothing until someone approves it, so the card is an invitation
+	if (artifact.kind === "proposal") {
+		const proposal = artifact.proposal as { id: number } | undefined;
+		return proposal?.id ? <ProposalArtifact id={proposal.id} onApproved={onApproved} /> : null;
+	}
+
+	// A drafted function. Deliberately not rendered as a finished result: it
+	// computes nothing until an admin approves it, so the card is an invitation
 	// to review rather than a report of something done.
 	if (artifact.kind === "functionProposal") {
 		const fn = artifact.function as {
@@ -769,21 +866,27 @@ function ArtifactView({
 	}
 
 	if (artifact.kind === "dashboard") {
+		const report = artifact.boardKind === "report";
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
-				<div className="row" style={{ gap: 8 }}>
+			<Link className="board-artifact" to={`/dashboards/${String(artifact.slug)}`}>
+				<span className={`board-kind ${report ? "report" : ""}`} aria-hidden>
+					{report ? "▤" : "▦"}
+				</span>
+				<span className="board-artifact-text">
 					<strong>{String(artifact.title)}</strong>
-					<span className="chip">{String(artifact.widgets)} widgets</span>
-					<Link className="btn sm primary" to={`/dashboards/${String(artifact.slug)}`} style={{ marginLeft: "auto" }}>
-						Open dashboard
-					</Link>
-				</div>
-			</div>
+					<span className="muted">
+						{report ? "Report" : "Dashboard"} · {String(artifact.widgets)} widgets
+					</span>
+				</span>
+				<span className="btn sm primary">Open {report ? "report" : "dashboard"}</span>
+			</Link>
 		);
 	}
 
 	if (artifact.kind === "chart") {
 		const series = (artifact.series as Array<{ label: string; value: number | null }>) ?? [];
+		const grain = (artifact.dimensionGrain as string | null) ?? grainOf(artifact.dimension as string | null);
+		const formatLabel = grain ? (label: string) => formatPeriod(label, grain) : undefined;
 		return (
 			<div className="card" style={{ background: "var(--surface-2)" }}>
 				<div className="card-head">
@@ -804,7 +907,15 @@ function ArtifactView({
 					points={series}
 					format={String(artifact.format ?? "number")}
 					unit={artifact.unit as string | null}
+					formatLabel={formatLabel}
+					partialLabel={(artifact.partialPeriod as string | null) ?? null}
 				/>
+				{Boolean(artifact.partialPeriod) && (
+					<p className="muted" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
+						{formatLabel ? formatLabel(String(artifact.partialPeriod)) : String(artifact.partialPeriod)} is
+						incomplete: the data runs to {String(artifact.dataThrough)}.
+					</p>
+				)}
 				{Boolean(artifact.caveat) && (
 					<p className="muted" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
 						{String(artifact.caveat)}
@@ -862,25 +973,78 @@ function ArtifactView({
 		);
 	}
 
-	if (artifact.kind === "lineage") {
-		const byLayer = (artifact.upstreamByLayer as Record<string, string[]>) ?? {};
+	// The plan the assistant is working through. Steps render with their live
+	// status, because a plan only earns its place on the screen while it is
+	// visibly being followed - a finished list of ticks is an answer, not a plan.
+	if (artifact.kind === "plan" && artifact.plan) {
+		const plan = artifact.plan as {
+			title: string;
+			background?: string | null;
+			status: string;
+			steps: Array<{ description: string; status: string }>;
+		};
+		const glyph: Record<string, string> = {
+			pending: "○",
+			in_progress: "◐",
+			done: "●",
+			skipped: "◌",
+		};
 		return (
 			<div className="card" style={{ background: "var(--surface-2)" }}>
 				<div className="card-head">
-					<h3>Lineage for {String(artifact.subject)}</h3>
-					<Link className="btn sm" to="/lineage" style={{ marginLeft: "auto" }}>
-						Open lineage graph
-					</Link>
+					<h3>Plan · {plan.title}</h3>
+					<span className="rp-rows mono" style={{ marginLeft: "auto" }}>
+						{plan.status}
+					</span>
 				</div>
-				<dl className="kv">
-					{Object.entries(byLayer).map(([layer, labels]) => (
-						<div key={layer} style={{ display: "contents" }}>
-							<dt>{layer}</dt>
-							<dd className="secondary">{labels.join(", ")}</dd>
-						</div>
+				{plan.background && <p className="secondary">{plan.background}</p>}
+				<ol style={{ margin: "8px 0 0", paddingLeft: 4, listStyle: "none" }}>
+					{plan.steps.map((step, index) => (
+						<li key={index} style={{ padding: "3px 0" }}>
+							<span aria-hidden style={{ marginRight: 8 }}>
+								{glyph[step.status] ?? "○"}
+							</span>
+							<span className={step.status === "done" ? "secondary" : ""}>
+								{step.description}
+							</span>
+						</li>
 					))}
-				</dl>
+				</ol>
 			</div>
+		);
+	}
+
+	if (artifact.kind === "todos" && Array.isArray(artifact.todos)) {
+		const todos = artifact.todos as Array<{ text: string; status: string }>;
+		if (!todos.length) return null;
+		return (
+			<div className="card" style={{ background: "var(--surface-2)" }}>
+				<div className="card-head">
+					<h3>Follow-ups</h3>
+				</div>
+				<ul style={{ margin: "8px 0 0", paddingLeft: 20 }}>
+					{todos.map((todo, index) => (
+						<li
+							key={index}
+							className={todo.status === "done" ? "secondary" : ""}
+							style={{ padding: "2px 0" }}
+						>
+							{todo.status === "done" ? "✓ " : ""}
+							{todo.text}
+						</li>
+					))}
+				</ul>
+			</div>
+		);
+	}
+
+	// A mode switch is worth one quiet line in the transcript: it explains why
+	// the next answer was shaped by a different set of tools.
+	if (artifact.kind === "modeChange" && artifact.mode) {
+		return (
+			<p className="muted" style={{ fontSize: 12, margin: "8px 0" }}>
+				↳ switched to the <strong>{String(artifact.label ?? artifact.mode)}</strong> mode
+			</p>
 		);
 	}
 

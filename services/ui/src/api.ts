@@ -46,6 +46,23 @@ export interface SessionUser {
 	username: string;
 	role: "viewer" | "analyst" | "admin";
 	ontologyRole: string;
+	/** "self" for an account created through the registration form. */
+	signupSource?: string;
+	/** The caller's own workspace, where new work lands by default. */
+	personalSpace?: string;
+	displayName?: string | null;
+}
+
+export interface AuthConfig {
+	selfRegistration: boolean;
+	registrationRole: string;
+}
+
+export interface RegistrationForm {
+	username: string;
+	password: string;
+	email?: string;
+	displayName?: string;
 }
 
 const TOKEN_KEY = "tms.auth.token";
@@ -115,10 +132,10 @@ export const session = {
  *
  * SpaceProvider owns the value; this is only where the client reads it.
  */
-let activeSpace = "sandbox";
+let activeSpace = "";
 
 export function setActiveSpace(slug: string): void {
-	activeSpace = slug || "sandbox";
+	activeSpace = slug;
 }
 
 /**
@@ -131,8 +148,11 @@ function withSpace(path: string): string {
 	if (path.startsWith("/api/auth/")) return path;
 	const [base, query = ""] = path.split("?");
 	const params = new URLSearchParams(query);
-	if (!params.has("space")) params.set("space", activeSpace);
-	return `${base}?${params.toString()}`;
+	// Before a space is known, no parameter at all: the server then uses the
+	// caller's own workspace, which is the right place for a stray request.
+	if (!params.has("space") && activeSpace) params.set("space", activeSpace);
+	const encoded = params.toString();
+	return encoded ? `${base}?${encoded}` : base!;
 }
 
 /** Notified when the server rejects our token, so the app can show the login. */
@@ -191,7 +211,7 @@ export const api = {
 	/** Saving a repository file: the path identifies it, so writing one is a PUT. */
 	put: <T>(path: string, body?: unknown) =>
 		request<T>(path, { method: "PUT", body: JSON.stringify(body ?? {}) }),
-	/** A body is optional: deleting a pipeline sends the outputs chosen to drop. */
+	/** A body is optional; most deletes need none. */
 	del: <T>(path: string, body?: unknown) =>
 		request<T>(
 			path,
@@ -206,6 +226,20 @@ export const api = {
 		}>("/api/auth/login", {
 			method: "POST",
 			body: JSON.stringify({ username, password }),
+		});
+		session.set(result.token, result.user, result.expiresAt);
+		return result.user;
+	},
+
+	/** Create an account (and its private workspace) and sign in with it. */
+	async register(form: RegistrationForm): Promise<SessionUser> {
+		const result = await request<{
+			token: string;
+			expiresAt: string;
+			user: SessionUser;
+		}>("/api/auth/register", {
+			method: "POST",
+			body: JSON.stringify(form),
 		});
 		session.set(result.token, result.user, result.expiresAt);
 		return result.user;
@@ -371,6 +405,28 @@ export interface KpiResult {
 	coverageNote: string | null;
 	sql: string;
 	appliedFilters: Record<string, unknown>;
+	/** The grain when the dimension is a date grouped by period. */
+	dimensionGrain?: string | null;
+	/** count, sum, avg...: whether the parts of a breakdown add up to the total. */
+	aggregation?: string;
+	/** The newest period, when the data stops part-way through it. */
+	partialPeriod?: string | null;
+	dataThrough?: string | null;
+	/** A headline figure's recent history, on stat tiles. */
+	trend?: KpiTrend | null;
+}
+
+export interface KpiTrend {
+	grain: string;
+	timeColumn: string;
+	points: Array<{ label: string; value: number | null }>;
+	/** Change between the last two COMPLETE periods. */
+	delta: number | null;
+	deltaPct: number | null;
+	lastPeriod: string | null;
+	previousPeriod: string | null;
+	dataThrough: string | null;
+	lastPointPartial: boolean;
 }
 
 export interface Widget {
@@ -400,12 +456,129 @@ export interface DashboardSummary {
 	createdAt: string;
 	updatedAt: string;
 	isPinned: boolean;
+	/** A live grid, or the same widgets laid out as a printable document. */
+	kind?: "dashboard" | "report";
+	chatSessionId?: number | null;
 }
 
 export interface ResolvedDashboard extends DashboardSummary {
-	widgets: Array<Widget & { index: number; data: KpiResult | null; error: string | null }>;
+	widgets: Array<
+		Widget & { index: number; data: KpiResult | null; error: string | null; ignoredFilters?: string[] }
+	>;
 	coverageNotes: string[];
 	dependsOnSimulation: boolean;
+}
+
+/** What a board can be filtered by, read from the data. */
+export interface DashboardFilterOptions {
+	dimensions: Array<{ key: string; label: string; values: Array<{ value: string; count: number }> }>;
+	time: Array<{ column: string; label: string; min: string | null; max: string | null }>;
+}
+
+// ── workspaces, feasibility, proposals ──────────────────────────────────────
+
+export interface WorkspaceSummary {
+	space: { slug: string; name: string; kind: string; ownerUsername: string | null } | null;
+	counts: {
+		connections: number;
+		datasets: number;
+		objectTypes: number;
+		linkTypes: number;
+		metrics: number;
+		actionTypes: number;
+		dashboards: number;
+		reports: number;
+		pendingProposals: number;
+	};
+	objectTypes: Array<{
+		apiName: string;
+		label: string;
+		pluralLabel: string | null;
+		rowCount: number;
+		origin: string;
+		color: string | null;
+		group: string | null;
+		properties: number;
+		measures: number;
+		dimensions: number;
+		links: number;
+	}>;
+}
+
+export type FeasibilityStatus = "ready" | "needs_approval" | "not_possible";
+
+export interface FollowUp {
+	build: "dashboard" | "report";
+	title: string;
+	measure: string | null;
+	sourcePrompt: string | null;
+}
+
+export interface DraftProposal {
+	kind: ProposalKind;
+	title: string;
+	summary: string;
+	payload: Record<string, unknown>;
+	dependsOn: number[];
+	followUp?: FollowUp;
+}
+
+export interface FeasibilityItem {
+	request: { text?: string; measure?: string; dimension?: string; objectType?: string };
+	status: FeasibilityStatus;
+	explanation: string;
+	kpi?: string | null;
+	dimension?: string | null;
+	widget?: Widget | null;
+	proposals?: DraftProposal[];
+	missing?: string[];
+	alternatives?: string[];
+}
+
+export interface FeasibilityReport {
+	intent: string;
+	subject: string | null;
+	items: FeasibilityItem[];
+	summary: { ready: number; needsApproval: number; notPossible: number };
+	layout?: Widget[];
+	title?: string;
+}
+
+export type ProposalKind = "link_type" | "metric" | "combination" | "action_type";
+export type ProposalStatus = "pending" | "applied" | "rejected" | "failed";
+
+export interface ProposalRecord {
+	id: number;
+	kind: ProposalKind;
+	title: string;
+	summary: string | null;
+	payload: Record<string, unknown>;
+	preview: Record<string, unknown>;
+	status: ProposalStatus;
+	dependsOn: number[];
+	result: (Record<string, unknown> & { built?: BuiltBoard | { error: string } }) | null;
+	error: string | null;
+	createdBy: string;
+	createdVia: "user" | "assistant" | "planner";
+	chatSessionId: number | null;
+	decidedBy: string | null;
+	decidedAt: string | null;
+	decisionNote: string | null;
+	createdAt: string;
+	followUp: FollowUp | null;
+}
+
+export interface BuiltBoard {
+	kind: "dashboard" | "report";
+	slug: string;
+	title: string;
+	widgets: number;
+}
+
+/** The board a settled proposal built, if it built one. */
+export function builtBoard(proposal: ProposalRecord): BuiltBoard | null {
+	const built = proposal.result?.built;
+	return built && "slug" in built ? built : null;
 }
 
 export interface PlatformStats {
@@ -415,7 +588,17 @@ export interface PlatformStats {
 		label: string | null;
 		description: string | null;
 		createdAt: string;
-		validation: Record<string, unknown>;
+		validation: { valid?: boolean; errors?: string[]; warnings?: string[] };
+	};
+	/** The path, counted for this space: what each stage has to build from. */
+	flow: {
+		connections: number;
+		syncs: number;
+		schedules: number;
+		datasets: number;
+		objectTypes: number;
+		functions: number;
+		lastSyncAt: string | null;
 	};
 	counts: {
 		objectTypes: number;
@@ -424,55 +607,9 @@ export interface PlatformStats {
 		linkTypes: number;
 		completeLinks: number;
 		actionTypes: number;
-		readOnlyActions: number;
 		kpis: number;
-		simulatedKpis: number;
 	};
-	groups: Array<{ group: string; types: number; objects: number }>;
-	dataCoverage: Array<{
-		metric_area: string;
-		object_type: string;
-		total_rows: number;
-		rows_from_source: number;
-		rows_simulated: number;
-		source_coverage_pct: string | null;
-		note: string;
-	}>;
-	exceptions: Array<{
-		exception_type: string;
-		object_type: string;
-		severity: string;
-		item_count: number;
-		description: string;
-	}>;
-	generationRuns: Array<Record<string, unknown>>;
-}
-
-export interface LineageNode {
-	id: string;
-	nodeType: "dataSource" | "transformation" | "object" | "usage";
-	label: string;
-	description: string | null;
-	objectId: string | null;
-	layer: string | null;
-	payload: Record<string, unknown>;
-	tags: string[];
-	depth?: number;
-}
-
-export interface LineageEdge {
-	id: string;
-	source: string;
-	target: string;
-	relationType: "flowsTo" | "derivedFrom" | "usedBy";
-	weight: number | null;
-	payload: Record<string, unknown>;
-}
-
-export interface LineageGraph {
-	nodes: LineageNode[];
-	edges: LineageEdge[];
-	layers: Array<{ layer: string; count: number }>;
+	objectTypes: Array<{ apiName: string; label: string; objects: number; dataset: string; color: string | null }>;
 }
 
 export interface ChatToolCall {
@@ -485,19 +622,17 @@ export interface ChatToolCall {
 
 /** Mirrors the server's ResourceKind union, so grouping stays exhaustive. */
 export type ResourceKind =
+	| "connection"
 	| "dataset"
 	| "objectType"
-	| "actionType"
 	| "linkType"
-	| "pipeline"
-	| "dashboard"
-	| "connection"
-	| "codeRepo"
-	| "kpi";
+	| "actionType"
+	| "kpi"
+	| "dashboard";
 
-// ── connections: what comes through one ─────────────────────────────────────
+// ── connections, syncs and datasets ─────────────────────────────────────────
 
-/** One relation on the far side of a connection, as its catalogue reports it. */
+/** One view or table on the far side of a connection, as its catalogue reports it. */
 export interface RemoteRelation {
 	schema: string;
 	name: string;
@@ -506,22 +641,16 @@ export interface RemoteRelation {
 	size: string | null;
 }
 
-export type ConnectorKind = "postgresql" | "rest";
-
 export interface ConnectionCatalog {
 	connection: string;
 	isPlatformDatabase: boolean;
-	connector: ConnectorKind;
 	relations: RemoteRelation[];
-	/** Why the list looks the way it does — a REST source has no catalogue. */
-	note: string | null;
 }
 
 export interface SyncRun {
 	id: number;
 	syncId: number;
 	status: "running" | "success" | "failed";
-	mode: "snapshot" | "incremental";
 	startedAt: string;
 	finishedAt: string | null;
 	durationMs: number | null;
@@ -529,8 +658,6 @@ export interface SyncRun {
 	rowsWritten: number | null;
 	rowsBefore: number | null;
 	rowsAfter: number | null;
-	cursorFrom: string | null;
-	cursorTo: string | null;
 	/** True when the read stopped at the row limit, so this is a prefix. */
 	truncated: boolean;
 	errorMessage: string | null;
@@ -545,12 +672,6 @@ export interface SyncRecord {
 	description: string | null;
 	sourceSchema: string;
 	sourceTable: string;
-	/** REST only: the path on the source, and where its records sit. */
-	sourcePath: string | null;
-	recordsPath: string | null;
-	mode: "snapshot" | "incremental";
-	cursorColumn: string | null;
-	lastCursorValue: string | null;
 	targetTable: string;
 	targetRelation: string;
 	rowLimit: number;
@@ -560,6 +681,8 @@ export interface SyncRecord {
 	createdAt: string;
 	updatedAt: string;
 	lastRun: SyncRun | null;
+	/** How often it runs on its own; null when it runs only on demand. */
+	schedule: { id: number; intervalSeconds: number; enabled: boolean; nextRunAt: string | null } | null;
 }
 
 export interface SyncOutcome {
@@ -568,84 +691,90 @@ export interface SyncOutcome {
 	/** Columns with no local type equivalent, which landed as text. */
 	widenedColumns: string[];
 	datasetResourceId: number | null;
+	objectTypesRefreshed: number;
+	/** Object-type properties whose column the source no longer has. */
+	brokenProperties: string[];
 }
 
-// ── code repositories ───────────────────────────────────────────────────────
-
-export type RepoKind = "transforms" | "python" | "functions";
-
-export interface BuildArtifact {
-	path: string;
-	kind: "sync" | "transform" | "function" | "ignored";
-	status: "created" | "updated" | "unchanged" | "skipped" | "failed";
-	message: string;
-	produced: string | null;
-	rows: number | null;
-	durationMs: number;
-}
-
-export interface BuildRecord {
-	id: number;
-	repoId: number;
-	commitId: number | null;
-	commitSequence: number | null;
-	status: "running" | "success" | "failed";
-	startedAt: string;
-	finishedAt: string | null;
-	durationMs: number | null;
-	artifacts: BuildArtifact[];
-	errorMessage: string | null;
-	triggeredBy: string;
-}
-
-export interface RepoRecord {
-	id: number;
-	spaceSlug: string;
-	slug: string;
+export interface DatasetSummary {
+	resourceId: number;
 	name: string;
-	description: string | null;
-	kind: RepoKind;
-	defaultBranch: string;
-	fileCount: number;
-	commitCount: number;
-	lastCommitAt: string | null;
-	lastBuild: BuildRecord | null;
-	createdBy: string;
-	createdAt: string;
-	updatedAt: string;
+	relation: string;
+	connection: string | null;
+	source: string | null;
+	syncId: number | null;
+	rowCount: number | null;
+	columnCount: number | null;
+	lastSyncedAt: string | null;
+	objectTypes: string[];
 }
 
-export interface RepoFile {
-	id: number;
-	repoId: number;
-	path: string;
-	content: string;
-	language: string;
-	updatedBy: string;
-	updatedAt: string;
-}
-
-export interface RepoCommit {
-	id: number;
-	repoId: number;
-	sequence: number;
-	message: string;
-	author: string;
-	createdAt: string;
-	fileCount: number;
-}
-
-/** Everything the repository page needs, in one request. */
-export interface RepoDetail {
-	repo: RepoRecord;
-	files: RepoFile[];
-	commits: RepoCommit[];
-	builds: BuildRecord[];
-	outputs: {
-		datasets: Array<{ name: string; relation: string; rows: number | null }>;
-		functions: Array<{ apiName: string; name: string; status: string }>;
-		syncs: Array<{ name: string; connection: string; relation: string }>;
+export interface ColumnProfile {
+	column: string;
+	sqlType: string;
+	nulls: number;
+	distinct: number;
+	empty: boolean;
+	samples: string[];
+	suggested: {
+		apiName: string;
+		label: string;
+		datatype: string;
+		semanticRole: string;
+		defaultAggregation: string | null;
 	};
+}
+
+export interface DatasetProfile {
+	dataset: DatasetSummary;
+	rowCount: number;
+	sampled: boolean;
+	columns: ColumnProfile[];
+	primaryKeyCandidates: string[];
+	suggestion: {
+		apiName: string;
+		label: string;
+		pluralLabel: string;
+		primaryKey: string | null;
+		titleColumn: string | null;
+	};
+	existingObjectTypes: string[];
+}
+
+/** Sync cadences offered by the UI; the server also takes any "<n><m|h|d|w>". */
+export const CADENCES: Array<{ every: string; label: string }> = [
+	{ every: "manual", label: "Manual only" },
+	{ every: "20m", label: "Every 20 minutes" },
+	{ every: "1h", label: "Every hour" },
+	{ every: "2h", label: "Every 2 hours" },
+	{ every: "6h", label: "Every 6 hours" },
+	{ every: "12h", label: "Every 12 hours" },
+	{ every: "1d", label: "Every day" },
+	{ every: "8d", label: "Every 8 days" },
+];
+
+/** 7200 -> "every 2 hours", matching how the server describes a cadence. */
+export function describeInterval(seconds: number): string {
+	const units: Array<[number, string]> = [
+		[604_800, "week"],
+		[86_400, "day"],
+		[3600, "hour"],
+		[60, "minute"],
+	];
+	for (const [size, name] of units) {
+		if (seconds % size === 0) {
+			const count = seconds / size;
+			return count === 1 ? `every ${name}` : `every ${count} ${name}s`;
+		}
+	}
+	return `every ${seconds} seconds`;
+}
+
+/** The preset matching an interval, so a select can show the current cadence. */
+export function cadenceFor(seconds: number | null | undefined): string {
+	if (!seconds) return "manual";
+	const unit = seconds % 86_400 === 0 ? [86_400, "d"] : seconds % 3600 === 0 ? [3600, "h"] : [60, "m"];
+	return `${seconds / (unit[0] as number)}${unit[1]}`;
 }
 
 export interface ResourceRecord {
@@ -656,7 +785,7 @@ export interface ResourceRecord {
 	name: string;
 	description: string | null;
 	targetRef: string | null;
-	/** The relation this is read from, e.g. tms_views.v_kpi_mode_mix. */
+	/** The relation this is read from, e.g. connection_raw.<table>. */
 	backingView: string | null;
 	properties: Record<string, unknown>;
 	createdBy: string;
@@ -670,12 +799,21 @@ export interface ChatArtifact {
 		| "dashboard"
 		| "table"
 		| "action"
-		| "lineage"
 		| "clarification"
-		/** A metric the assistant drafted, awaiting a person's approval. */
+		/** A function the assistant drafted, awaiting an admin's approval. */
 		| "functionProposal"
-		/** A pipeline graph the assistant drafted, awaiting acceptance (§18). */
-		| "pipelineProposal";
+		/** What the data can answer, one approval away, or not at all. */
+		| "feasibility"
+		/** A link, dataset, metric or action waiting for the user's approval. */
+		| "proposal"
+		/** Something the assistant created: a dataset, object type, link, metric or action. */
+		| "ontologyChange"
+		/** The step-by-step plan the assistant is working through. */
+		| "plan"
+		/** The conversation's follow-up checklist. */
+		| "todos"
+		/** One line noting the assistant switched operational mode. */
+		| "modeChange";
 	[key: string]: unknown;
 }
 
@@ -690,7 +828,9 @@ export interface ChatResponse {
 	usage: Record<string, unknown>;
 	provider: string;
 	model: string;
-	failoverReason?: string | null;
+	/** The conversation's agent state after this turn. */
+	agentMode?: string;
+	enabledCapabilities?: string[];
 	/** What the turn cost. `priced` is false when the provider has no rate. */
 	cost?: {
 		usd: number;
@@ -718,12 +858,11 @@ export interface AssistantHealth {
 	provider: string;
 	configuredProvider?: string;
 	model: string;
-	/** Why this provider was chosen — GPU detection, explicit setting, or failover. */
+	/** Why this provider was chosen. */
 	providerReason?: string | null;
 	llm: ProviderHealth & {
 		activeProvider?: string;
 		breakerOpen?: boolean;
-		lastFailoverReason?: string | null;
 		primary?: ProviderHealth;
 		fallback?: ProviderHealth;
 	};
@@ -769,6 +908,60 @@ export function formatValue(
 	}
 }
 
+// ── periods and exports ─────────────────────────────────────────────────────
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "1997-04-01" at a month grain reads "Apr 1997"; anything else is left alone. */
+export function formatPeriod(label: string, grain: string | null | undefined): string {
+	const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(label ?? "");
+	if (!match || !grain) return label;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	switch (grain) {
+		case "year":
+			return String(year);
+		case "quarter":
+			return `Q${Math.floor((month - 1) / 3) + 1} ${year}`;
+		case "month":
+			return `${MONTHS[month - 1]} ${year}`;
+		case "week":
+			return `${day} ${MONTHS[month - 1]} ${String(year).slice(2)}`;
+		default:
+			return `${day} ${MONTHS[month - 1]} ${year}`;
+	}
+}
+
+/** The grain of a dimension key such as "order_date:month", if it has one. */
+export function grainOf(dimension: string | null | undefined): string | null {
+	const grain = (dimension ?? "").split(":")[1];
+	return grain || null;
+}
+
+/** Rows as CSV text, quoted where needed, for a download. */
+export function toCsv(columns: string[], rows: Array<Array<unknown>>): string {
+	const cell = (value: unknown): string => {
+		if (value === null || value === undefined) return "";
+		const text = String(value);
+		return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+	};
+	return [columns.map(cell).join(","), ...rows.map((row) => row.map(cell).join(","))].join("\r\n");
+}
+
+/** Offer text as a file download, without a server round trip. */
+export function downloadText(filename: string, text: string, type = "text/csv;charset=utf-8"): void {
+	const blob = new Blob([text], { type });
+	const url = URL.createObjectURL(blob);
+	const anchor = document.createElement("a");
+	anchor.href = url;
+	anchor.download = filename;
+	document.body.appendChild(anchor);
+	anchor.click();
+	anchor.remove();
+	setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 function formatCurrency(value: number): string {
 	const absolute = Math.abs(value);
 	// Unit rates need cents; totals in the millions do not. Switching on the
@@ -800,9 +993,10 @@ export function formatCell(value: unknown): string {
 			: round(value, 2).toLocaleString("en-US");
 	}
 	const text = String(value);
-	// Collapse an ISO timestamp to a readable date-time; leave everything else.
+	// Collapse an ISO timestamp to a readable date-time - a plain date when it
+	// is midnight, as dates stored as timestamps are - and leave anything else.
 	const iso = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(text);
-	if (iso) return `${iso[1]} ${iso[2]}`;
+	if (iso) return iso[2] === "00:00" ? iso[1]! : `${iso[1]} ${iso[2]}`;
 	if (/^\d+\.\d+$/.test(text)) return round(Number(text), 2).toLocaleString("en-US");
 	return text;
 }

@@ -45,7 +45,7 @@ interface Resource {
 	name: string;
 	description: string | null;
 	targetRef: string | null;
-	/** The relation it is read from, e.g. tms_views.v_kpi_mode_mix. */
+	/** The relation it is read from, e.g. connection_raw.<table>. */
 	backingView: string | null;
 	properties: Record<string, unknown>;
 	createdBy: string;
@@ -84,7 +84,7 @@ export function Spaces() {
 	const [notice, setNotice] = useState<string | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [dialog, setDialog] = useState<
-		"project" | "folder" | "dataset" | "connection" | null
+		"project" | "folder" | "connection" | null
 	>(null);
 
 	const role = session.user()?.role ?? "viewer";
@@ -146,7 +146,7 @@ export function Spaces() {
 		try {
 			await api.post("/api/spaces/sandbox/seed");
 			await loadProjects("sandbox");
-			setNotice("Sandbox filled from the published ontology.");
+			setNotice("Sandbox set up: folders, and the TMS database registered as a connection.");
 		} catch (exc) {
 			setNotice(exc instanceof ApiError ? exc.message : "Could not fill the sandbox.");
 		} finally {
@@ -273,7 +273,7 @@ export function Spaces() {
 							</button>
 							{spaceSlug === "sandbox" && projects.length === 0 && (
 								<button className="btn sm primary" onClick={seedSandbox} disabled={busy}>
-									Fill from the ontology
+									Set up the sandbox
 								</button>
 							)}
 						</>
@@ -284,8 +284,8 @@ export function Spaces() {
 					<p className="muted">
 						No projects in this space yet.
 						{spaceSlug === "sandbox"
-							? " Fill it from the published ontology, or create one."
-							: " Create one, or promote a project from the sandbox."}
+							? " Set it up - folders and the TMS database connection - or create one."
+							: " Create one to hold its connections and datasets."}
 					</p>
 				) : (
 					<div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
@@ -365,9 +365,6 @@ export function Spaces() {
 								<>
 									<button className="btn sm" onClick={() => setDialog("connection")}>
 										New connection
-									</button>
-									<button className="btn sm" onClick={() => setDialog("dataset")}>
-										Register dataset
 									</button>
 								</>
 							)}
@@ -462,7 +459,8 @@ export function Spaces() {
 	);
 }
 
-/** New project, new folder, or register a dataset — one small modal for each. */
+/** New project, new folder or new connection — one small modal for each. A
+ *  dataset is not created here: it is what a sync lands. */
 function CreateDialog({
 	kind,
 	spaceSlug,
@@ -471,7 +469,7 @@ function CreateDialog({
 	onClose,
 	onDone,
 }: {
-	kind: "project" | "folder" | "dataset" | "connection";
+	kind: "project" | "folder" | "connection";
 	spaceSlug: string;
 	projectSlug: string | null;
 	folderId: number | null;
@@ -480,8 +478,6 @@ function CreateDialog({
 }) {
 	const [name, setName] = useState("");
 	const [description, setDescription] = useState("");
-	const [view, setView] = useState("");
-	const [views, setViews] = useState<Array<{ view: string; usedBy: string[] }>>([]);
 	const [busy, setBusy] = useState(false);
 	const [problem, setProblem] = useState<string | null>(null);
 
@@ -502,7 +498,6 @@ function CreateDialog({
 	const connectionSpec = () => ({
 		name,
 		description,
-		engine: "postgresql" as const,
 		host,
 		port: Number(port) || 5432,
 		database,
@@ -523,17 +518,6 @@ function CreateDialog({
 		}
 	}
 
-	useEffect(() => {
-		if (kind !== "dataset") return;
-		api
-			.get<Array<{ view: string; usedBy: string[] }>>("/api/spaces/views")
-			.then((list) => {
-				setViews(list);
-				setView(list[0]?.view ?? "");
-			})
-			.catch(() => setViews([]));
-	}, [kind]);
-
 	async function submit() {
 		setBusy(true);
 		setProblem(null);
@@ -547,7 +531,7 @@ function CreateDialog({
 					parentId: folderId,
 				});
 				onDone(`Folder “${name}” created.`);
-			} else if (kind === "connection") {
+			} else {
 				const created = await api.post<{ test: { ok: boolean; detail: string } }>(
 					`/api/spaces/${spaceSlug}/projects/${projectSlug}/connections`,
 					connectionSpec(),
@@ -557,14 +541,6 @@ function CreateDialog({
 						? `Connection “${name}” created and reachable.`
 						: `Connection “${name}” created, but the test failed: ${created.test.detail}`,
 				);
-			} else {
-				await api.post(`/api/spaces/${spaceSlug}/projects/${projectSlug}/datasets`, {
-					name,
-					description,
-					sourceView: view,
-					folderId,
-				});
-				onDone(`Dataset “${name}” registered on ${view}.`);
 			}
 		} catch (exc) {
 			setProblem(exc instanceof ApiError ? exc.message : "That did not work.");
@@ -578,9 +554,7 @@ function CreateDialog({
 			? "New project"
 			: kind === "folder"
 				? "New folder"
-				: kind === "connection"
-					? "New connection"
-					: "Register a dataset";
+				: "New connection";
 
 	return (
 		<div
@@ -604,23 +578,6 @@ function CreateDialog({
 						<span>Name</span>
 						<input value={name} autoFocus onChange={(event) => setName(event.target.value)} />
 					</label>
-
-					{kind === "dataset" && (
-						<label className="field">
-							<span>Backing view</span>
-							<select value={view} onChange={(event) => setView(event.target.value)}>
-								{views.map((entry) => (
-									<option key={entry.view} value={entry.view}>
-										{entry.view} — used by {entry.usedBy.slice(0, 2).join(", ")}
-									</option>
-								))}
-							</select>
-							<em className="field-hint">
-								Only views the published ontology exposes. A dataset on anything else would
-								point at nothing.
-							</em>
-						</label>
-					)}
 
 					{kind === "connection" && (
 						<>
@@ -707,7 +664,7 @@ function CreateDialog({
 						<button
 							className="btn sm primary"
 							onClick={submit}
-							disabled={busy || !name.trim() || (kind === "dataset" && !view)}
+							disabled={busy || !name.trim()}
 						>
 							{busy ? "Working…" : "Create"}
 						</button>

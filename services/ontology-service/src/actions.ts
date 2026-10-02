@@ -4,6 +4,7 @@ import type { ActionType, OntologyDefinition } from "@ontograph/core";
 import { query, queryOne } from "./db";
 import {
 	BadRequest,
+	currentSpace,
 	getRegistry,
 	NotFound,
 	type ActionTypeMeta,
@@ -28,8 +29,8 @@ import {
  *
  * THE READ-ONLY GATE is the important one. Read-only actions (the what-ifs and
  * recalculations) genuinely execute and return computed results. Mutating actions
- * cannot: this platform reads the TMS through a captured snapshot and has no
- * write-back endpoint. Rather than pretend, a mutating action is validated,
+ * cannot: an object's data is a synced copy of its source, and this platform
+ * has no write-back to that source. Rather than pretend, a mutating action is validated,
  * permission-checked, recorded in the audit trail with the exact payload that
  * would be sent to the TMS, and returned as `staged`. A dashboard that says a
  * shipment was held when nothing was held is worse than one that says the request
@@ -267,10 +268,9 @@ async function stageMutation(
 		},
 		note:
 			"Parameters and permissions were checked and the request was recorded in " +
-			"platform.action_audit. Nothing was sent: this platform reads the TMS " +
-			"through the captured snapshot in TMS_MCP/api_responses and has no " +
-			"write-back endpoint. Wiring one means POSTing the payload above to the " +
-			"corresponding TMS endpoint.",
+			"platform.action_audit. Nothing was changed: the object's data is a synced " +
+			"copy of its source, and this platform has no write-back to that source. " +
+			"Wiring one means sending the payload above to the system of record.",
 	};
 }
 
@@ -304,8 +304,9 @@ export async function executeAction(
 				`INSERT INTO platform.action_audit
 				   (action_type_rid, api_name, object_type_rid, object_key, parameters, status,
 				    validation, result, error_message, actor, actor_role, initiated_by_ai,
-				    chat_session_id, duration_ms)
-				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+				    chat_session_id, duration_ms, space_id)
+				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+				         (SELECT space_id FROM platform.space WHERE slug = $15))
 				 RETURNING action_audit_id`,
 				[
 					meta.rid,
@@ -322,6 +323,7 @@ export async function executeAction(
 					context.initiatedByAi,
 					context.chatSessionId,
 					durationMs,
+					currentSpace(),
 				],
 			);
 			auditId = row?.action_audit_id ?? null;
@@ -392,8 +394,8 @@ export async function executeAction(
 		const result = await stageMutation(meta, parameters);
 		return record(
 			"staged",
-			`${meta.label} was validated and recorded, but not sent: this platform has no ` +
-				"write-back endpoint to the TMS.",
+			`${meta.label} was validated and recorded, but not applied: the data is a synced ` +
+				"copy and this platform has no write-back to its source.",
 			validation,
 			result,
 		);
@@ -408,12 +410,17 @@ function firstKeyValue(parameters: Record<string, unknown>): string | null {
 	return key ? String(parameters[key]) : null;
 }
 
-export async function listAudit(limit = 100): Promise<Array<Record<string, unknown>>> {
+/**
+ * The audit trail, newest first: one space's when `spaceSlug` is given (what a
+ * workspace owner sees), every space's otherwise (a platform administrator).
+ */
+export async function listAudit(limit = 100, spaceSlug: string | null = null): Promise<Array<Record<string, unknown>>> {
 	return query(
-		`SELECT action_audit_id, api_name, object_key, status, actor, actor_role,
-		        initiated_by_ai, duration_ms, error_message, created_at, parameters, result
-		   FROM platform.action_audit
-		  ORDER BY created_at DESC LIMIT $1`,
-		[Math.min(Math.max(1, Number.isFinite(Number(limit)) ? Number(limit) : 100), 500)],
+		`SELECT a.action_audit_id, a.api_name, a.object_key, a.status, a.actor, a.actor_role,
+		        a.initiated_by_ai, a.duration_ms, a.error_message, a.created_at, a.parameters, a.result
+		   FROM platform.action_audit a
+		  WHERE $2::text IS NULL OR a.space_id = (SELECT space_id FROM platform.space WHERE slug = $2)
+		  ORDER BY a.created_at DESC LIMIT $1`,
+		[Math.min(Math.max(1, Number.isFinite(Number(limit)) ? Number(limit) : 100), 500), spaceSlug],
 	);
 }

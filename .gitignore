@@ -252,7 +252,10 @@ venv/
 *.log
 pgdata/
 ollama/
-data/
+# Anchored to the repository root. A bare `data/` also matched
+# services/ui/src/components/data/, which kept DataGrid.tsx out of git and
+# left the UI unbuildable from a clean clone.
+/data/
 
 # Editors / OS
 .DS_Store

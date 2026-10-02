@@ -9,8 +9,11 @@
  *
  * A function is the way out. The assistant DRAFTS one and it lands as
  * `proposed`; nothing computes from it and no dashboard may use it. A person
- * reads the definition, sees which views it touches, and approves it. Only
+ * reads the definition, sees which datasets it touches, and approves it. Only
  * then does it become usable.
+ *
+ * A definition may read only synced datasets - the tables the object types
+ * are built on - and runs read-only. See sqlGuard.ts for how that is enforced.
  *
  * ── what is frozen ─────────────────────────────────────────────────────────
  * function_rid and api_name never change after creation. Dashboards, saved
@@ -21,8 +24,9 @@
  */
 
 import { query, queryOne } from "./db";
-import { compileNode, type InputRelation, NotExecutable } from "./compile";
 import { BadRequest, currentSpace, getRegistry, NotFound } from "./registry";
+import { type DatasetScope, inspectSelect, runSelect } from "./sqlGuard";
+import { spaceBySlug } from "./workspaces";
 
 export interface FunctionParameter {
 	name: string;
@@ -175,92 +179,77 @@ export function deriveNames(name: string): { rid: string; apiName: string } {
 /**
  * Check a SQL definition really runs, without saving anything.
  *
- * Compiled through the same path as a pipeline node, so a function gets the
- * identical guarantees: single SELECT, no stacked statements, and every
- * relation it names checked against the published ontology. A proposal that
- * does not compile is refused at draft time rather than discovered later by
- * whoever opens the dashboard.
+ * The relations it reads come from the planner, not from reading the text, and
+ * every one must be a synced dataset. A definition that reads nothing is not
+ * traceable to real data and is refused. Then it is planned and probed with
+ * LIMIT 0, so an unknown column, a bad cast or a type mismatch is caught here
+ * rather than by whoever opens the dashboard - the assistant's first real
+ * proposal used camelCase api names where the dataset has snake_case columns,
+ * and only running it would have shown that.
  */
 export async function validateDefinition(
 	definition: string,
 	language: string,
-): Promise<{ valid: boolean; error: string | null; readsViews: string[]; columns: string[] }> {
+): Promise<{
+	valid: boolean;
+	error: string | null;
+	readsViews: string[];
+	readsObjectTypes: string[];
+	columns: string[];
+}> {
 	if (language !== "sql") {
 		// Nothing to validate: it will not be executed here, and pretending to
 		// syntax-check another language would be theatre.
-		return { valid: true, error: null, readsViews: [], columns: [] };
+		return { valid: true, error: null, readsViews: [], readsObjectTypes: [], columns: [] };
 	}
 
-	// 1. Shape. Single SELECT, no stacked statements, no writes.
-	let compiledSql: string;
+	let inspected: { relations: string[]; columns: string[] };
 	try {
-		compiledSql = compileNode(
-			{
-				id: "fn",
-				kind: "sql",
-				name: "function",
-				position: { x: 0, y: 0 },
-				config: { sql: definition },
-			} as never,
-			[] as InputRelation[],
-		).sql;
-	} catch (error) {
-		return { valid: false, error: (error as Error).message, readsViews: [], columns: [] };
-	}
-
-	// 2. Which published views it names. Shown to the approver, and a
-	//    definition that reads nothing published is not traceable to real data.
-	const registry = getRegistry();
-	const known = [
-		...new Set([
-			...registry.objectTypes.map((t) => t.sourceView),
-			...registry.kpis.map((k) => k.sourceView),
-		]),
-	];
-	const readsViews = known.filter((view) =>
-		// The view name is escaped before it becomes a pattern: it contains a dot,
-		// which would otherwise match any character and report a view the
-		// definition does not actually read.
-		new RegExp(`\\b${view.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(definition),
-	);
-
-	if (readsViews.length === 0) {
-		return {
-			valid: false,
-			error:
-				"This definition does not read any view the published ontology exposes. " +
-				"A function has to be traceable to real data.",
-			readsViews: [],
-			columns: [],
-		};
-	}
-
-	// 3. IT ACTUALLY RUNS. Checking the shape is not enough and the gap was not
-	//    hypothetical: the assistant's first real proposal used the ontology's
-	//    camelCase api names (plannedStartMonth) where the view has snake_case
-	//    columns (planned_start_month). It passed every check above and failed
-	//    the moment anyone ran it — which is precisely the reviewer's time this
-	//    validation exists to protect.
-	//
-	//    LIMIT 0 plans and executes without materialising rows, so an unknown
-	//    column, a bad cast or a type mismatch is caught here, cheaply.
-	try {
-		const probe = await query(`SELECT * FROM (${compiledSql}) AS _probe LIMIT 0`);
-		return {
-			valid: true,
-			error: null,
-			readsViews,
-			// The fields the result will have, which the dialog can show.
-			columns: probe.length > 0 ? Object.keys(probe[0]!) : [],
-		};
+		inspected = await inspectSelect(definition, await datasetScope());
 	} catch (error) {
 		return {
 			valid: false,
 			error: (error as Error).message,
-			readsViews,
+			readsViews: [],
+			readsObjectTypes: [],
 			columns: [],
 		};
 	}
+
+	const registry = getRegistry();
+	const readsObjectTypes = registry.objectTypes
+		.filter((type) => inspected.relations.includes(type.sourceView))
+		.map((type) => type.apiName);
+
+	if (inspected.relations.length === 0) {
+		return {
+			valid: false,
+			error: "This definition reads no dataset. A function has to be traceable to real data.",
+			readsViews: [],
+			readsObjectTypes: [],
+			columns: inspected.columns,
+		};
+	}
+
+	return {
+		valid: true,
+		error: null,
+		readsViews: inspected.relations,
+		readsObjectTypes,
+		columns: inspected.columns,
+	};
+}
+
+/**
+ * What a definition may read in the space in scope: in a personal workspace,
+ * only that workspace's own synced tables (and the combined datasets built on
+ * them, which the planner reports as those tables).
+ */
+export async function datasetScope(): Promise<DatasetScope | undefined> {
+	const space = await spaceBySlug(currentSpace());
+	if (space?.kind !== "personal") return undefined;
+	// connections.ts names a personal workspace's landing tables w<id>_...
+	return { tablePrefix: `w${space.id}_`, owner: "this workspace's" };
 }
 
 /** The columns a definition returns, read from the catalogue after a probe. */
@@ -387,7 +376,8 @@ export async function proposeFunction(
 			request.valueFormat ?? "number",
 			JSON.stringify(request.parameters ?? []),
 			check.readsViews,
-			request.readsObjectTypes ?? [],
+			// What the planner says it reads, not what the caller claims.
+			check.readsObjectTypes.length ? check.readsObjectTypes : (request.readsObjectTypes ?? []),
 			proposedBy,
 			request.proposedFrom ?? null,
 		],
@@ -569,22 +559,10 @@ export async function runFunction(
 
 	let sql: string | null = null;
 	try {
-		const compiled = compileNode(
-			{
-				id: "fn",
-				kind: "sql",
-				name: fn.name,
-				position: { x: 0, y: 0 },
-				config: { sql: fn.definition },
-			} as never,
-			[] as InputRelation[],
-		);
-		sql = compiled.sql;
-
-		// Wrapped as a subquery for the same reason the pipeline engine wraps
-		// node SQL: a non-SELECT is a syntax error in that position, and a
-		// data-modifying CTE is rejected by Postgres outside the top level.
-		const rows = await query(`SELECT * FROM (${compiled.sql}) AS _fn LIMIT ${MAX_ROWS}`);
+		// Read-only, time-limited, and wrapped as a subquery - see sqlGuard.ts.
+		const ran = await runSelect(fn.definition, MAX_ROWS, await datasetScope());
+		sql = ran.sql;
+		const rows = ran.rows;
 		const durationMs = Date.now() - started;
 
 		// A scalar function returns the first column of the first row: that is

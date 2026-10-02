@@ -7,10 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@xyflow/react": "^12.3.6",
     "mermaid": "^11.4.1",
     "react": "18.3.1",
     "react-dom": "18.3.1",
@@ -21,6 +21,7 @@
     "@types/react-dom": "18.3.5",
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "5.7.2",
-    "vite": "6.0.5"
+    "vite": "6.0.5",
+    "vitest": "^2.1.8"
   }
 }

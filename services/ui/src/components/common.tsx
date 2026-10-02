@@ -1,7 +1,7 @@
 /** Small shared pieces: stat tiles, tables, markdown, loading and error states. */
 
 import { useEffect, useRef, useState } from "react";
-import { type KpiResult, formatCell, formatValue, statusFor } from "../api";
+import { type KpiResult, formatCell, formatPeriod, formatValue, statusFor } from "../api";
 
 export function Spinner({ label }: { label?: string }) {
 	return (
@@ -41,11 +41,34 @@ export function Empty({ children }: { children: React.ReactNode }) {
  */
 export function StatTile({ result, title }: { result: KpiResult; title?: string }) {
 	const status = statusFor(result.total, result);
+	const trend = result.trend ?? null;
+	const points = (trend?.points ?? []).filter((point) => point.value !== null) as Array<{ label: string; value: number }>;
+	// Compared over the last two COMPLETE periods: a month with six days of
+	// data in it is not a fall.
+	const change = trend?.deltaPct ?? null;
+	const better =
+		change === null || result.higherIsBetter === null ? null : (change >= 0) === result.higherIsBetter;
 	return (
 		<div className="card stat">
 			<div className="label">{title ?? result.label}</div>
-			<div className="value">{formatValue(result.total, result.valueFormat, result.unit)}</div>
+			<div className="stat-main">
+				<div className="value">{formatValue(result.total, result.valueFormat, result.unit)}</div>
+				{points.length >= 3 && <Sparkline points={points} partial={trend?.lastPointPartial ?? false} />}
+			</div>
 			<div className="foot row" style={{ gap: 6 }}>
+				{change !== null && Number.isFinite(change) && (
+					<span
+						className={`delta ${better === null ? "" : better ? "up-good" : "down-bad"}`}
+						title={
+							trend?.lastPeriod && trend.previousPeriod
+								? `${formatPeriod(trend.lastPeriod, trend.grain)} vs ${formatPeriod(trend.previousPeriod, trend.grain)}`
+								: undefined
+						}
+					>
+						{change >= 0 ? "▲" : "▼"} {Math.abs(change).toFixed(1)}%
+						<span className="muted"> {trend?.lastPeriod ? `in ${formatPeriod(trend.lastPeriod, trend.grain)}` : ""}</span>
+					</span>
+				)}
 				{status && (
 					<span className={`chip ${status}`}>
 						<span className="dot" aria-hidden />
@@ -64,6 +87,45 @@ export function StatTile({ result, title }: { result: KpiResult; title?: string 
 				)}
 			</div>
 		</div>
+	);
+}
+
+/** A headline's recent history: shape only, no axes. */
+export function Sparkline({
+	points,
+	partial = false,
+	width = 96,
+	height = 30,
+}: {
+	points: Array<{ label: string; value: number }>;
+	partial?: boolean;
+	width?: number;
+	height?: number;
+}) {
+	const values = points.map((point) => point.value);
+	const min = Math.min(...values);
+	const max = Math.max(...values);
+	const span = max - min || 1;
+	const x = (index: number) => (index / Math.max(points.length - 1, 1)) * (width - 4) + 2;
+	const y = (value: number) => height - 3 - ((value - min) / span) * (height - 6);
+	const solid = partial ? points.slice(0, -1) : points;
+	const line = solid.map((point, index) => `${index === 0 ? "M" : "L"}${x(index)},${y(point.value)}`).join(" ");
+	const last = points.length - 1;
+	return (
+		<svg className="sparkline" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden>
+			<path d={line} fill="none" stroke="var(--series-1)" strokeWidth={1.6} strokeLinejoin="round" />
+			{partial && last > 0 && (
+				<path
+					d={`M${x(last - 1)},${y(points[last - 1]!.value)} L${x(last)},${y(points[last]!.value)}`}
+					fill="none"
+					stroke="var(--series-1)"
+					strokeWidth={1.6}
+					strokeDasharray="2 2"
+					opacity={0.6}
+				/>
+			)}
+			<circle cx={x(partial ? last - 1 : last)} cy={y(points[partial ? last - 1 : last]!.value)} r={2.4} fill="var(--series-1)" />
+		</svg>
 	);
 }
 
@@ -235,7 +297,6 @@ const RESOURCE_GLYPHS: Record<string, string> = {
 	kpi: "Σ",
 	dataset: "▤",
 	dashboard: "▦",
-	pipeline: "⑄",
 	connection: "⛁",
 };
 
@@ -306,13 +367,35 @@ function inline(text: string): string {
 		},
 	);
 
+	// Code is literal: `a * b * c` keeps its stars rather than turning italic,
+	// so code spans are set aside before any emphasis is read.
+	const code: string[] = [];
 	const rendered = escapeHtml(withPlaceholders)
-		.replace(/`([^`]+)`/g, "<code>$1</code>")
+		.replace(/`([^`]+)`/g, (_m, body: string) => {
+			code.push(`<code>${body}</code>`);
+			return `\u0001${code.length - 1}\u0001`;
+		})
 		.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
 		.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
-		.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+		// _italic_ only as a whole word, so snake_case names stay as written.
+		.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
+		.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label: string, href: string) =>
+			safeHref(href) ? `<a href="${href}">${label}</a>` : whole,
+		);
 
-	return rendered.replace(/\[\[CHIP(\d+)\]\]/g, (_m, i) => chips[Number(i)] ?? "");
+	return rendered
+		.replace(/\u0001(\d+)\u0001/g, (_m, i) => code[Number(i)] ?? "")
+		.replace(/\[\[CHIP(\d+)\]\]/g, (_m, i) => chips[Number(i)] ?? "");
+}
+
+/**
+ * Links an answer may carry: web pages, mail, and places in this app. The
+ * text can echo what is in someone's data, so a `javascript:` or `data:`
+ * target is shown as text, never made clickable.
+ */
+function safeHref(href: string): boolean {
+	const decoded = href.replace(/&amp;/g, "&").trim().toLowerCase();
+	return /^(https?:|mailto:)/.test(decoded) || (/^[/#?]/.test(decoded) && !decoded.startsWith("//"));
 }
 
 export function renderMarkdown(source: string): string {
@@ -466,14 +549,12 @@ export function CoverageBanner({ notes }: { notes: string[] }) {
 }
 
 /**
- * What an ontology page shows in a space nothing has been published to.
+ * What an ontology page shows in a space with no ontology loaded.
  *
- * The ontology is produced by a pipeline, and pipelines belong to a space, so
- * the object types, links, actions, metrics and lineage in a space are the
- * ones its own pipeline published. A space nobody has published to has none —
- * and saying so is the honest answer. Borrowing the sandbox's, which is what
- * this page used to do, presented unreviewed work as though it were live in
- * an environment it had never been promoted to.
+ * The ontology belongs to a space: its object types are built from that
+ * space's datasets. Every space is given an empty one at boot, so this is a
+ * space created since - and saying so is the honest answer. Borrowing the
+ * sandbox's would present its work as though it were live here.
  */
 export function NoOntologyHere({
 	what,
@@ -491,12 +572,11 @@ export function NoOntologyHere({
 				No {what} in {spaceName}
 			</h3>
 			<p>
-				No ontology has been published to this space yet. One arrives when a pipeline runs
-				here, or when a version is promoted from another space.
+				This space has no ontology yet. Sync a view from a connection, then create object types
+				from the datasets it lands.
 			</p>
 			<p className="empty-space-hint">
-				The sandbox holds the ontology built so far — switch to it in the space selector
-				above.
+				The sandbox holds the ontology built so far — switch to it in the space selector above.
 			</p>
 		</div>
 	);

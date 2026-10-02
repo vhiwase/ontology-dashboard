@@ -1,6 +1,7 @@
 import { query, queryOne } from "./db";
-import { executeKpi, resolveKpi, type KpiExecuteResult } from "./kpi";
-import { BadRequest, getRegistry, NotFound } from "./registry";
+import { dimensionValues, executeKpi, humanizeColumn, kpiColumns, resolveKpi, type KpiExecuteResult } from "./kpi";
+import { quoteIdentifier, quoteQualified } from "./registry";
+import { BadRequest, currentSpace, getRegistry, NotFound } from "./registry";
 
 /**
  * Dashboards.
@@ -48,8 +49,10 @@ export interface DashboardRecord {
 	isPinned: boolean;
 	/** The conversation that produced it, for an AI-built dashboard. */
 	chatSessionId: number | null;
-	/** The space it lives in. Dashboards are per-space, like pipelines. */
+	/** The space it lives in. Dashboards are per-space, like the metrics they chart. */
 	spaceSlug: string;
+	/** A dashboard is a grid; a report is the same widgets read as a document. */
+	kind: "dashboard" | "report";
 }
 
 interface DashboardRow {
@@ -68,6 +71,7 @@ interface DashboardRow {
 	is_pinned: boolean;
 	chat_session_id: number | null;
 	space_slug: string;
+	kind: "dashboard" | "report" | null;
 }
 
 function toRecord(row: DashboardRow): DashboardRecord {
@@ -87,6 +91,7 @@ function toRecord(row: DashboardRow): DashboardRecord {
 		isPinned: row.is_pinned,
 		chatSessionId: row.chat_session_id ?? null,
 		spaceSlug: row.space_slug,
+		kind: row.kind ?? "dashboard",
 	};
 }
 
@@ -131,6 +136,12 @@ export interface ResolvedWidget extends Widget {
 	index: number;
 	data: KpiExecuteResult | null;
 	error: string | null;
+	/**
+	 * Interactive filters this widget could not apply because its metric's data
+	 * has no such column. Reported, not hidden: a tile that silently ignores
+	 * "Region = West" reads as though it obeyed it.
+	 */
+	ignoredFilters?: string[];
 }
 
 export interface ResolvedDashboard extends DashboardRecord {
@@ -151,8 +162,10 @@ export interface ResolvedDashboard extends DashboardRecord {
 export async function resolveDashboard(
 	slug: string,
 	spaceSlug?: string,
+	runtime: { filters?: Record<string, unknown> } = {},
 ): Promise<ResolvedDashboard> {
 	const dashboard = await getDashboard(slug, spaceSlug);
+	const interactive = runtime.filters ?? {};
 
 	const widgets = await Promise.all(
 		dashboard.layout.map(async (widget, index): Promise<ResolvedWidget> => {
@@ -160,14 +173,26 @@ export async function resolveDashboard(
 				return { ...widget, index, data: null, error: null };
 			}
 			try {
+				// Filters chosen on the board apply to every widget whose metric
+				// has the column; the rest say so rather than ignoring it quietly.
+				const columns = await kpiColumns(widget.kpi).catch(() => new Set<string>());
+				const applicable: Record<string, unknown> = {};
+				const ignoredFilters: string[] = [];
+				for (const [key, value] of Object.entries(interactive)) {
+					if (value === undefined || value === null || value === "") continue;
+					if (columns.has(key.split(":")[0]!)) applicable[key] = value;
+					else ignoredFilters.push(key);
+				}
 				const data = await executeKpi(widget.kpi, {
 					dimension: widget.type === "stat" ? null : widget.dimension,
-					filters: { ...dashboard.filters, ...(widget.filters ?? {}) },
+					filters: { ...dashboard.filters, ...(widget.filters ?? {}), ...applicable },
 					limit: widget.limit,
 					sort: widget.sort,
 					totalOnly: widget.type === "stat",
+					// A headline number is shown with its last year beside it.
+					trend: widget.type === "stat" ? { grain: "month", periods: 12 } : undefined,
 				});
-				return { ...widget, index, data, error: null };
+				return { ...widget, index, data, error: null, ...(ignoredFilters.length ? { ignoredFilters } : {}) };
 			} catch (error) {
 				return { ...widget, index, data: null, error: (error as Error).message };
 			}
@@ -203,6 +228,7 @@ export interface SaveDashboardRequest {
 	isPinned?: boolean;
 	chatSessionId?: number | null;
 	spaceSlug?: string;
+	kind?: "dashboard" | "report";
 }
 
 export function slugify(title: string): string {
@@ -375,17 +401,34 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 		);
 	}
 
-	const slug = request.slug?.trim() || slugify(request.title);
 	// Work that has not been deliberately promoted belongs in the sandbox.
 	const spaceSlug = request.spaceSlug?.trim() || "sandbox";
 	const spaceId = await spaceIdFor(spaceSlug);
+	// A slug given is an edit of that board. Without one this is a new board,
+	// and it gets a slug of its own: asking the assistant twice for "a sales
+	// dashboard" used to overwrite the first one, edits and all.
+	let slug = request.slug?.trim() ?? "";
+	if (!slug) {
+		const base = slugify(request.title);
+		const taken = new Set(
+			(
+				await query<{ slug: string }>(
+					"SELECT slug FROM platform.dashboard WHERE space_id = $1 AND (slug = $2 OR slug LIKE $3)",
+					[spaceId, base, `${base}-%`],
+				)
+			).map((row) => row.slug),
+		);
+		slug = base;
+		for (let n = 2; taken.has(slug); n += 1) slug = `${base}-${n}`;
+	}
 
 	const row = await queryOne<DashboardRow>(
 		`INSERT INTO platform.dashboard
 		   (slug, title, description, layout, filters, audience, is_ai_generated,
-		    source_prompt, created_by, is_pinned, chat_session_id, space_id, updated_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now())
+		    source_prompt, created_by, is_pinned, chat_session_id, space_id, updated_at, kind)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12, now(), $14)
 		 ON CONFLICT (space_id, slug) DO UPDATE SET
+		   kind = EXCLUDED.kind,
 		   title = EXCLUDED.title,
 		   description = EXCLUDED.description,
 		   layout = EXCLUDED.layout,
@@ -413,6 +456,7 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 			request.chatSessionId ?? null,
 			spaceId,
 			spaceSlug,
+			request.kind === "report" ? "report" : "dashboard",
 		],
 	);
 	if (!row) throw new Error("Dashboard save returned no row.");
@@ -420,9 +464,14 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 }
 
 export async function deleteDashboard(slug: string, spaceSlug?: string): Promise<void> {
+	// Scoped to the space. Slugs are unique per space, not globally, and this
+	// used to delete by slug alone - so deleting "sales" in one space deleted
+	// every other space's "sales" with it.
 	const result = await query<{ slug: string }>(
-		"DELETE FROM platform.dashboard WHERE slug = $1 RETURNING slug",
-		[slug],
+		`DELETE FROM platform.dashboard d USING platform.space s
+		  WHERE s.space_id = d.space_id AND d.slug = $1 AND s.slug = $2
+		RETURNING d.slug`,
+		[slug, spaceSlug ?? currentSpace()],
 	);
 	if (result.length === 0) throw new NotFound(`No dashboard '${slug}'.`);
 }
@@ -700,12 +749,66 @@ export async function importDashboards(
 	return outcome;
 }
 
+export interface DashboardFilterOptions {
+	dimensions: Array<{ key: string; label: string; values: Array<{ value: string; count: number }> }>;
+	time: Array<{ column: string; label: string; min: string | null; max: string | null }>;
+}
+
+/**
+ * What a board can be filtered by: every category any of its metrics can be
+ * sliced by, with the values that occur, and every date they are placed in
+ * time by, with its range. Read from the data, so a filter can only offer a
+ * value that exists.
+ */
+export async function dashboardFilterOptions(slug: string, spaceSlug?: string): Promise<DashboardFilterOptions> {
+	const dashboard = await getDashboard(slug, spaceSlug);
+	const kpis = [...new Set(dashboard.layout.map((w) => w.kpi).filter((k): k is string => Boolean(k)))]
+		.map((name) => {
+			try {
+				return resolveKpi(name);
+			} catch {
+				return null;
+			}
+		})
+		.filter((k): k is NonNullable<typeof k> => k !== null);
+
+	const dimensions: DashboardFilterOptions["dimensions"] = [];
+	const seen = new Set<string>();
+	for (const kpi of kpis) {
+		for (const dimension of kpi.dimensions) {
+			if (dimension.includes(":") || seen.has(dimension) || dimensions.length >= 8) continue;
+			seen.add(dimension);
+			const values = await dimensionValues(kpi.apiName, dimension, 60).catch(() => []);
+			if (values.length >= 2) dimensions.push({ key: dimension, label: humanizeColumn(dimension), values });
+		}
+	}
+
+	const time: DashboardFilterOptions["time"] = [];
+	const seenTime = new Set<string>();
+	for (const kpi of kpis) {
+		if (!kpi.timeColumn || seenTime.has(kpi.timeColumn)) continue;
+		seenTime.add(kpi.timeColumn);
+		const [range] = await query<{ min: string | null; max: string | null }>(
+			`SELECT min(${quoteIdentifier(kpi.timeColumn)})::date::text AS min,
+			        max(${quoteIdentifier(kpi.timeColumn)})::date::text AS max
+			   FROM ${quoteQualified(kpi.sourceView)}`,
+		).catch(() => [{ min: null, max: null }]);
+		time.push({ column: kpi.timeColumn, label: humanizeColumn(kpi.timeColumn), min: range?.min ?? null, max: range?.max ?? null });
+	}
+	return { dimensions, time };
+}
+
 export function kpiCatalogueForPrompt(): Array<Record<string, unknown>> {
-	return getRegistry().kpis.map((kpi) => ({
+	const registry = getRegistry();
+	return registry.kpis.map((kpi) => ({
 		apiName: kpi.apiName,
 		label: kpi.label,
 		question: kpi.businessQuestion,
 		category: kpi.category,
+		objectType: registry.objectTypeByRid.get(kpi.objectTypeRid ?? kpi.relatedObjectTypes[0] ?? "")?.apiName ?? null,
+		aggregation: kpi.aggregation,
+		measure: kpi.measureColumn,
+		conditions: kpi.conditions ?? {},
 		unit: kpi.unit,
 		format: kpi.valueFormat,
 		dimensions: kpi.dimensions,
