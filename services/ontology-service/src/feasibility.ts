@@ -44,6 +44,8 @@ export interface DraftProposal {
 	payload: Record<string, unknown>;
 	/** Indexes into the same item's proposals that must be applied first. */
 	dependsOn: number[];
+	/** What to build once this is applied (see FollowUp in proposals.ts). */
+	followUp?: { build: "dashboard" | "report"; title: string; measure: string | null; sourcePrompt: string | null };
 }
 
 export interface FeasibilityRequest {
@@ -307,6 +309,17 @@ function revenueRecipe(): { type: ObjectTypeMeta; expression: string; name: stri
 
 // ── deciding one request ────────────────────────────────────────────────────
 
+/** "Orders per month", "Revenue by customer country". */
+export function widgetTitle(kpi: KpiMeta, dimension: string | null): string {
+	if (!dimension) return kpi.label;
+	const [column = "", grain] = dimension.split(":");
+	if (!grain) return `${kpi.label} by ${humanize(column).toLowerCase()}`;
+	// The metric's own date needs no naming; any other date does.
+	return kpi.timeColumn && kpi.timeColumn !== column
+		? `${kpi.label} per ${grain} (${humanize(column).toLowerCase()})`
+		: `${kpi.label} per ${grain}`;
+}
+
 function readyItem(request: FeasibilityRequest, kpi: KpiMeta, dimension: string | null, title?: string): FeasibilityItem {
 	const widget: Widget = dimension
 		? {
@@ -315,7 +328,7 @@ function readyItem(request: FeasibilityRequest, kpi: KpiMeta, dimension: string 
 				dimension,
 				chart: chartFor(dimension, kpi),
 				...(dimension.includes(":") ? { sort: "dimension_asc" as const } : { sort: "value_desc" as const, limit: 12 }),
-				title: title ?? `${kpi.label} by ${humanize(dimension.split(":")[0]!).toLowerCase()}${dimension.includes(":") ? ` (${dimension.split(":")[1]})` : ""}`,
+				title: title ?? widgetTitle(kpi, dimension),
 				width: 2,
 			}
 		: { type: "stat", kpi: kpi.apiName, title: title ?? kpi.label, width: 1 };
@@ -323,8 +336,8 @@ function readyItem(request: FeasibilityRequest, kpi: KpiMeta, dimension: string 
 		request,
 		status: "ready",
 		explanation: dimension
-			? `${kpi.label} can be charted by ${humanize(dimension.split(":")[0]!).toLowerCase()}${dimension.includes(":") ? ` per ${dimension.split(":")[1]}` : ""} with the existing metric ${kpi.apiName}.`
-			: `${kpi.label} is an existing metric (${kpi.apiName}).`,
+			? `${widget.title ?? widgetTitle(kpi, dimension)} is ready, from the existing metric ${kpi.apiName}.`
+			: `${kpi.label} is ready as a single figure, from the existing metric ${kpi.apiName}.`,
 		kpi: kpi.apiName,
 		dimension,
 		widget,
@@ -766,6 +779,149 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 	return { request, status: "not_possible", explanation: "This request could not be resolved against the ontology.", missing: [] };
 }
 
+// ── analysis datasets ───────────────────────────────────────────────────────
+//
+//  A board needs a timeline and a few ways to slice its main figure. When the
+//  type a request is about has neither - order lines whose date and customer
+//  live one or two links away - the answer is one wide dataset: the fact rows
+//  with the date, name and main categories of everything they point at. It is
+//  a combination like any other, so it waits for approval, and the board the
+//  person asked for is built from it the moment it is approved.
+
+const CONTACT_LIKE = /(address|street|postal|zip|phone|fax|url|email|homepage|photo|picture|notes|password|token|extension)/i;
+
+function dimensionRank(property: PropertyMeta): number {
+	const column = property.sqlColumn.toLowerCase();
+	if (/country|region|state|territory|province/.test(column)) return 0;
+	if (/category|type|segment|class|kind|status|tier|channel|group/.test(column)) return 1;
+	if (/city/.test(column)) return 2;
+	return 3;
+}
+
+/** What a linked type contributes: its main date, its name, its main categories. */
+export function carriedFields(type: ObjectTypeMeta): string[] {
+	const fields: string[] = [];
+	const dates = type.properties
+		.filter((p) => p.semanticRole === "temporal" && !/(birth|hire|modified|updated|created)/i.test(p.sqlColumn))
+		.sort((a, b) => a.displayOrder - b.displayOrder);
+	fields.push(...dates.slice(0, 2).map((p) => p.sqlColumn));
+	// A name says which customer or product; an event (anything dated) has
+	// no name worth ranking by, only its date and categories.
+	const title = dates.length === 0
+		? type.properties.find((p) => p.isTitle && !CONTACT_LIKE.test(p.sqlColumn) && p.sqlColumn !== type.primaryKeyColumn)
+		: undefined;
+	if (title) fields.push(title.sqlColumn);
+	const dimensions = type.properties
+		.filter(
+			(p) =>
+				p.semanticRole === "dimension" &&
+				!CONTACT_LIKE.test(p.sqlColumn) &&
+				p.sqlColumn !== title?.sqlColumn &&
+				// Text categories: a numeric "level" groups badly next to names.
+				!/int|numeric|double|real|decimal/.test((p.sqlType ?? "").toLowerCase()),
+		)
+		.sort((a, b) => dimensionRank(a) - dimensionRank(b) || a.displayOrder - b.displayOrder);
+	fields.push(...dimensions.slice(0, 2).map((p) => p.sqlColumn));
+	return [...new Set(fields)];
+}
+
+/**
+ * Every type a fact type reaches along many-to-one links (two hops), with
+ * what each contributes. Many-to-one only, so the dataset keeps one row per
+ * fact row and every total over it stays true.
+ */
+export function analysisJoins(base: ObjectTypeMeta, maxHops = 2): Array<{ path: string[]; fields: string[]; target: ObjectTypeMeta }> {
+	const registry = getRegistry();
+	const joins: Array<{ path: string[]; fields: string[]; target: ObjectTypeMeta }> = [];
+	const seen = new Set([base.rid]);
+	const queue: Array<{ type: ObjectTypeMeta; path: string[] }> = [{ type: base, path: [] }];
+	while (queue.length > 0 && joins.length < 8) {
+		const { type, path } = queue.shift()!;
+		if (path.length >= maxHops) continue;
+		for (const link of registry.linksBySourceRid.get(type.rid) ?? []) {
+			if (link.cardinality !== "MANY_TO_ONE" && link.cardinality !== "ONE_TO_ONE") continue;
+			const target = registry.objectTypeByRid.get(link.targetObjectType);
+			if (!target || seen.has(target.rid) || target.origin === "combination") continue;
+			seen.add(target.rid);
+			const nextPath = [...path, link.apiName];
+			const fields = carriedFields(target);
+			if (fields.length > 0) joins.push({ path: nextPath, fields, target });
+			queue.push({ type: target, path: nextPath });
+		}
+	}
+	return joins.slice(0, 8);
+}
+
+function titleCase(text: string): string {
+	return text.replace(/\b([a-z])/g, (_, letter: string) => letter.toUpperCase());
+}
+
+/**
+ * The analysis dataset for a board on `topic`, or null when the fact type
+ * reaches nothing worth carrying in.
+ */
+function analysisDataset(
+	topic: string,
+	intent: "dashboard" | "report",
+	boardTitle: string,
+	sourcePrompt: string,
+): { item: FeasibilityItem } | null {
+	const registry = getRegistry();
+	const topicTokens = tokens(topic);
+	const recipe = topicTokens.includes("revenue") ? revenueRecipe() : null;
+	const measureMatch = recipe ? null : topic ? matchProperty(topic, ["measure"], null) : null;
+	const base =
+		recipe?.type ??
+		(measureMatch && measureMatch.type.origin !== "combination" ? measureMatch.type : null) ??
+		(topic ? matchType(topic) : null) ??
+		pickSubject("");
+	if (!base) return null;
+	const joins = analysisJoins(base);
+	const hasOwnDate = base.properties.some((p) => p.semanticRole === "temporal");
+	const joinedDate = joins.some((j) => j.target.properties.some((p) => j.fields.includes(p.sqlColumn) && p.semanticRole === "temporal"));
+	if (joins.length === 0 || (!hasOwnDate && !joinedDate && joins.length < 2)) return null;
+
+	// "Sales Order Detail" for a figure; "Enriched Product" when the topic is
+	// the type itself (or there is none).
+	const topicIsType = !topic || overlap(tokens(topic), typeTokens(base)) > 0;
+	let name = (topicIsType ? `Enriched ${base.label}` : `${titleCase(topic)} ${base.label}`).slice(0, 60);
+	for (let n = 2; registry.objectTypeByApiName.has(name.replace(/[^A-Za-z0-9]+/g, " ").split(" ").filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("")); n += 1) {
+		name = `${name.replace(/ \d+$/, "")} ${n}`;
+	}
+	const measure = recipe?.name ?? measureMatch?.property.sqlColumn ?? null;
+	const carried = joins.map((j) => `${j.target.label.toLowerCase()} (${j.fields.map((f) => humanize(f).toLowerCase()).join(", ")})`);
+	const proposal: DraftProposal = {
+		kind: "combination",
+		title: `New dataset: ${name}`,
+		summary:
+			`${base.pluralLabel ?? plural(base.label)}, one row each, with ` +
+			carried.join("; ") +
+			(recipe ? `, and revenue = ${recipe.expression}` : "") +
+			`. Approve it and the ${intent} "${boardTitle}" is built from it.`,
+		payload: {
+			name,
+			base: base.apiName,
+			joins: joins.map((j) => ({ path: j.path, fields: j.fields })),
+			derived: recipe ? [{ name: recipe.name, expression: recipe.expression }] : [],
+		},
+		dependsOn: [],
+		followUp: { build: intent, title: boardTitle, measure, sourcePrompt },
+	};
+	return {
+		item: {
+			request: { text: sourcePrompt, measure: topic || undefined },
+			status: "needs_approval",
+			explanation:
+				`To build "${boardTitle}" properly, ${base.pluralLabel?.toLowerCase() ?? plural(base.label.toLowerCase())} need what they point at in one place: ` +
+				carried.join("; ") +
+				(recipe ? `, with revenue worked out as ${recipe.expression}` : "") +
+				`. That is one new dataset (nothing in your database changes). Approve it and the ${intent} is built straight away - ` +
+				"headline figures, a monthly timeline and the main breakdowns.",
+			proposals: [proposal],
+		},
+	};
+}
+
 // ── dashboards and capabilities ─────────────────────────────────────────────
 
 async function cardinality(type: ObjectTypeMeta, column: string): Promise<number> {
@@ -802,14 +958,28 @@ export function pickSubject(text: string): ObjectTypeMeta | null {
  * across the top, its timeline, then its strongest slices. Only READY widgets
  * go on it; what would need approval is returned separately.
  */
-export async function planBoard(subject: ObjectTypeMeta): Promise<{ layout: Widget[]; items: FeasibilityItem[] }> {
+export async function planBoard(
+	subject: ObjectTypeMeta,
+	options: { measure?: string | null } = {},
+): Promise<{ layout: Widget[]; items: FeasibilityItem[] }> {
 	const registry = getRegistry();
 	const metrics = registry.kpis.filter((k) => k.objectTypeRid === subject.rid);
 	const layout: Widget[] = [];
 	const items: FeasibilityItem[] = [];
 	const count = metrics.find((k) => k.aggregation === "count");
-	const sums = metrics.filter((k) => k.aggregation === "sum" || k.aggregation === "avg").slice(0, 3);
-	const headline = [count, ...sums].filter((k): k is KpiMeta => Boolean(k)).slice(0, 4);
+	// The figure the board was asked for leads it: a sales board opens on revenue.
+	const lead = options.measure
+		? metrics.find((k) => k.measureColumn === options.measure && k.aggregation === "sum") ??
+			metrics.find((k) => k.measureColumn === options.measure)
+		: undefined;
+	const sums = [
+		...(lead ? [lead] : []),
+		...metrics.filter((k) => k !== lead && (k.aggregation === "sum" || k.aggregation === "avg")),
+	].slice(0, 3);
+	const distinct = lead ? metrics.find((k) => k.aggregation === "count_distinct") : undefined;
+	const headline = (lead ? [lead, distinct ?? count, ...sums.slice(1)] : [count, ...sums])
+		.filter((k, index, all): k is KpiMeta => Boolean(k) && all.indexOf(k) === index)
+		.slice(0, 4);
 	for (const kpi of headline) {
 		layout.push({ type: "stat", kpi: kpi.apiName, title: kpi.label, width: 1 });
 		items.push(readyItem({ measure: kpi.label }, kpi, null));
@@ -822,7 +992,7 @@ export async function planBoard(subject: ObjectTypeMeta): Promise<{ layout: Widg
 	}
 	if (layout.length % 4 !== 0) layout[layout.length - 1]!.width = 1 + (4 - (layout.length % 4));
 
-	const primary = sums.find((k) => k.aggregation === "sum") ?? count;
+	const primary = lead ?? sums.find((k) => k.aggregation === "sum") ?? count;
 	if (primary?.timeColumn) {
 		const dimension = `${primary.timeColumn}:month`;
 		if (primary.dimensions.includes(dimension)) {
@@ -831,23 +1001,91 @@ export async function planBoard(subject: ObjectTypeMeta): Promise<{ layout: Widg
 	}
 	if (primary) {
 		const categorical = primary.dimensions.filter((d) => !d.includes(":"));
-		const withCardinality = await Promise.all(
-			categorical.slice(0, 8).map(async (d) => ({ d, n: await cardinality(subject, d) })),
+		const measured = await Promise.all(
+			categorical.slice(0, 24).map(async (d) => ({ d, n: await cardinality(subject, d), family: family(d) })),
 		);
-		const useful = withCardinality.filter((x) => x.n >= 2).sort((a, b) => a.n - b.n);
-		const small = useful.find((x) => x.n <= 4);
-		if (small) {
-			layout.push({ type: "chart", kpi: primary.apiName, dimension: small.d, chart: "donut", title: `${primary.label} by ${humanize(small.d).toLowerCase()}`, width: 2 });
+		const useful = measured.filter((x) => x.n >= 2);
+		// A share of a small whole reads best as a donut: who carried it, which
+		// channel - a place is better ranked than pied.
+		const donut = useful
+			.filter((x) => x.n <= 4)
+			.sort((a, b) => Number(a.family === "where") - Number(b.family === "where") || a.n - b.n)[0];
+		if (donut) {
+			layout.push({ type: "chart", kpi: primary.apiName, dimension: donut.d, chart: "donut", title: `${primary.label} by ${humanize(donut.d).toLowerCase()}`, width: 2 });
 		}
-		for (const { d } of useful.filter((x) => x !== small).slice(0, small ? 1 : 2)) {
+		// Then one ranked slice per kind of question - where, what, who - so a
+		// wide dataset does not fill the board with three versions of country.
+		const shown: typeof useful = [];
+		const slices = categorical.length >= 5 ? 3 : 2;
+		for (const kind of ["where", "what", "who", "other"] as const) {
+			if (shown.length >= (donut ? slices - (slices === 3 ? 0 : 1) : slices)) break;
+			// Countries before regions; a slice of two bars only when nothing
+			// richer exists; otherwise the dataset's own order (its base first).
+			const pick = useful
+				.filter((x) => x !== donut && x.family === kind && x.n <= 60)
+				.sort(
+					(a, b) =>
+						nameRank(a.d) - nameRank(b.d) ||
+						Number(a.n < 5) - Number(b.n < 5) ||
+						categorical.indexOf(a.d) - categorical.indexOf(b.d),
+				)[0];
+			if (pick) shown.push(pick);
+		}
+		for (const { d } of shown) {
 			layout.push({ type: "chart", kpi: primary.apiName, dimension: d, chart: "hbar", sort: "value_desc", limit: 10, title: `${primary.label} by ${humanize(d).toLowerCase()}`, width: 2 });
 		}
-		const tableDimension = useful[useful.length - 1];
-		if (tableDimension && useful.length > 1) {
-			layout.push({ type: "table", kpi: primary.apiName, dimension: tableDimension.d, sort: "value_desc", limit: 15, title: `Top ${humanize(tableDimension.d).toLowerCase()} by ${primary.label.toLowerCase()}`, width: layout.length % 2 === 0 ? 4 : 2 });
+		// The table ranks the finest dimension: the top customers, the top products.
+		const tableDimension = [...useful]
+			.filter((x) => x !== donut && !shown.includes(x) && x.family !== "where")
+			.sort((a, b) => b.n - a.n)[0];
+		if (tableDimension) {
+			const used = layout.reduce((sum, w) => sum + (w.width ?? 1), 0) % 4;
+			layout.push({ type: "table", kpi: primary.apiName, dimension: tableDimension.d, sort: "value_desc", limit: 15, title: `Top ${humanize(tableDimension.d).toLowerCase()} by ${primary.label.toLowerCase()}`, width: used === 2 ? 2 : 4 });
 		}
 	}
 	return { layout, items };
+}
+
+function nameRank(column: string): number {
+	const lowered = column.toLowerCase();
+	if (/country|nation/.test(lowered)) return 0;
+	if (/region|state|territory|province/.test(lowered)) return 1;
+	if (/category|type|segment|class|kind|status|tier|channel|group/.test(lowered)) return 1;
+	if (/city/.test(lowered)) return 2;
+	return 3;
+}
+
+/** The kind of question a dimension answers. */
+function family(column: string): "where" | "what" | "who" | "other" {
+	const lowered = column.toLowerCase();
+	// A contact's job title says little about who bought.
+	if (/contact/.test(lowered)) return "other";
+	if (/country|nation|region|state|territory|province|city|zone|market/.test(lowered)) return "where";
+	if (/category|type|segment|class|kind|status|tier|channel|group|product|line|brand/.test(lowered)) return "what";
+	if (/customer|client|employee|staff|rep|agent|owner|manager|supplier|vendor|shipper|carrier|company|last_name|first_name|name/.test(lowered)) return "who";
+	return "other";
+}
+
+/**
+ * The type a board on `topic` should be built on: of the types the topic
+ * names (or that hold its measure), the one with the most to show - a
+ * timeline, ways to slice, and the measure itself.
+ */
+function boardSubject(topic: string, measure: string | null): ObjectTypeMeta | null {
+	const registry = getRegistry();
+	const want = tokens(topic);
+	const candidates = registry.objectTypes.filter(
+		(type) => (want.length > 0 && overlap(want, typeTokens(type)) > 0) || (measure !== null && type.propertyBySqlColumn.has(measure)),
+	);
+	if (candidates.length === 0) return pickSubject(topic);
+	const richness = (type: ObjectTypeMeta): number => {
+		const metrics = registry.kpis.filter((k) => k.objectTypeRid === type.rid);
+		const timeline = metrics.some((k) => k.dimensions.some((d) => d.includes(":"))) ? 3 : 0;
+		const slices = Math.min(new Set(metrics.flatMap((k) => k.dimensions.filter((d) => !d.includes(":")))).size, 6);
+		const holdsMeasure = measure !== null && type.propertyBySqlColumn.has(measure) ? 2 : 0;
+		return timeline + slices + holdsMeasure;
+	};
+	return [...candidates].sort((a, b) => richness(b) - richness(a))[0] ?? null;
 }
 
 /** Everything a workspace can chart right now, and what approval would add. */
@@ -895,19 +1133,49 @@ export async function assess(input: { text?: string; requests?: FeasibilityReque
 	if (intent === "capabilities") {
 		items.push(...(await capabilities()));
 	} else if ((intent === "dashboard" || intent === "report") && !(input.requests?.length) && !/\s(by|per)\s/.test(` ${text.toLowerCase()} `)) {
-		const topic = text.replace(/\b(build|create|make|me|a|an|the|dashboard|report|board|overview|for|about|on|my|our|please|show)\b/gi, " ").trim();
-		subject = subject ?? pickSubject(topic);
+		const topic = text
+			.replace(
+				/\b(build|create|make|write|generate|prepare|draft|give|show|me|us|i|we|can|could|want|need|share|send|a|an|the|new|dashboard|dashboards|report|reports|board|overview|for|about|on|of|with|my|our|please|that|to)\b/gi,
+				" ",
+			)
+			.replace(/[^\p{L}\p{N} -]+/gu, " ")
+			.replace(/\s+/g, " ")
+			.trim();
+		const recipe = tokens(topic).includes("revenue") ? revenueRecipe() : null;
+		subject = subject ?? boardSubject(topic, recipe?.name ?? null);
 		if (subject) {
-			const plan = await planBoard(subject);
-			layout = plan.layout;
-			items.push(...plan.items);
-			// "A sales dashboard" asks for sales: if the topic names a figure
-			// the board does not already show, say whether it can be added.
-			if (topic && !matchType(topic)) {
-				const topical = await decide({ text: topic, measure: topic });
-				if (topical.status !== "ready" || !layout.some((w) => w.kpi === topical.kpi)) items.push(topical);
+			// Named for what was asked ("Sales dashboard") when the topic is a
+			// figure rather than one of the types; otherwise for the type.
+			const namesType =
+				Boolean(topic) &&
+				[subject.label, subject.pluralLabel ?? "", subject.apiName].some((name) => name.toLowerCase() === topic.toLowerCase());
+			title =
+				topic && !namesType
+					? `${topic.charAt(0).toUpperCase()}${topic.slice(1)} ${intent === "report" ? "report" : "dashboard"}`
+					: `${subject.pluralLabel ?? plural(subject.label)} ${intent === "report" ? "report" : "overview"}`;
+			// "A sales dashboard" asks for sales: the board leads with that
+			// figure when one exists, on whichever type holds it.
+			const topical = topic && !matchType(topic) ? await decide({ text: topic, measure: topic }) : null;
+			const leadKpi = topical?.status === "ready" && topical.kpi ? getRegistry().kpiByApiName.get(topical.kpi) : undefined;
+			if (leadKpi?.objectTypeRid && leadKpi.objectTypeRid !== subject.rid) {
+				subject = getRegistry().objectTypeByRid.get(leadKpi.objectTypeRid) ?? subject;
 			}
-			title = `${subject.pluralLabel ?? plural(subject.label)} ${intent === "report" ? "report" : "overview"}`;
+			const measure = leadKpi?.measureColumn ?? (recipe && subject.propertyBySqlColumn.has(recipe.name) ? recipe.name : null);
+			const plan = await planBoard(subject, { measure });
+			const charts = plan.layout.filter((w) => w.type !== "stat");
+			const thin = !charts.some((w) => w.dimension?.includes(":")) || charts.length < 3;
+			const topicMissing = Boolean(topic) && !namesType && measure === null;
+			// A board with no timeline or almost nothing to slice, or one that
+			// cannot show what it was asked about, is better built on one wide
+			// dataset: proposed, and built the moment it is approved.
+			const wide = thin || topicMissing ? analysisDataset(topic, intent, title, text) : null;
+			if (wide) {
+				items.push(wide.item);
+			} else {
+				layout = plan.layout;
+				items.push(...plan.items);
+				if (topical && topical.status !== "ready") items.push(topical);
+			}
 		} else {
 			items.push(...(await capabilities()));
 		}

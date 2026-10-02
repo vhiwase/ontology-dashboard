@@ -69,6 +69,13 @@ export interface ModelSource {
 	 * source table: a combination keeps its base type's links this way.
 	 */
 	directForeignKeys?: Array<{ column: string; targetRelation: string; targetColumn: string }>;
+	/**
+	 * Columns already known to identify rows of some type: a combination's
+	 * copies of its base type's references and keys. Profiling a view sees
+	 * no constraints, so without this an integer reference (ship_via) reads
+	 * as a number to add up.
+	 */
+	identityColumns?: string[];
 }
 
 export interface ModelOutcome {
@@ -306,9 +313,11 @@ export async function modelSources(
 	const profiled = [];
 	for (const source of sources) {
 		const { rowCount, columns } = await profileRelation(source.relation);
-		const foreignKeyColumns = new Set(
-			source.foreignKeys.filter((fk) => fk.columns.length === 1).map((fk) => fk.columns[0]!),
-		);
+		const foreignKeyColumns = new Set([
+			...source.foreignKeys.filter((fk) => fk.columns.length === 1).map((fk) => fk.columns[0]!),
+			...(source.directForeignKeys ?? []).map((fk) => fk.column),
+			...(source.identityColumns ?? []),
+		]);
 		const profiles = inferRoles(rowCount, columns, {
 			primaryKey: source.primaryKey,
 			foreignKeyColumns,

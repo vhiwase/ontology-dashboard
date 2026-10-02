@@ -28,6 +28,7 @@ import { importTables, remodelConnection } from "./importer";
 import { removeModelledType } from "./modeling";
 import { assess, pickSubject, planBoard } from "./feasibility";
 import { approveProposal, createProposal, getProposal, listProposals, rejectProposal } from "./proposals";
+import { runFollowUps } from "./followups";
 import { deleteCredential, storeCredential } from "./vault";
 import {
 	accessibleSpaces,
@@ -903,7 +904,11 @@ app.post(
 	"/api/proposals/:id/approve",
 	handle(async (req, res) => {
 		const note = typeof req.body?.note === "string" ? req.body.note : null;
-		res.json(await approveProposal(Number(req.params.id), req.principal?.username ?? "unknown", note));
+		const username = req.principal?.username ?? "unknown";
+		const settled = await approveProposal(Number(req.params.id), username, note);
+		// What the proposals were for - the board someone asked for before the
+		// data could answer it - is built now; each record carries result.built.
+		res.json(await runFollowUps(settled, username, currentSpace()));
 	}),
 );
 

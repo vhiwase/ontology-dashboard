@@ -28,7 +28,7 @@ from typing import Any, Callable, Awaitable
 import httpx
 
 from .config import CONFIG
-from .context import current_request_id, current_space, current_token
+from .context import current_request_id, current_session, current_space, current_token
 
 log = logging.getLogger("ai_fde.tools")
 
@@ -267,14 +267,24 @@ async def execute_kpi(arguments: dict[str, Any]) -> dict[str, Any]:
     api_name = str(arguments.get("kpi") or arguments.get("apiName") or "")
     if not api_name:
         raise ToolError("kpi is required.")
+    dimension = arguments.get("dimension")
+    sort = arguments.get("sort") or None
+    # A timeline cut to its first thirty periods would answer "per month" with
+    # the oldest months of the data. Asked newest-first and put back in time
+    # order, it ends at the latest period instead.
+    latest_first = bool(dimension and ":" in str(dimension) and sort in (None, "dimension_asc"))
     body = {
-        "dimension": arguments.get("dimension"),
+        "dimension": dimension,
         "filters": arguments.get("filters") or {},
         "limit": min(int(arguments.get("limit") or MAX_SERIES_POINTS), MAX_SERIES_POINTS),
-        "sort": arguments.get("sort") or "value_desc",
+        # Unset lets the service choose: time order for a date grain, largest
+        # first for a category. Forcing value_desc scrambled every timeline.
+        "sort": "dimension_desc" if latest_first else sort,
         "totalOnly": bool(arguments.get("totalOnly")),
     }
     result = await client.post(f"/api/kpis/{api_name}/execute", body)
+    if latest_first:
+        result["series"] = list(reversed(result["series"]))
     payload: dict[str, Any] = {
         "kpi": result["kpi"],
         "label": result["label"],
@@ -282,10 +292,24 @@ async def execute_kpi(arguments: dict[str, Any]) -> dict[str, Any]:
         "unit": result["unit"],
         "format": result["valueFormat"],
         "dimension": result["dimension"],
+        "dimensionLabel": result.get("dimensionLabel"),
+        "dimensionGrain": result.get("dimensionGrain"),
+        # Whether the parts add up to the total: a breakdown of a sum or a
+        # count does; one of an average or a distinct count does not.
+        "aggregation": result.get("aggregation"),
         "series": result["series"][:MAX_SERIES_POINTS],
         "target": result["target"],
         "higherIsBetter": result["higherIsBetter"],
     }
+    if result.get("partialPeriod"):
+        # Said where the number is, so the newest period is not read as a fall.
+        payload["partialPeriod"] = result["partialPeriod"]
+        payload["dataThrough"] = result.get("dataThrough")
+        payload["periodNote"] = (
+            f"The data runs to {result.get('dataThrough')}, so the period starting "
+            f"{result['partialPeriod']} is incomplete. Say so if you quote it, and do "
+            "not compare it with complete periods."
+        )
     # The caveat travels with the number so it cannot be quoted without it.
     if result["dependsOnSimulation"]:
         payload["dataQualityCaveat"] = result["coverageNote"] or (
@@ -384,10 +408,13 @@ async def create_dashboard(arguments: dict[str, Any]) -> dict[str, Any]:
             "sourcePrompt": arguments.get("sourcePrompt"),
             "createdBy": "ai-fde",
             "isPinned": False,
+            "kind": "report" if arguments.get("kind") == "report" else "dashboard",
+            "chatSessionId": current_session.get(),
         },
     )
     return {
         "created": True,
+        "kind": saved.get("kind", "dashboard"),
         "slug": saved["slug"],
         "title": saved["title"],
         "widgets": len(saved["layout"]),
@@ -710,6 +737,65 @@ async def propose_pipeline(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def check_feasibility(arguments: dict[str, Any]) -> dict[str, Any]:
+    """What this workspace's data can and cannot answer, and what is missing."""
+    body: dict[str, Any] = {}
+    if arguments.get("text"):
+        body["text"] = str(arguments["text"])
+    if isinstance(arguments.get("requests"), list):
+        body["requests"] = arguments["requests"]
+    if arguments.get("intent"):
+        body["intent"] = str(arguments["intent"])
+    if arguments.get("objectType"):
+        body["objectType"] = str(arguments["objectType"])
+    if not body:
+        raise ToolError("Give text (the user's request) or requests (structured asks).")
+    return await client.post("/api/feasibility", body)
+
+
+async def propose_change(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Draft a link, metric, combined dataset or action type for approval."""
+    kind = str(arguments.get("kind") or "")
+    payload = arguments.get("payload")
+    if not isinstance(payload, dict):
+        raise ToolError("payload must be an object (use the payload check_feasibility returned).")
+    created = await client.post(
+        "/api/proposals",
+        {
+            "kind": kind,
+            "payload": payload,
+            "title": arguments.get("title"),
+            "summary": arguments.get("summary"),
+            "dependsOn": arguments.get("dependsOn") or [],
+            "createdVia": "planner" if arguments.get("_via") == "planner" else "assistant",
+            # What to build once it is approved, as check_feasibility drafted it.
+            "followUp": arguments.get("followUp"),
+            "chatSessionId": current_session.get(),
+        },
+    )
+    follow_up = created.get("followUp") or {}
+    return {
+        "proposed": True,
+        "proposal": created,
+        "note": (
+            "Saved as a PROPOSAL waiting for the user's approval; nothing has changed yet. "
+            "Say what it adds and that it appears with Approve / Reject buttons."
+            + (
+                f" Approving it also builds the {follow_up.get('build')} \"{follow_up.get('title')}\" straight away."
+                if follow_up
+                else ""
+            )
+        ),
+    }
+
+
+async def list_proposals(arguments: dict[str, Any]) -> dict[str, Any]:
+    status = arguments.get("status")
+    params = {"status": str(status)} if status else {}
+    proposals = await client.get("/api/proposals", params=params)
+    return {"proposals": proposals[:30], "count": len(proposals)}
+
+
 TOOL_IMPLEMENTATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]] = {
     "search_documentation": search_documentation,
     "request_clarification": request_clarification,
@@ -730,6 +816,9 @@ TOOL_IMPLEMENTATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, A
     "apply_action": apply_action,
     "get_lineage": get_lineage,
     "global_search": global_search,
+    "check_feasibility": check_feasibility,
+    "propose_change": propose_change,
+    "list_proposals": list_proposals,
 }
 
 FILTER_CLAUSE_SCHEMA = {
@@ -772,8 +861,101 @@ WIDGET_SCHEMA = {
 
 
 def tool_schemas() -> list[dict[str, Any]]:
-    """The OpenAI-style function schemas both providers accept."""
+    """The OpenAI-style function schemas every provider accepts."""
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "check_feasibility",
+                "description": (
+                    "Decide, from this workspace's ontology, whether charts, metrics, dashboards "
+                    "or reports the user asks for can be built. Returns one item per request "
+                    "with status ready (with the exact widget to use), needs_approval (with the "
+                    "proposals that would make it possible: a link, a combined dataset, a derived "
+                    "property, a metric) or not_possible (with what data is missing and the nearest "
+                    "answerable alternatives). For a dashboard or report it also returns a layout "
+                    "of ready widgets. Call this FIRST for any request to chart, measure, combine, "
+                    "link or build something."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "The user's request in their words."},
+                        "requests": {
+                            "type": "array",
+                            "description": "Structured asks, when you know them precisely.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "measure": {"type": "string"},
+                                    "aggregation": {"type": "string", "enum": ["count", "sum", "avg", "min", "max", "count_distinct"]},
+                                    "dimension": {"type": "string"},
+                                    "grain": {"type": "string", "enum": ["day", "week", "month", "quarter", "year"]},
+                                    "objectType": {"type": "string"},
+                                },
+                            },
+                        },
+                        "intent": {
+                            "type": "string",
+                            "enum": ["chart", "dashboard", "report", "link", "combination", "metric", "capabilities"],
+                        },
+                        "objectType": {"type": "string", "description": "Object type api name to focus on."},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "propose_change",
+                "description": (
+                    "Save a change to the ontology as a PROPOSAL the user approves: kind link_type, "
+                    "metric, combination or action_type, with the payload check_feasibility returned "
+                    "(or one you build from describe_object_type). Nothing is applied until the user "
+                    "approves it. For a proposal that needs another one first, pass the earlier "
+                    "proposal's id in dependsOn. After proposing, stop and tell the user what each "
+                    "proposal adds; they approve it in the chat."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["link_type", "metric", "combination", "action_type"]},
+                        "payload": {
+                            "type": "object",
+                            "description": (
+                                "link_type: {source, sourceProperty, target, targetProperty}. "
+                                "metric: {objectType, aggregation, measure?, numerator?, denominator? ('*' = per row), filters?, label?, extraDimensions?}. "
+                                "combination: {name, base, joins: [{path: [link api names], fields: [property]}], derived?: [{name, expression}]} - "
+                                "expressions are arithmetic over numeric properties, e.g. 'unit_price * quantity * (1 - discount)'. "
+                                "action_type: {objectType, label, parameters: [{property, allowedValues?}]}."
+                            ),
+                        },
+                        "title": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "dependsOn": {"type": "array", "items": {"type": "integer"}},
+                        "followUp": {
+                            "type": "object",
+                            "description": (
+                                "Pass through the followUp check_feasibility drafted with the proposal, "
+                                "if any: the dashboard or report to build as soon as it is approved."
+                            ),
+                        },
+                    },
+                    "required": ["kind", "payload"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_proposals",
+                "description": "List proposals in this workspace (pending, applied, rejected, failed).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string", "enum": ["pending", "applied", "rejected", "failed"]}},
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -1177,6 +1359,11 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["dashboard", "report"],
+                            "description": "report lays the widgets out as a printable document; add note widgets for the narrative.",
+                        },
                         "title": {"type": "string"},
                         "description": {"type": "string"},
                         "audience": {"type": "string", "description": "Who this is for."},

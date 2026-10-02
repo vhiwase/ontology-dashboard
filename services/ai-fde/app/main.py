@@ -19,12 +19,12 @@ from pydantic import BaseModel, Field
 from . import store
 from .agent import Agent
 from .auth import Principal, require_role
-from .context import current_request_id, current_space
+from .context import current_request_id, current_session, current_space
 from .config import CONFIG
 from .limits import REPLICA_WARNING, RateLimited, limiter
 from .llm import LlmError, _single_provider, build_provider
 from .pricing import price_turn, rates
-from .prompts import STARTER_PROMPTS
+from .prompts import is_tms, starter_prompts
 from .tools import NoOntologyInSpace, OntologyClient
 
 logging.basicConfig(
@@ -39,12 +39,16 @@ state: dict[str, Any] = {}
 
 # The providers a caller may choose between, in the order the dropdown shows
 # them. "auto" is the server's configured chain, which is what ran before a
-# per-request choice existed.
-SELECTABLE_PROVIDERS = ("ollama", "azure_openai")
+# per-request choice existed. One that cannot be constructed (no key) is left
+# out of the dropdown rather than offered and then failing.
+SELECTABLE_PROVIDERS = ("anthropic", "openai", "azure_openai", "ollama", "builtin")
 
 PROVIDER_LABELS = {
+    "anthropic": "Claude (Anthropic)",
+    "openai": "OpenAI-compatible (hosted)",
     "ollama": "Ollama (local, open source)",
     "azure_openai": "Azure OpenAI (hosted)",
+    "builtin": "Built-in planner (no AI model)",
     "auto": "Automatic (server default)",
 }
 
@@ -161,23 +165,32 @@ async def correlate_and_log(request: Request, call_next):
 
 
 async def ontology_snapshot() -> dict[str, Any]:
-    """The orientation data handed to the model each turn."""
+    """The orientation data handed to the model each turn.
+
+    Read from the conversation's space: the workspace summary (what the space
+    is, what it holds), its object types, links and metrics. The transport
+    demo's source-coverage figures are added only in a space that holds that
+    ontology - in anyone else's workspace they describe somebody else's data.
+    """
     client: OntologyClient = state["ontology"]
     try:
-        types, kpis, stats = (
-            await client.get("/api/object-types"),
-            await client.get("/api/kpis/catalogue"),
-            await client.get("/api/stats"),
-        )
+        summary = await client.get("/api/workspace/summary")
+        types = await client.get("/api/object-types")
+        kpis = await client.get("/api/kpis/catalogue")
+        links = await client.get("/api/link-types")
+        ontology = await client.get("/api/ontology")
     except NoOntologyInSpace as exc:
         # Not a fault: this space is simply empty. Said plainly, because the
         # answer is an action the user can take, not an incident to report.
+        space = current_space.get()
         raise HTTPException(
             status_code=409,
             detail=(
-                f"There is no ontology in the '{current_space.get()}' space yet, so there "
-                "is nothing here to ask about. Switch to a space that has one, or run a "
-                f"pipeline in this one. ({exc})"
+                "Your workspace has no data yet. Connect a PostgreSQL database on the Home "
+                "page and import the tables you want to report on, then ask again."
+                if space.startswith("u-")
+                else f"There is no ontology in the '{space}' space yet, so there is nothing "
+                f"here to ask about. Switch to a space that has one, or import tables into it. ({exc})"
             ),
         ) from exc
     except Exception as exc:  # noqa: BLE001
@@ -186,21 +199,63 @@ async def ontology_snapshot() -> dict[str, Any]:
             detail=f"Could not read the ontology service at {client.base_url}: {exc}",
         ) from exc
 
-    return {
-        "ontologyVersion": stats["ontology"]["version"],
+    by_rid = {t.get("rid"): t.get("apiName") for t in types}
+    snapshot: dict[str, Any] = {
+        "ontologyVersion": ontology.get("version"),
+        "space": summary.get("space"),
+        "counts": summary.get("counts"),
         "objectTypes": [
-            {"apiName": t["apiName"], "label": t["label"], "rowCount": t["rowCount"]}
+            {
+                "apiName": t["apiName"],
+                "label": t["label"],
+                "pluralLabel": t.get("pluralLabel"),
+                "rowCount": t["rowCount"],
+            }
             for t in sorted(types, key=lambda t: -t["rowCount"])
         ],
-        "kpis": kpis,
-        "coverage": [
+        "links": [
             {
-                "metricArea": row["metric_area"],
-                "sourceCoveragePct": float(row["source_coverage_pct"] or 0),
+                "apiName": link.get("apiName"),
+                "source": link.get("sourceApiName") or by_rid.get(link.get("sourceObjectType")),
+                "target": link.get("targetApiName") or by_rid.get(link.get("targetObjectType")),
             }
-            for row in stats["dataCoverage"]
+            for link in links
         ],
+        "kpis": kpis,
+        "coverage": [],
     }
+    if is_tms(snapshot):
+        try:
+            stats = await client.get("/api/stats")
+            snapshot["coverage"] = [
+                {
+                    "metricArea": row["metric_area"],
+                    "sourceCoveragePct": float(row["source_coverage_pct"] or 0),
+                }
+                for row in stats.get("dataCoverage") or []
+            ]
+        except Exception as exc:  # noqa: BLE001 - orientation only
+            log.warning("Could not read data coverage: %s", exc)
+    return snapshot
+
+
+async def default_space() -> str:
+    """The space a new conversation opens in when the caller names none.
+
+    The caller's own workspace, as the ontology service reports it. The old
+    default was the shared sandbox, which put every new user's first question
+    in somebody else's data.
+    """
+    client: OntologyClient = state["ontology"]
+    try:
+        # An empty space means "wherever the caller defaults to", which the
+        # ontology service resolves to their own workspace.
+        me = await client.get("/api/auth/me", params={"space": ""})
+        if isinstance(me, dict) and me.get("personalSpace"):
+            return str(me["personalSpace"])
+    except Exception as exc:  # noqa: BLE001 - the sandbox is still a valid answer
+        log.warning("Could not resolve the caller's personal space: %s", exc)
+    return "sandbox"
 
 
 # ── schemas ─────────────────────────────────────────────────────────────────
@@ -534,9 +589,16 @@ async def costs(
 
 @app.get("/api/assistant/starters")
 async def starters(
+    space: str | None = None,
     _: Principal = Depends(require_role("viewer")),
 ) -> dict[str, Any]:
-    return {"starters": STARTER_PROMPTS}
+    """Suggested first questions, written from the space's own metrics."""
+    current_space.set(space or await default_space())
+    try:
+        snapshot = await ontology_snapshot()
+    except HTTPException:
+        snapshot = None
+    return {"starters": starter_prompts(snapshot), "space": current_space.get()}
 
 
 def _visible_owner(principal: Principal) -> str | None:
@@ -641,18 +703,12 @@ async def chat(
     # The space this turn reads the ontology in, fixed before the snapshot is
     # taken and before any tool runs. For an existing conversation the stored
     # space wins over whatever the request says, so a chat cannot be steered
-    # into another environment mid-thread.
+    # into another environment mid-thread. A new one opens in the caller's own
+    # workspace unless they named another.
     session_id = request.sessionId
     if session_id is None:
-        current_space.set(request.spaceSlug or "sandbox")
-        session_id = store.create_session(
-            title=None,
-            user_id=principal.username,
-            user_role=principal.ontology_role,
-            provider=chosen if chosen not in ("", "auto") else CONFIG.provider,
-            model=CONFIG.model_for(chosen) if chosen not in ("", "auto") else CONFIG.model_name,
-            space_slug=request.spaceSlug or "sandbox",
-        )
+        space_slug = request.spaceSlug or await default_space()
+        current_space.set(space_slug)
     elif not store.session_exists(session_id, _visible_owner(principal)):
         # Continuing someone else's conversation would hand the caller its
         # history, so an unowned id is simply not found.
@@ -667,8 +723,20 @@ async def chat(
         else getattr(state.get("provider"), "name", CONFIG.provider)
     )
 
+    # Taken before a new session is stored: a space with nothing in it answers
+    # 409 here, and used to leave an empty conversation behind every time.
     snapshot = await ontology_snapshot()
+    if session_id is None:
+        session_id = store.create_session(
+            title=None,
+            user_id=principal.username,
+            user_role=principal.ontology_role,
+            provider=chosen if chosen not in ("", "auto") else attempted_provider,
+            model=CONFIG.model_for(chosen if chosen not in ("", "auto") else attempted_provider),
+            space_slug=current_space.get(),
+        )
     history = store.history_for_model(session_id)
+    current_session.set(session_id)
 
     # Resolve what the user attached. Anything that cannot be resolved is
     # reported in the block rather than dropped: the model should know a

@@ -143,7 +143,17 @@ export interface KpiExecuteResult {
 	dimensionGrain: TimeGrain | null;
 	/** Filters that are part of the metric's own definition. */
 	baseFilters: Record<string, unknown>;
+	/** count, sum, avg, ...: whether the parts of a breakdown add up to the total. */
+	aggregation?: string;
 	trend?: KpiTrend | null;
+	/** For a date grouped by period: the latest date in the data. */
+	dataThrough?: string | null;
+	/**
+	 * For a date grouped by period: the label of the newest period when the
+	 * data stops part-way through it (a month holding six days of orders), so
+	 * a chart or a sentence does not read it as a fall. Null when complete.
+	 */
+	partialPeriod?: string | null;
 }
 
 export function resolveKpi(apiName: string): KpiMeta {
@@ -433,6 +443,25 @@ export async function executeKpiWith(
 		}));
 	}
 
+	let dataThrough: string | null = null;
+	let partialPeriod: string | null = null;
+	const periodGrain = dimensionRef?.grain;
+	if (dimensionRef && periodGrain && isTemporalType(columns.get(dimensionRef.column)?.sqlType)) {
+		const column = quoteIdentifier(dimensionRef.column);
+		const where = [...predicates, `${column} IS NOT NULL`].join(" AND ");
+		const [coverage] = await query<{ through: string | null; period_start: string | null; period_end: string | null }>(
+			`SELECT max(${column})::date::text AS through,
+			        date_trunc('${periodGrain}', max(${column}))::date::text AS period_start,
+			        (date_trunc('${periodGrain}', max(${column})) + interval '${GRAIN_INTERVAL[periodGrain]}' - interval '1 day')::date::text AS period_end
+			   FROM ${view} WHERE ${where}`,
+			values,
+		);
+		dataThrough = coverage?.through ?? null;
+		if (coverage?.through && coverage.period_end && coverage.through < coverage.period_end) {
+			partialPeriod = coverage.period_start;
+		}
+	}
+
 	let trend: KpiTrend | null = null;
 	if (request.trend && kpi.timeColumn && isTemporalType(columns.get(kpi.timeColumn)?.sqlType)) {
 		const options = typeof request.trend === "object" ? request.trend : {};
@@ -504,7 +533,10 @@ export async function executeKpiWith(
 		appliedFilters: applied,
 		dimensionGrain: dimensionRef?.grain ?? null,
 		baseFilters: kpi.baseFilters ?? {},
+		aggregation: kpi.aggregation,
 		trend,
+		dataThrough,
+		partialPeriod,
 	};
 }
 

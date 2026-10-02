@@ -5,9 +5,11 @@ the results back, repeat until it answers or the round budget runs out.
 
 What is deliberate here:
 
-  * ROUND BUDGET. Capped at AI_FDE_MAX_TOOL_ROUNDS. On the last round the tools are
-    withdrawn and the model is told to answer from what it already has, which
-    turns "gave up after 8 loops" into a real answer built on partial information.
+  * ROUND BUDGET. Capped at AI_FDE_MAX_TOOL_ROUNDS. On the last round tool use
+    is switched off (tool_choice "none" - the tool list itself stays the same,
+    because changing it mid-turn would invalidate the model's earlier reasoning)
+    and the model is told to answer from what it already has, which turns "gave
+    up after 8 loops" into a real answer built on partial information.
 
   * DUPLICATE CALL DETECTION. A small model will happily call
     list_object_types three times in one turn. Repeats are served from a cache with
@@ -32,7 +34,7 @@ from typing import Any
 
 from .config import CONFIG
 from .llm import LlmError, LlmProvider, ToolCall, recover_text_tool_calls
-from .prompts import SYSTEM_PROMPT, build_context_message
+from .prompts import system_messages
 from .tools import TOOL_NAMES, run_tool, serialise_result, tool_schemas
 
 log = logging.getLogger("ai_fde.agent")
@@ -76,17 +78,53 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "total": payload.get("total"),
             "series": payload.get("series"),
             "caveat": payload.get("dataQualityCaveat"),
+            "dimensionLabel": payload.get("dimensionLabel"),
+            "dimensionGrain": payload.get("dimensionGrain"),
+            "partialPeriod": payload.get("partialPeriod"),
+            "dataThrough": payload.get("dataThrough"),
             # A ranked category list reads far better horizontally; a date series
             # reads as a line. Picking here means the assistant does not have to.
-            "chart": "line" if _looks_temporal(payload.get("dimension")) else "hbar",
+            "chart": "line" if payload.get("dimensionGrain") or _looks_temporal(payload.get("dimension")) else "hbar",
         }
     if name == "create_dashboard" and payload.get("created"):
         return {
             "kind": "dashboard",
+            # "dashboard" or "report": the UI opens a report in its print view.
+            "boardKind": payload.get("kind") or "dashboard",
             "slug": payload.get("slug"),
             "title": payload.get("title"),
             "widgets": payload.get("widgets"),
             "url": payload.get("url"),
+        }
+    if name == "check_feasibility" and isinstance(payload.get("items"), list):
+        # What the data can answer, what one approval away, and what not - the
+        # UI renders it as a checklist with the drafted proposals attached.
+        return {
+            "kind": "feasibility",
+            "intent": payload.get("intent"),
+            "subject": payload.get("subject"),
+            "summary": payload.get("summary"),
+            "items": [
+                {
+                    "status": item.get("status"),
+                    "explanation": item.get("explanation"),
+                    "request": item.get("request"),
+                    "kpi": item.get("kpi"),
+                    "dimension": item.get("dimension"),
+                    "missing": item.get("missing"),
+                    "alternatives": item.get("alternatives"),
+                }
+                for item in payload["items"][:24]
+            ],
+        }
+    if name == "propose_change" and payload.get("proposal"):
+        proposal = payload["proposal"]
+        return {
+            "kind": "proposal",
+            "proposal": {
+                key: proposal.get(key)
+                for key in ("id", "kind", "status", "title", "summary", "dependsOn", "payload")
+            },
         }
     if name in ("search_objects", "aggregate_objects", "traverse_link") and payload.get("rows"):
         return {
@@ -158,10 +196,9 @@ class Agent:
     ) -> AgentResult:
         started = time.monotonic()
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": build_context_message(snapshot)},
-        ]
+        # The fixed instructions first and this workspace's inventory last, so
+        # the part every conversation shares is the cached prefix.
+        messages: list[dict[str, Any]] = system_messages(snapshot)
         # Prior turns are replayed as plain text. Tool transcripts from earlier
         # turns are deliberately not replayed: they are large, and the model
         # re-derives what it needs far more cheaply than carrying them forward.
@@ -202,7 +239,9 @@ class Agent:
                 )
 
             try:
-                reply = await self.provider.chat(messages, None if is_final_round else schemas)
+                reply = await self.provider.chat(
+                    messages, schemas, tool_choice="none" if is_final_round else "auto"
+                )
             except LlmError as exc:
                 return AgentResult(
                     content=f"I could not reach the language model: {exc}",
@@ -248,6 +287,12 @@ class Agent:
                 {
                     "role": "assistant",
                     "content": content,
+                    # What the provider returned, block for block, so the next
+                    # round of this turn replays it unedited (Claude binds its
+                    # reasoning to the exact conversation that produced it).
+                    # Providers that do not need it ignore both keys.
+                    "provider": reply.provider,
+                    "provider_content": reply.provider_content,
                     "tool_calls": [
                         {
                             "id": call.id,

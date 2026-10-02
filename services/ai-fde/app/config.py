@@ -55,7 +55,8 @@ class Config:
         ).rstrip("/")
     )
 
-    # `auto` (the default), `ollama` (local, open source) or `azure_openai`.
+    # `auto` (the default), or one of: anthropic, openai, azure_openai, ollama,
+    # builtin (the deterministic planner, which needs no model at all).
     #
     # `auto` resolves at startup from whether Ollama has a GPU:
     #   GPU present -> ollama primary, azure_openai fallback
@@ -106,6 +107,38 @@ class Config:
         default_factory=lambda: os.environ.get("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
     )
 
+    # ── Claude (Anthropic) ──────────────────────────────────────────────────
+    # Read ONLY from these names. The Anthropic SDK would otherwise pick up an
+    # ambient ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL from the environment the
+    # service happens to run in, which is how a deployment ends up billed to,
+    # or routed through, an account nobody configured for it.
+    anthropic_api_key: str = field(default_factory=lambda: _secret("AI_FDE_ANTHROPIC_API_KEY"))
+    anthropic_base_url: str = field(
+        default_factory=lambda: os.environ.get("AI_FDE_ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    )
+    anthropic_model: str = field(
+        default_factory=lambda: os.environ.get("AI_FDE_ANTHROPIC_MODEL", "claude-opus-5-5")
+    )
+    # low | medium | high | xhigh | max. Claude Opus 5.5 defaults to medium;
+    # set here explicitly rather than inherited.
+    anthropic_effort: str = field(
+        default_factory=lambda: os.environ.get("AI_FDE_ANTHROPIC_EFFORT", "medium").strip().lower()
+    )
+    anthropic_timeout: float = field(default_factory=lambda: _num("AI_FDE_ANTHROPIC_TIMEOUT", 180))
+    # Server-side refusal fallback ("default" lets the API pick the model by
+    # refusal category). "off" disables it.
+    anthropic_fallbacks: str = field(
+        default_factory=lambda: os.environ.get("AI_FDE_ANTHROPIC_FALLBACKS", "default").strip().lower()
+    )
+
+    # ── any OpenAI-compatible endpoint (OpenAI, a gateway, vLLM, LM Studio) ──
+    openai_api_key: str = field(default_factory=lambda: _secret("AI_FDE_OPENAI_API_KEY"))
+    openai_base_url: str = field(
+        default_factory=lambda: os.environ.get("AI_FDE_OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    )
+    openai_model: str = field(default_factory=lambda: os.environ.get("AI_FDE_OPENAI_MODEL", "gpt-4.1"))
+    openai_timeout: float = field(default_factory=lambda: _num("AI_FDE_OPENAI_TIMEOUT", 120))
+
     # The role the assistant acts as. Analyst can read everything and mutate
     # nothing, so a conversation cannot stage a write unless a user changes this.
     default_role: str = field(
@@ -119,10 +152,15 @@ class Config:
 
     @property
     def model_name(self) -> str:
-        return self.azure_deployment if self.provider == "azure_openai" else self.ollama_model
+        return self.model_for(self.provider)
 
     def model_for(self, provider: str) -> str:
-        return self.azure_deployment if provider == "azure_openai" else self.ollama_model
+        return {
+            "azure_openai": self.azure_deployment,
+            "anthropic": self.anthropic_model,
+            "openai": self.openai_model,
+            "builtin": "planner-1",
+        }.get(provider, self.ollama_model)
 
 
 CONFIG = Config()

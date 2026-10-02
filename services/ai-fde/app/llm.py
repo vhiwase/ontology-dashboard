@@ -55,6 +55,10 @@ class LlmReply:
     model: str = ""
     # Set when the primary was skipped or failed, so the UI can say why.
     failover_reason: str | None = None
+    # The provider's own record of the assistant turn, replayed verbatim on
+    # the next round of the same turn. Claude needs this: its thinking blocks
+    # are bound to the conversation and a reconstructed copy would not match.
+    provider_content: list[dict[str, Any]] | None = None
 
 
 class LlmError(RuntimeError):
@@ -131,8 +135,20 @@ class LlmProvider:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LlmReply:
+        """One model call. tool_choice "none" means: answer, call nothing."""
         raise NotImplementedError
+
+
+# The fields an OpenAI-shaped chat message may carry. The agent hangs its own
+# bookkeeping on messages (provider_content, provider), which an OpenAI-style
+# endpoint would reject as unknown properties, so it is stripped on the way out.
+_OPENAI_MESSAGE_FIELDS = ("role", "content", "tool_calls", "tool_call_id", "name")
+
+
+def openai_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{k: m[k] for k in _OPENAI_MESSAGE_FIELDS if k in m} for m in messages]
 
     async def health(self) -> dict[str, Any]:
         raise NotImplementedError
@@ -149,7 +165,10 @@ class OllamaProvider(LlmProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LlmReply:
+        if tool_choice == "none":
+            tools = None
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": _to_ollama_messages(messages),
@@ -337,14 +356,15 @@ class AzureOpenAIProvider(LlmProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LlmReply:
         payload: dict[str, Any] = {
-            "messages": messages,
+            "messages": openai_messages(messages),
             "temperature": CONFIG.temperature,
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = "none" if tool_choice == "none" else "auto"
 
         async with httpx.AsyncClient(timeout=CONFIG.azure_timeout) as client:
             try:
@@ -445,23 +465,24 @@ class FallbackProvider(LlmProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
     ) -> LlmReply:
         if self.breaker_open:
-            reply = await self.fallback.chat(messages, tools)
+            reply = await self.fallback.chat(messages, tools, tool_choice)
             reply.failover_reason = (
                 f"{self.primary.name} is in cooldown after: {self._last_reason}"
             )
             return reply
 
         try:
-            return await self.primary.chat(messages, tools)
+            return await self.primary.chat(messages, tools, tool_choice)
         except LlmError as exc:
             self._trip(str(exc))
             # If the fallback also fails there is nothing left to try, so its error
             # propagates - but it carries both, because "Ollama timed out AND the
             # Azure key is wrong" is two different fixes.
             try:
-                reply = await self.fallback.chat(messages, tools)
+                reply = await self.fallback.chat(messages, tools, tool_choice)
             except LlmError as fallback_exc:
                 raise LlmError(
                     f"Both providers failed. {self.primary.name}: {exc} | "
@@ -497,12 +518,99 @@ class FallbackProvider(LlmProvider):
         }
 
 
+class OpenAICompatibleProvider(LlmProvider):
+    """Any endpoint that speaks the OpenAI chat-completions protocol.
+
+    OpenAI itself, a company gateway, vLLM, LM Studio, OpenRouter: the base URL,
+    key and model are configuration (AI_FDE_OPENAI_*).
+    """
+
+    name = "openai"
+
+    def __init__(self) -> None:
+        if not CONFIG.openai_api_key:
+            raise LlmError(
+                "LLM_PROVIDER=openai needs AI_FDE_OPENAI_API_KEY (or AI_FDE_OPENAI_API_KEY_FILE) "
+                "and, for anything but OpenAI itself, AI_FDE_OPENAI_BASE_URL."
+            )
+        self.url = f"{CONFIG.openai_base_url}/chat/completions"
+        self.model = CONFIG.openai_model
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str = "auto",
+    ) -> LlmReply:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": openai_messages(messages),
+            "temperature": CONFIG.temperature,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "none" if tool_choice == "none" else "auto"
+        async with httpx.AsyncClient(timeout=CONFIG.openai_timeout) as client:
+            try:
+                response = await client.post(
+                    self.url,
+                    json=payload,
+                    headers={"authorization": f"Bearer {CONFIG.openai_api_key}"},
+                )
+            except httpx.TimeoutException as exc:
+                raise LlmError(f"{self.url} did not answer within {CONFIG.openai_timeout:.0f}s.") from exc
+            except httpx.HTTPError as exc:
+                raise LlmError(f"Could not reach {self.url}: {exc}") from exc
+        if response.status_code >= 400:
+            raise LlmError(f"{self.url} returned {response.status_code}: {response.text[:400]}")
+        body = response.json()
+        choice = (body.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        calls = [
+            ToolCall(
+                id=call.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                name=(call.get("function") or {}).get("name", ""),
+                arguments=_coerce_arguments((call.get("function") or {}).get("arguments"), "?"),
+            )
+            for call in message.get("tool_calls") or []
+        ]
+        usage = body.get("usage") or {}
+        return LlmReply(
+            content=message.get("content") or "",
+            tool_calls=[c for c in calls if c.name],
+            usage={
+                "promptTokens": usage.get("prompt_tokens"),
+                "completionTokens": usage.get("completion_tokens"),
+                "totalTokens": usage.get("total_tokens"),
+            },
+            raw_finish_reason=choice.get("finish_reason"),
+            provider=self.name,
+            model=body.get("model") or self.model,
+        )
+
+    async def health(self) -> dict[str, Any]:
+        return {"reachable": True, "model": self.model, "modelPresent": True, "detail": None}
+
+
 def _single_provider(name: str) -> LlmProvider:
     if name == "azure_openai":
         return AzureOpenAIProvider()
     if name == "ollama":
         return OllamaProvider()
-    raise LlmError(f"Unknown LLM provider '{name}'. Use 'ollama' or 'azure_openai'.")
+    if name == "openai":
+        return OpenAICompatibleProvider()
+    if name == "anthropic":
+        # Imported here: the module imports this one for the shared types.
+        from .anthropic_provider import AnthropicProvider
+
+        return AnthropicProvider()
+    if name == "builtin":
+        from .planner import BuiltinPlanner
+
+        return BuiltinPlanner()
+    raise LlmError(
+        f"Unknown LLM provider '{name}'. Use anthropic, openai, azure_openai, ollama or builtin."
+    )
 
 
 async def resolve_provider_order() -> tuple[str, str, str]:
@@ -518,6 +626,23 @@ async def resolve_provider_order() -> tuple[str, str, str]:
         if fallback == explicit:
             fallback = ""
         return explicit, fallback, f"LLM_PROVIDER={explicit} was set explicitly."
+
+    # A configured hosted model is the clearest signal of intent: someone put a
+    # key in. Claude first, then any OpenAI-compatible endpoint.
+    if CONFIG.anthropic_api_key:
+        return "anthropic", CONFIG.fallback_provider, "A Claude API key is configured."
+    if CONFIG.openai_api_key:
+        return "openai", CONFIG.fallback_provider, "An OpenAI-compatible API key is configured."
+    if not (CONFIG.azure_endpoint and CONFIG.azure_key) and CONFIG.ollama_gpu != "true":
+        gpu, _detail = await OllamaProvider().has_gpu() if CONFIG.ollama_gpu == "" else (False, "")
+        if gpu is not True:
+            return (
+                "builtin",
+                "",
+                "No language model is configured (no Claude, OpenAI or Azure key, and no GPU "
+                "for the local model), so the built-in planner answers: it works from the "
+                "ontology without a model and says so on every answer.",
+            )
 
     if CONFIG.ollama_gpu == "true":
         return (
@@ -557,7 +682,27 @@ async def resolve_provider_order() -> tuple[str, str, str]:
 
 
 async def build_provider() -> tuple[LlmProvider, str]:
-    """Build the provider chain, returning it with the reason for the choice."""
+    """Build the provider chain, returning it with the reason for the choice.
+
+    The built-in planner is the last link of every automatic chain: when the
+    models fail, a question still gets an answer from the ontology, labelled
+    as coming from the planner rather than passed off as the model's.
+    """
+    from .planner import BuiltinPlanner
+
+    try:
+        provider, why = await _build_chain()
+    except LlmError as exc:
+        # A model that cannot even be constructed (LLM_PROVIDER=anthropic with
+        # no key, say) used to leave the assistant with no answer at all.
+        log.error("No language model could be set up: %s", exc)
+        return BuiltinPlanner(), f"The configured model could not be set up ({exc}), so the built-in planner answers."
+    if getattr(provider, "name", "") == "builtin":
+        return provider, why
+    return FallbackProvider(provider, BuiltinPlanner()), why
+
+
+async def _build_chain() -> tuple[LlmProvider, str]:
     primary_name, fallback_name, why = await resolve_provider_order()
 
     try:

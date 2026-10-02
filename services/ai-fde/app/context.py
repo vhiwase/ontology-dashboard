@@ -32,3 +32,7 @@ current_request_id: ContextVar[str | None] = ContextVar("current_request_id", de
 # reason as the token: every tool reaches the ontology through one client, and
 # this is the one place that has to know.
 current_space: ContextVar[str] = ContextVar("current_space", default="sandbox")
+
+# The conversation a turn belongs to, so what the assistant creates - a
+# dashboard, a proposal - records which conversation it came from.
+current_session: ContextVar[int | None] = ContextVar("current_session", default=None)

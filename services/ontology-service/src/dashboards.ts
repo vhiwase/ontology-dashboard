@@ -401,10 +401,26 @@ export async function saveDashboard(request: SaveDashboardRequest): Promise<Dash
 		);
 	}
 
-	const slug = request.slug?.trim() || slugify(request.title);
 	// Work that has not been deliberately promoted belongs in the sandbox.
 	const spaceSlug = request.spaceSlug?.trim() || "sandbox";
 	const spaceId = await spaceIdFor(spaceSlug);
+	// A slug given is an edit of that board. Without one this is a new board,
+	// and it gets a slug of its own: asking the assistant twice for "a sales
+	// dashboard" used to overwrite the first one, edits and all.
+	let slug = request.slug?.trim() ?? "";
+	if (!slug) {
+		const base = slugify(request.title);
+		const taken = new Set(
+			(
+				await query<{ slug: string }>(
+					"SELECT slug FROM platform.dashboard WHERE space_id = $1 AND (slug = $2 OR slug LIKE $3)",
+					[spaceId, base, `${base}-%`],
+				)
+			).map((row) => row.slug),
+		);
+		slug = base;
+		for (let n = 2; taken.has(slug); n += 1) slug = `${base}-${n}`;
+	}
 
 	const row = await queryOne<DashboardRow>(
 		`INSERT INTO platform.dashboard
@@ -793,6 +809,8 @@ export function kpiCatalogueForPrompt(): Array<Record<string, unknown>> {
 		dimensions: kpi.dimensions,
 		defaultDimension: kpi.defaultDimension,
 		simulated: kpi.dependsOnSimulation,
+		aggregation: kpi.aggregation,
+		objectType: kpi.objectTypeRid ? (getRegistry().objectTypeByRid.get(kpi.objectTypeRid)?.apiName ?? null) : null,
 	}));
 }
 

@@ -69,6 +69,35 @@ export interface ProposalRecord {
 	decidedAt: string | null;
 	decisionNote: string | null;
 	createdAt: string;
+	/** What to build once this is applied - see FollowUp. */
+	followUp: FollowUp | null;
+}
+
+/**
+ * A request that waits on a proposal: "build me a sales dashboard" on data
+ * with no sales dataset becomes a proposal for the dataset with this
+ * attached, and the board is built from the new type when it is approved.
+ */
+export interface FollowUp {
+	build: "dashboard" | "report";
+	title: string;
+	/** The column the board leads with, e.g. a derived revenue. */
+	measure: string | null;
+	sourcePrompt: string | null;
+}
+
+export function parseFollowUp(raw: unknown): FollowUp | null {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+	const value = raw as Record<string, unknown>;
+	const build = value.build === "report" ? "report" : value.build === "dashboard" ? "dashboard" : null;
+	const title = typeof value.title === "string" ? value.title.trim().slice(0, 120) : "";
+	if (!build || !title) return null;
+	return {
+		build,
+		title,
+		measure: typeof value.measure === "string" && value.measure.trim() ? value.measure.trim().slice(0, 63) : null,
+		sourcePrompt: typeof value.sourcePrompt === "string" ? value.sourcePrompt.slice(0, 500) : null,
+	};
 }
 
 type ProposalRow = {
@@ -89,6 +118,7 @@ type ProposalRow = {
 	decided_at: Date | null;
 	decision_note: string | null;
 	created_at: Date;
+	follow_up: unknown;
 };
 
 function toRecord(row: ProposalRow): ProposalRecord {
@@ -110,6 +140,7 @@ function toRecord(row: ProposalRow): ProposalRecord {
 		decidedAt: row.decided_at?.toISOString() ?? null,
 		decisionNote: row.decision_note,
 		createdAt: row.created_at.toISOString(),
+		followUp: parseFollowUp(row.follow_up),
 	};
 }
 
@@ -480,7 +511,7 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 	if (joins.length === 0 && derived.length === 0) {
 		throw new BadRequest("A combination joins at least one linked type or derives at least one property.");
 	}
-	if (joins.length > 6) throw new BadRequest("At most six joins.");
+	if (joins.length > 10) throw new BadRequest("At most ten joins.");
 
 	const registry = getRegistry();
 	const apiName = pascal(name);
@@ -489,8 +520,12 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 
 	// Output columns: every base column, then the joined fields, then derived.
 	const outputs = new Map<string, { sql: string; numeric: boolean; from: string }>();
+	// Columns that identify rows in the type they came from keep that role in
+	// the combination: a reference copied into a view is still a reference.
+	const identityColumns: string[] = [];
 	for (const p of base.properties) {
 		outputs.set(p.sqlColumn, { sql: `b.${quoteIdentifier(p.sqlColumn)}`, numeric: isNumeric(p), from: base.apiName });
+		if (p.semanticRole === "identity" && p.sqlColumn !== base.primaryKeyColumn) identityColumns.push(p.sqlColumn);
 	}
 	const joinSql: string[] = [];
 	const joinedHops = new Map<string, string>(); // path key -> alias, so shared prefixes join once
@@ -532,6 +567,7 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 				numeric: isNumeric(property),
 				from: finalType.apiName,
 			});
+			if (property.semanticRole === "identity") identityColumns.push(column);
 			fieldsUsed.push({ column, from: finalType.apiName, property: property.sqlColumn });
 		}
 	}
@@ -582,7 +618,7 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 			derived: derivedUsed,
 			viewName: `ontology_views.${viewName}`,
 		},
-		preview: { sql, columns: [...outputs.keys()], sample, rowCount },
+		preview: { sql, columns: [...outputs.keys()], sample, rowCount, identityColumns },
 	};
 }
 
@@ -620,6 +656,7 @@ async function applyCombination(payload: Record<string, unknown>, username: stri
 				primaryKey: base.keyIsUnique ? [base.primaryKeyColumn] : null,
 				foreignKeys: [],
 				directForeignKeys,
+				identityColumns: (draft.preview.identityColumns as string[] | undefined) ?? [],
 				group: "Combined",
 				origin: "combination",
 				apiName: String(p.apiName),
@@ -642,7 +679,11 @@ async function draftActionType(raw: Record<string, unknown>): Promise<Draft> {
 	const parameters: Array<Record<string, unknown>> = [
 		{ name: keyParameter, label: `${type.label} key`, type: "string", required: true },
 	];
-	const requested = Array.isArray(raw.parameters) ? (raw.parameters as Array<Record<string, unknown>>) : [];
+	// The key parameter is added here, so a payload being re-validated on
+	// approval (which already carries it, with no property) does not count it.
+	const requested = (Array.isArray(raw.parameters) ? (raw.parameters as Array<Record<string, unknown>>) : []).filter(
+		(entry) => entry.name !== keyParameter || entry.property,
+	);
 	if (requested.length === 0) throw new BadRequest("An action needs at least one parameter: the property it changes.");
 	for (const entry of requested) {
 		const property = resolveColumn(type, str(entry.property, "parameters[].property"));
@@ -666,7 +707,7 @@ async function draftActionType(raw: Record<string, unknown>): Promise<Draft> {
 	return {
 		title: `New action: ${label}`,
 		summary:
-			`Lets ${allowedRoles.map((r) => r.replace(/^tms:|Role$/g, "")).join(" and ")} run "${label}" on a ${type.label.toLowerCase()}, ` +
+			`Lets ${allowedRoles.map((r) => r.replace(/^tms:|Role$/g, "")).join(" and ")} run "${label}" on ${/^[aeiou]/i.test(type.label) ? "an" : "a"} ${type.label.toLowerCase()}, ` +
 			`setting ${parameters.slice(1).map((p) => p.label).join(", ")}. Each run is validated, permission-checked and recorded ` +
 			"in the audit trail. Synced tables are read-only copies of your database, so a run is staged with its exact payload rather than written back.",
 		payload: {
@@ -719,6 +760,7 @@ export async function createProposal(
 		dependsOn?: unknown;
 		createdVia?: unknown;
 		chatSessionId?: unknown;
+		followUp?: unknown;
 	},
 	createdBy: string,
 ): Promise<ProposalRecord> {
@@ -752,8 +794,8 @@ export async function createProposal(
 	const via = ["user", "assistant", "planner"].includes(String(input.createdVia)) ? String(input.createdVia) : "user";
 	const row = await queryOne<ProposalRow>(
 		`INSERT INTO platform.proposal
-		   (space_id, kind, title, summary, payload, preview, depends_on, created_by, created_via, chat_session_id)
-		 SELECT s.space_id, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10
+		   (space_id, kind, title, summary, payload, preview, depends_on, created_by, created_via, chat_session_id, follow_up)
+		 SELECT s.space_id, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11::jsonb
 		   FROM platform.space s WHERE s.slug = $1
 		 RETURNING *`,
 		[
@@ -767,6 +809,7 @@ export async function createProposal(
 			createdBy,
 			via,
 			input.chatSessionId === undefined || input.chatSessionId === null ? null : Number(input.chatSessionId),
+			((followUp) => (followUp ? JSON.stringify(followUp) : null))(parseFollowUp(input.followUp)),
 		],
 	);
 	if (!row) throw new Error("The proposal was not stored.");
@@ -819,7 +862,9 @@ export async function approveProposal(id: number, decidedBy: string, note?: stri
 		if (chain.has(proposalId)) throw new BadRequest("These proposals depend on each other in a cycle.");
 		const proposal = await getProposal(proposalId);
 		if (proposal.status === "applied") return;
-		if (proposal.status !== "pending") {
+		// A failed proposal may be approved again: what failed it - a type
+		// renamed, a table mid-resync - is often gone a minute later.
+		if (proposal.status !== "pending" && proposal.status !== "failed") {
 			throw new BadRequest(`Proposal ${proposalId} is ${proposal.status}, so it cannot be applied.`);
 		}
 		for (const dependency of proposal.dependsOn) await visit(dependency, new Set([...chain, proposalId]));
@@ -840,6 +885,18 @@ export async function approveProposal(id: number, decidedBy: string, note?: stri
 	};
 	await visit(id, new Set());
 	return settled;
+}
+
+/** Record what a proposal's follow-up built (or why it could not). */
+export async function recordFollowUp(id: number, built: Record<string, unknown>): Promise<ProposalRecord> {
+	const row = await queryOne<ProposalRow>(
+		`UPDATE platform.proposal
+		    SET result = COALESCE(result, '{}'::jsonb) || jsonb_build_object('built', $2::jsonb)
+		  WHERE proposal_id = $1 RETURNING *`,
+		[id, JSON.stringify(built)],
+	);
+	if (!row) throw new NotFound(`No proposal ${id}.`);
+	return toRecord(row);
 }
 
 export async function rejectProposal(id: number, decidedBy: string, note?: string | null): Promise<ProposalRecord> {

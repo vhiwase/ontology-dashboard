@@ -265,12 +265,16 @@ async function stageMutation(
 			actionRid: meta.rid,
 			parameters,
 		},
-		note:
-			"Parameters and permissions were checked and the request was recorded in " +
-			"platform.action_audit. Nothing was sent: this platform reads the TMS " +
-			"through the captured snapshot in TMS_MCP/api_responses and has no " +
-			"write-back endpoint. Wiring one means POSTing the payload above to the " +
-			"corresponding TMS endpoint.",
+		note: meta.rid.startsWith("ws:")
+			? "Parameters and permissions were checked and the request was recorded in " +
+				"platform.action_audit. Nothing was written: the object's data is a synced, " +
+				"read-only copy of your database, so the change is staged with its exact payload " +
+				"for whoever applies it at the source."
+			: "Parameters and permissions were checked and the request was recorded in " +
+				"platform.action_audit. Nothing was sent: this platform reads the TMS " +
+				"through the captured snapshot in TMS_MCP/api_responses and has no " +
+				"write-back endpoint. Wiring one means POSTing the payload above to the " +
+				"corresponding TMS endpoint.",
 	};
 }
 
