@@ -184,6 +184,21 @@ export function chooseTimeColumn(profiles: ColumnProfile[]): string | null {
 	return (preferred ?? ordinary ?? temporal[0]!).name;
 }
 
+/**
+ * How a type with no dates is sliced first: by where or what kind (country,
+ * category, status) before anything else, and never by a contact's details.
+ */
+export function defaultSlice(dimensions: string[]): string | null {
+	const categorical = dimensions.filter((d) => !d.includes(":"));
+	const usable = categorical.filter((d) => !/(contact_|job_title|title_of_courtesy|salutation|phone|fax|email|address|postal|zip)/.test(d));
+	// Country before region: regions are often blank outside a few countries.
+	for (const kind of [/country|nation/, /region|state|province|territory/, /category|segment|type|status|tier|channel|group/]) {
+		const hit = usable.find((d) => kind.test(d));
+		if (hit) return hit;
+	}
+	return usable[0] ?? categorical[0] ?? null;
+}
+
 /** The dimensions every metric on a type may be sliced by. */
 export function dimensionsFor(profiles: ColumnProfile[]): string[] {
 	const categorical = profiles.filter((p) => p.role === "dimension" || p.role === "flag").map((p) => p.name);
@@ -587,7 +602,7 @@ export async function modelSources(
 			);
 			const dimensions = dimensionsFor(plan.profiles);
 			const timeColumn = chooseTimeColumn(plan.profiles);
-			const defaultDimension = timeColumn ? `${timeColumn}:month` : (dimensions[0] ?? null);
+			const defaultDimension = timeColumn ? `${timeColumn}:month` : defaultSlice(dimensions);
 			const references = new Map(
 				existingLinks
 					.filter((link) => link.source_object_type === plan.rid)
@@ -615,7 +630,7 @@ export async function modelSources(
 					[
 						spaceId, `kpi:${apiName}`, apiName, metric.label, metric.description, metric.businessQuestion,
 						plan.label, plan.source.relation, metric.measureColumn, metric.aggregation, dimensions,
-						metric.aggregation === "count_distinct" ? (dimensions.find((d) => d.endsWith(":month")) ?? defaultDimension) : defaultDimension,
+						defaultDimension,
 						timeColumn, metric.unit, metric.valueFormat, metric.higherIsBetter, [plan.rid],
 						1000 + order, plan.rid, createdBy,
 					],

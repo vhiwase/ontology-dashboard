@@ -31,6 +31,7 @@ import { query, queryOne } from "./db";
 import { executeKpiWith, type KpiExecuteResult } from "./kpi";
 import {
 	chooseTimeColumn,
+	defaultSlice,
 	insertWorkspaceLink,
 	measureLinkNow,
 	modelSources,
@@ -417,7 +418,7 @@ async function draftMetric(raw: Record<string, unknown>): Promise<Draft> {
 		unit: (raw.unit as string | undefined) ?? (format === "percent" ? "%" : null),
 		apiName,
 		dimensions,
-		defaultDimension: timeColumn ? `${timeColumn}:month` : (dimensions[0] ?? null),
+		defaultDimension: timeColumn ? `${timeColumn}:month` : defaultSlice(dimensions),
 		timeColumn,
 	};
 

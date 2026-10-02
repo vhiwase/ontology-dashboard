@@ -21,7 +21,7 @@
  */
 
 import type { Widget } from "./dashboards";
-import { measureLinkNow } from "./modeling";
+import { defaultSlice, measureLinkNow } from "./modeling";
 import { humanize, plural, singular, snake } from "./profiling";
 import { dimensionsOf, pascal } from "./proposals";
 import {
@@ -103,6 +103,10 @@ const SYNONYMS: Record<string, string[]> = {
 	price: ["price"],
 	freight: ["freight"],
 };
+// Words that ask for a count rather than name what is counted.
+const COUNT_WORDS = new Set(["number", "count", "counts", "how", "many", "amount", "quantity", "volume", "unique", "distinct", "overall", "everything"]);
+// Words that say when, not what: answered from a type's own dates.
+const TIME_WORDS = new Set(["latest", "recent", "recently", "last", "newest", "new", "current", "this", "today", "yesterday", "past", "previous", "so", "far", "ytd", "mtd", "date"]);
 const GROUP_OF = new Map<string, string>();
 for (const [group, words] of Object.entries(SYNONYMS)) for (const word of words) GROUP_OF.set(word, group);
 
@@ -429,6 +433,13 @@ export function asksAboutPunctuality(phrase: string): boolean {
 	return PUNCTUAL.test(phrase.toLowerCase());
 }
 
+/** "Distinct customers", preferably one with the grain asked for. */
+function distinctKpiFor(type: ObjectTypeMeta, grain: string | null): KpiMeta | null {
+	const many = (type.pluralLabel ?? plural(type.label)).toLowerCase();
+	const distinct = getRegistry().kpis.filter((k) => k.aggregation === "count_distinct" && k.label.toLowerCase().includes(many));
+	return (grain ? distinct.find((k) => k.dimensions.some((d) => d.endsWith(`:${grain}`))) : undefined) ?? distinct[0] ?? null;
+}
+
 /** The metric a punctuality question is answered from, once it exists. */
 function punctualityKpi(counting: boolean): KpiMeta | null {
 	const [measure, aggregation] = counting ? ["is_late", "sum"] : ["on_time_pct", "avg"];
@@ -562,7 +573,21 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 	let kpi: KpiMeta | null = null;
 	let measureProperty: PropertyMatch | null = null;
 
-	if (aggregation === "count" || (countedType && !aggregation && (!propertyMatch || overlap(tokens(measurePhrase), typeTokens(countedType)) >= propertyMatch.score))) {
+	// The phrase is just a type's name: "total orders" is how many orders,
+	// not a sum of a column that happens to mention orders.
+	const namesTypeOnly = countedType !== null && namesTypeExactly(measurePhrase, countedType);
+	// "Unique customers per month": counted where they appear - the distinct
+	// customers on orders - which has a timeline the type itself may lack.
+	const distinctOf =
+		aggregation === "count_distinct" && namesTypeOnly ? distinctKpiFor(countedType!, request.grain ?? null) : null;
+
+	if (distinctOf) {
+		kpi = distinctOf;
+	} else if (
+		aggregation === "count" ||
+		(aggregation === "sum" && namesTypeOnly) ||
+		(countedType && !aggregation && (!propertyMatch || overlap(tokens(measurePhrase), typeTokens(countedType)) >= propertyMatch.score))
+	) {
 		// "How many orders", or a bare type name: that type's count metric. A
 		// property that merely shares a word ("units on order") does not
 		// outrank the type the question names.
@@ -590,6 +615,42 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 		if (!measured) return punctuality(request, counting);
 		kpi = measured;
 		measureProperty = null;
+	}
+
+	// 1c. A count of a type answers only for the type: "customer satisfaction
+	// score" is not the number of customers. Words the type's name does not
+	// cover must name something the data holds, or the answer is that it
+	// does not hold it.
+	if (kpi?.aggregation === "count" && countedType && kpi.objectTypeRid === countedType.rid) {
+		const own = typeTokens(countedType);
+		const dated = countedType.properties.some((p) => p.semanticRole === "temporal");
+		const unexplained = words(measurePhrase).filter((w) => {
+			if (STOPWORDS.has(w) || COUNT_WORDS.has(w)) return false;
+			// "Latest orders", "recent orders": a when, read from the type's dates.
+			if (dated && TIME_WORDS.has(w)) return false;
+			const token = GROUP_OF.get(singular(w)) ?? singular(w);
+			return !own.includes(token);
+		});
+		const phrase = unexplained.join(" ");
+		const explained =
+			phrase === "" ||
+			matchProperty(phrase, ["measure", "dimension", "flag", "temporal", "attribute", "title", "identity"], countedType) !== null ||
+			matchType(phrase) !== null ||
+			// "orders in Germany": a value the data holds, for a filter.
+			(await holdsValue(countedType, unexplained));
+		if (!explained) {
+			const many = countedType.pluralLabel ?? plural(countedType.label);
+			return {
+				request,
+				status: "not_possible",
+				explanation: `${many} can be counted, but nothing in this workspace's data looks like "${phrase}".`,
+				missing: [`a column holding ${phrase}`],
+				alternatives: registry.kpis
+					.filter((k) => k.objectTypeRid === countedType.rid)
+					.slice(0, 4)
+					.map((k) => (k.timeColumn ? `${k.label} per month` : k.label)),
+			};
+		}
 	}
 
 	let measureType = kpi
@@ -1402,6 +1463,20 @@ export async function combinationRequest(text: string): Promise<FeasibilityItem>
 
 // ── dashboards and capabilities ─────────────────────────────────────────────
 
+/** Whether one of a type's categories holds one of `values` ("Germany"). */
+async function holdsValue(type: ObjectTypeMeta, values: string[]): Promise<boolean> {
+	const columns = type.properties.filter((p) => p.semanticRole === "dimension" || p.semanticRole === "title").slice(0, 12);
+	if (columns.length === 0 || values.length === 0) return false;
+	const candidates = [...new Set([values.join(" "), ...values])].map((v) => v.toLowerCase());
+	try {
+		const checks = columns.map((p) => `lower(${quoteIdentifier(p.sqlColumn)}::text) = ANY($1::text[])`).join(" OR ");
+		const rows = await query(`SELECT 1 FROM ${quoteQualified(type.sourceView)} WHERE ${checks} LIMIT 1`, [candidates]);
+		return rows.length > 0;
+	} catch {
+		return false;
+	}
+}
+
 async function cardinality(type: ObjectTypeMeta, column: string): Promise<number> {
 	try {
 		const [row] = await query<{ n: string }>(
@@ -1624,7 +1699,12 @@ async function capabilities(): Promise<FeasibilityItem[]> {
 		for (const link of registry.linksBySourceRid.get(type.rid) ?? []) {
 			if (link.targetObjectType === type.rid) continue;
 			const target = registry.objectTypeByRid.get(link.targetObjectType);
-			const dimension = target?.properties.find((p) => p.semanticRole === "dimension");
+			// The slice the linked type is best known by: its country or kind,
+			// never a contact's details.
+			const sliceColumn = defaultSlice(
+				(target?.properties ?? []).filter((p) => p.semanticRole === "dimension" && !CONTACT_LIKE.test(p.sqlColumn)).map((p) => p.sqlColumn),
+			);
+			const dimension = target?.properties.find((p) => p.sqlColumn === sliceColumn);
 			const count = metrics.find((k) => k.aggregation === "count");
 			if (!target || !dimension || !count) continue;
 			items.push({

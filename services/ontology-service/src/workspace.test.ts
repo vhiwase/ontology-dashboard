@@ -18,6 +18,7 @@ import { effectiveRole, personalSpaceRefusal, validateRegistration, type Princip
 import { isLinkLocal, isLoopback, isPrivateAddress } from "./connectionPolicy";
 import { assertDerivedName, compileExpression } from "./derived";
 import { asksAboutPunctuality, detectIntent, parseQuestion, sliceName, tokens, widgetTitle } from "./feasibility";
+import { defaultSlice } from "./modeling";
 import { humanize, inferRoles, plural, singular, typeApiName, type ColumnInfo, type ColumnStats } from "./profiling";
 import { derivedMetric, parseFollowUp } from "./proposals";
 import type { KpiMeta } from "./registry";
@@ -385,4 +386,16 @@ describe("derivedMetric", () => {
 		[{ aggregation: "sum", label: "x".repeat(61) }, /at most 60/],
 		[{ aggregation: "avg", label: "x", format: "stars" }, /format must be/],
 	])("refuses %j", (raw, message) => expect(() => derivedMetric(raw)).toThrow(message));
+});
+
+describe("defaultSlice", () => {
+	it("slices a type with no dates by where or what kind first", () => {
+		expect(defaultSlice(["contact_title", "city", "region", "country"])).toBe("country");
+		expect(defaultSlice(["contact_title", "category_name"])).toBe("category_name");
+	});
+	it("never starts with a contact's details when anything else exists", () => {
+		expect(defaultSlice(["contact_title", "title_of_courtesy", "city"])).toBe("city");
+		expect(defaultSlice(["contact_title"])).toBe("contact_title");
+		expect(defaultSlice(["order_date:month"])).toBeNull();
+	});
 });
