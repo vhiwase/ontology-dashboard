@@ -32,9 +32,27 @@ export const DATASET_SCHEMA = "connection_raw";
 
 const STATEMENT_TIMEOUT_MS = 30_000;
 
-/** Server functions a definition may not call, whatever it reads. */
+/**
+ * Server functions a definition may not call, whatever it reads. Some run SQL
+ * handed to them as text (ts_stat, ts_rewrite, the *_to_xml family): the
+ * planner sees a function call, not the relations that SQL reads.
+ */
 const FORBIDDEN_CALLS =
-	/\b(pg_read_file|pg_read_binary_file|pg_ls_\w+|pg_stat_file|pg_file_\w+|lo_\w+|dblink\w*|pg_sleep\w*|set_config|current_setting|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_advisory\w*|query_to_xml\w*|table_to_xml\w*)\s*\(/i;
+	/\b(pg_read_file|pg_read_binary_file|pg_ls_\w+|pg_stat_file|pg_file_\w+|lo_\w+|dblink\w*|pg_sleep\w*|set_config|current_setting|pg_terminate_backend|pg_cancel_backend|pg_reload_conf|pg_advisory\w*|\w*_to_xml\w*|ts_stat|ts_rewrite)\s*\(/i;
+
+/** Text that is itself a query, the way SQL is smuggled into such a function. */
+const QUERY_IN_TEXT = /(?:'|\$\w*\$)\s*(select|with|table|values|insert|update|delete|copy)\b/i;
+
+/**
+ * Which synced tables a definition may read. A personal workspace reads only
+ * its own (their names start with its prefix); a shared space reads every
+ * synced dataset, which is the trust a team extends to its analysts.
+ */
+export interface DatasetScope {
+	tablePrefix: string;
+	/** For the refusal: "this workspace's". */
+	owner: string;
+}
 
 /**
  * The statement with comments and one trailing semicolon removed, or a
@@ -57,6 +75,9 @@ export function assertSingleSelect(statement: string): string {
 	const forbidden = FORBIDDEN_CALLS.exec(stripped);
 	if (forbidden) {
 		throw new BadRequest(`'${forbidden[1]}' reaches outside the data and cannot be used in a definition.`);
+	}
+	if (QUERY_IN_TEXT.test(stripped)) {
+		throw new BadRequest("A definition may not carry a query inside a string; write it as part of the SELECT.");
 	}
 	return stripped;
 }
@@ -102,7 +123,10 @@ export function relationsInPlan(plan: PlanNode): string[] {
  * statement does not plan - an unknown column, a bad cast - because that
  * message names the fix.
  */
-export async function inspectSelect(statement: string): Promise<{ relations: string[]; columns: string[] }> {
+export async function inspectSelect(
+	statement: string,
+	scope?: DatasetScope,
+): Promise<{ relations: string[]; columns: string[] }> {
 	const sql = assertSingleSelect(statement);
 	try {
 		return await readOnly(async (client) => {
@@ -117,6 +141,16 @@ export async function inspectSelect(statement: string): Promise<{ relations: str
 				throw new BadRequest(
 					`A definition may read only synced datasets (${DATASET_SCHEMA}.*). ` +
 						`This one reads ${outside.join(", ")}.`,
+				);
+			}
+			// A view is planned as the tables under it, so a combined dataset
+			// is checked by what it really reads.
+			const foreign = scope
+				? relations.filter((relation) => !relation.startsWith(`${DATASET_SCHEMA}.${scope.tablePrefix}`))
+				: [];
+			if (foreign.length > 0) {
+				throw new BadRequest(
+					`A definition here may read only ${scope!.owner} synced datasets. This one reads ${foreign.join(", ")}.`,
 				);
 			}
 
@@ -135,7 +169,11 @@ export async function inspectSelect(statement: string): Promise<{ relations: str
 export async function runSelect(
 	statement: string,
 	limit: number,
+	scope?: DatasetScope,
 ): Promise<{ sql: string; rows: Array<Record<string, unknown>> }> {
+	// Checked again at every run where the reach is narrowed: what a name
+	// resolves to is decided when the query is planned, not when it was saved.
+	if (scope) await inspectSelect(statement, scope);
 	const sql = assertSingleSelect(statement);
 	const bounded = Math.min(Math.max(1, Math.floor(limit)), 5000);
 	const rows = await readOnly(

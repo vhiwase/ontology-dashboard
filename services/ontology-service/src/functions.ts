@@ -25,7 +25,8 @@
 
 import { query, queryOne } from "./db";
 import { BadRequest, currentSpace, getRegistry, NotFound } from "./registry";
-import { inspectSelect, runSelect } from "./sqlGuard";
+import { type DatasetScope, inspectSelect, runSelect } from "./sqlGuard";
+import { spaceBySlug } from "./workspaces";
 
 export interface FunctionParameter {
 	name: string;
@@ -204,7 +205,7 @@ export async function validateDefinition(
 
 	let inspected: { relations: string[]; columns: string[] };
 	try {
-		inspected = await inspectSelect(definition);
+		inspected = await inspectSelect(definition, await datasetScope());
 	} catch (error) {
 		return {
 			valid: false,
@@ -237,6 +238,18 @@ export async function validateDefinition(
 		readsObjectTypes,
 		columns: inspected.columns,
 	};
+}
+
+/**
+ * What a definition may read in the space in scope: in a personal workspace,
+ * only that workspace's own synced tables (and the combined datasets built on
+ * them, which the planner reports as those tables).
+ */
+export async function datasetScope(): Promise<DatasetScope | undefined> {
+	const space = await spaceBySlug(currentSpace());
+	if (space?.kind !== "personal") return undefined;
+	// connections.ts names a personal workspace's landing tables w<id>_...
+	return { tablePrefix: `w${space.id}_`, owner: "this workspace's" };
 }
 
 /** The columns a definition returns, read from the catalogue after a probe. */
@@ -547,7 +560,7 @@ export async function runFunction(
 	let sql: string | null = null;
 	try {
 		// Read-only, time-limited, and wrapped as a subquery - see sqlGuard.ts.
-		const ran = await runSelect(fn.definition, MAX_ROWS);
+		const ran = await runSelect(fn.definition, MAX_ROWS, await datasetScope());
 		sql = ran.sql;
 		const rows = ran.rows;
 		const durationMs = Date.now() - started;

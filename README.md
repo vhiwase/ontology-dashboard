@@ -146,12 +146,29 @@ neither. Data without both dates is told so - it is never estimated.
 start (workspaces, proposals and per-workspace audit are 0032-0034, after the
 dataset-ontology migrations 0027-0031).
 
-### What a personal workspace does not offer
+A question that names a value - "revenue in Germany", "orders shipped via
+Speedy Express", "customers in Mexico" - is answered for that value. The
+value is found in the workspace's own category columns (never guessed) and
+placed on the column that holds it as asked: "shipped to France" on the ship
+country, "customers in Brazil" on the customer's country. When the figure's
+own rows do not carry that column, the same figure on a combined dataset with
+one row per record answers instead; when nothing carries it, you are told so
+and offered the combination that would - never the unfiltered number.
 
-SQL functions read synced tables by name, and the synced tables of every
-workspace share one schema, so they are offered only in shared spaces.
-Everything a workspace needs - links, combined datasets, derived columns,
-metrics, action types - is compiled from its own ontology instead.
+**New and returning customers** are told apart by the order of each
+customer's rows: "new vs returning customers per month" proposes an *Order
+History* dataset that numbers every order within its customer
+(`sequence_of(customer_id, order_date, order_id)`). A customer is new in the
+period of their first order and returning in any period they order again.
+
+### SQL functions in a personal workspace
+
+Every workspace's synced tables share one schema, so a function written in a
+personal workspace may read only that workspace's own synced tables - checked
+by the planner, which reports a combined dataset as the tables under it - and
+is checked again at every run. Functions that run SQL handed to them as text
+(`ts_stat`, `*_to_xml`) and queries carried inside a string are refused
+everywhere. The workspace's owner approves its functions.
 
 ---
 

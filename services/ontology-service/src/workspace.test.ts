@@ -250,13 +250,18 @@ describe("space roles", () => {
 		expect(effectiveRole(self, shared(null))).toBe("viewer");
 	});
 
-	it("refuses features that run caller-written SQL in a personal workspace", () => {
-		expect(personalSpaceRefusal("POST", "/functions", self, own)).toMatch(/not available in a personal workspace/);
-		expect(personalSpaceRefusal("PATCH", "/functions/revenue", self, own)).not.toBeNull();
-		expect(personalSpaceRefusal("GET", "/spaces/database", self, own)).not.toBeNull();
-		// Metrics, links and combinations are compiled from the ontology.
+	it("refuses platform-wide features in a personal workspace", () => {
+		expect(personalSpaceRefusal("GET", "/spaces/database", self, own)).toMatch(/not available in a personal workspace/);
+		expect(personalSpaceRefusal("POST", "/spaces/sandbox/seed", self, own)).not.toBeNull();
 		expect(personalSpaceRefusal("POST", "/proposals", self, own)).toBeNull();
-		expect(personalSpaceRefusal("POST", "/functions", self, shared("editor"))).toBeNull();
+	});
+
+	it("offers SQL functions in a personal workspace, read-scoped to its own tables (see sqlGuard)", () => {
+		expect(personalSpaceRefusal("POST", "/functions", self, own)).toBeNull();
+		expect(personalSpaceRefusal("PATCH", "/functions/revenue", self, own)).toBeNull();
+		// The owner approves their own; in a shared space that stays an admin's.
+		expect(effectiveRole(self, own)).toBe("admin");
+		expect(effectiveRole(self, shared("editor"))).toBe("analyst");
 	});
 });
 

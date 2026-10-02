@@ -611,7 +611,6 @@ export function apiAuthorization() {
 
 const PLATFORM_ADMIN_ONLY: ReadonlyArray<{ method: string; pattern: RegExp }> = [
 	{ method: "POST", pattern: /^\/registry\/reload$/ },
-	{ method: "POST", pattern: /^\/functions\/[^/]+\/(approve|reject|archive)$/ },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/members$/ },
 	{ method: "DELETE", pattern: /^\/spaces\/[^/]+\/members\/[^/]+$/ },
 ];
@@ -634,16 +633,12 @@ export function effectiveRole(principal: Principal, access: SpaceAccess | undefi
 /**
  * Features that cannot be offered inside a personal workspace.
  *
- * Each of these runs SQL the caller wrote, or reads a relation the caller
- * names, and the synced tables of every workspace live in one schema. In a
- * shared space that is the trust the team already extends to an analyst; in a
- * personal workspace it would let one account read another's synced tables.
- * Metrics, links and combined datasets are still available there - they are
- * compiled from the ontology, never written as SQL by the caller.
+ * Each of these reads platform-wide state, and a personal workspace sees only
+ * its own. SQL functions are available there: their reach is narrowed to the
+ * workspace's own synced tables by the planner check in sqlGuard.ts, and the
+ * owner approves them like any other change to their workspace.
  */
 const PERSONAL_SPACE_REFUSED: ReadonlyArray<{ method: string; pattern: RegExp; feature: string }> = [
-	{ method: "POST", pattern: /^\/functions(\/.*)?$/, feature: "SQL functions" },
-	{ method: "PATCH", pattern: /^\/functions\/.+$/, feature: "SQL functions" },
 	{ method: "POST", pattern: /^\/spaces\/sandbox\/seed$/, feature: "Seeding the sandbox from the TMS ontology" },
 	{ method: "GET", pattern: /^\/spaces\/database$/, feature: "The platform database's own details" },
 ];

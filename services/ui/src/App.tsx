@@ -82,6 +82,7 @@ const PERSONAL_NAV: NavEntry[] = [
 	{ to: "/ontology", label: "Business objects", glyph: "◇" },
 	{ to: "/graph", label: "Relationships", glyph: "◉" },
 	{ to: "/explorer", label: "Explore records", glyph: "▤" },
+	{ to: "/functions", label: "SQL functions", glyph: "ƒ" },
 	{ to: "/actions", label: "Actions", glyph: "▶" },
 	{ section: "Account" },
 	{ to: "/assistant/cost", label: "AI usage & cost", glyph: "$" },
