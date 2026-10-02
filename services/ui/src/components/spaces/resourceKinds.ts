@@ -3,21 +3,18 @@
  *
  * Shared by the tree, the resource list and the preview window, so an object
  * type carries the same glyph and colour wherever it appears. The accents are
- * the pipeline builder's node-group tokens: a dataset in the explorer and a
- * Dataset node on the canvas are the same kind of thing and should read that
- * way.
+ * grouped by stage: data (connections, datasets), ontology (types, links,
+ * actions), computation (metrics) and output (dashboards).
  */
 
 export type ResourceKind =
+	| "connection"
 	| "dataset"
 	| "objectType"
-	| "actionType"
 	| "linkType"
-	| "pipeline"
-	| "dashboard"
-	| "connection"
-	| "codeRepo"
-	| "kpi";
+	| "actionType"
+	| "kpi"
+	| "dashboard";
 
 export interface ResourceSpec {
 	kind: ResourceKind;
@@ -43,16 +40,6 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 		label: "Dataset",
 		plural: "Datasets",
 		accent: "var(--node-data)",
-	},
-	codeRepo: {
-		kind: "codeRepo",
-		glyph: "⌥",
-		label: "Repository",
-		plural: "Repositories",
-		// Transform's accent: a repository is where a transform is written,
-		// and it belongs beside the pipeline rather than beside the data.
-		accent: "var(--node-transform)",
-		route: (ref) => `/repos/${encodeURIComponent(ref)}`,
 	},
 	objectType: {
 		kind: "objectType",
@@ -88,14 +75,6 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 		plural: "Metrics",
 		accent: "var(--node-transform)",
 	},
-	pipeline: {
-		kind: "pipeline",
-		glyph: "⑄",
-		label: "Pipeline",
-		plural: "Pipelines",
-		accent: "var(--node-transform)",
-		route: () => "/pipeline",
-	},
 	dashboard: {
 		kind: "dashboard",
 		glyph: "▦",
@@ -111,21 +90,17 @@ export const RESOURCE_KIND_LIST = Object.values(RESOURCE_SPECS);
 /**
  * The resource kinds as navigation entries, in the order data flows through
  * the platform: it arrives through a connection, lands as a dataset, is
- * modelled as ontology, is computed by pipelines and leaves as an output.
+ * modelled as ontology, is measured by metrics and leaves as an output.
  *
  * The slug is the URL segment under /browse. Metrics and Outputs are named for
  * what a reader looks for, not for the internal kind (kpi, dashboard).
  */
 export const BROWSE_KINDS: Array<{ slug: string; kind: ResourceKind; label: string }> = [
 	{ slug: "connections", kind: "connection", label: "Connections" },
-	// Between the connection and the dataset, which is where a repository sits
-	// in the flow: it is the code that pulls one through and reshapes it.
-	{ slug: "repositories", kind: "codeRepo", label: "Repositories" },
 	{ slug: "datasets", kind: "dataset", label: "Datasets" },
 	{ slug: "object-types", kind: "objectType", label: "Object Types" },
 	{ slug: "links", kind: "linkType", label: "Links" },
 	{ slug: "action-types", kind: "actionType", label: "Action Types" },
 	{ slug: "metrics", kind: "kpi", label: "Metrics" },
-	{ slug: "pipelines", kind: "pipeline", label: "Pipelines" },
 	{ slug: "outputs", kind: "dashboard", label: "Outputs" },
 ];

@@ -14,6 +14,7 @@ shown to the user.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -47,6 +48,24 @@ class LlmReply:
 
 class LlmError(RuntimeError):
     pass
+
+
+# How often a rate-limited call is retried, and the longest single wait. Three
+# waits of at most 20 s bound the extra time a turn can spend at a minute.
+RATE_LIMIT_RETRIES = 3
+MAX_RETRY_WAIT_SECONDS = 20.0
+
+
+def _retry_after_seconds(response: httpx.Response) -> float:
+    """The wait Azure asks for on a 429, bounded; 5 s when it names none."""
+    for header, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        raw = response.headers.get(header)
+        if raw:
+            try:
+                return max(0.5, min(float(raw) * scale, MAX_RETRY_WAIT_SECONDS))
+            except ValueError:
+                continue
+    return 5.0
 
 
 def _coerce_arguments(raw: Any, tool_name: str) -> dict[str, Any]:
@@ -156,18 +175,30 @@ class AzureOpenAIProvider(LlmProvider):
             payload["tool_choice"] = "auto"
 
         async with httpx.AsyncClient(timeout=CONFIG.azure_timeout) as client:
-            try:
-                response = await client.post(
-                    self.url,
-                    json=payload,
-                    headers={"api-key": CONFIG.azure_key, "content-type": "application/json"},
-                )
-            except httpx.TimeoutException as exc:
-                raise LlmError(
-                    f"Azure OpenAI did not answer within {CONFIG.azure_timeout:.0f}s."
-                ) from exc
-            except httpx.HTTPError as exc:
-                raise LlmError(f"Could not reach Azure OpenAI: {exc}") from exc
+            for attempt in range(RATE_LIMIT_RETRIES + 1):
+                try:
+                    response = await client.post(
+                        self.url,
+                        json=payload,
+                        headers={"api-key": CONFIG.azure_key, "content-type": "application/json"},
+                    )
+                except httpx.TimeoutException as exc:
+                    raise LlmError(
+                        f"Azure OpenAI did not answer within {CONFIG.azure_timeout:.0f}s."
+                    ) from exc
+                except httpx.HTTPError as exc:
+                    raise LlmError(f"Could not reach Azure OpenAI: {exc}") from exc
+
+                # A 429 is the deployment's tokens-per-minute limit, not a
+                # failure of the request: a long turn (building an ontology
+                # is a dozen rounds) can cross it. Waiting the time Azure asks
+                # for and trying again finishes the turn; giving up would
+                # leave work half-described.
+                if response.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+                    break
+                wait = _retry_after_seconds(response)
+                log.warning("Azure OpenAI rate limit; retrying in %.1fs (attempt %d).", wait, attempt + 1)
+                await asyncio.sleep(wait)
 
         if response.status_code >= 400:
             raise LlmError(f"Azure OpenAI returned {response.status_code}: {response.text[:400]}")

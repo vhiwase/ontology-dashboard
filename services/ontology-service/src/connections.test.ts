@@ -74,17 +74,12 @@ describe("localTypeFor", () => {
 describe("validateSyncRequest", () => {
 	const base = { name: "orders", sourceSchema: "public", sourceTable: "orders" };
 
-	it("accepts a plain snapshot", () => {
+	it("accepts a view to copy as it is", () => {
 		expect(validateSyncRequest(base)).toEqual({
 			name: "orders",
 			description: null,
 			sourceSchema: "public",
 			sourceTable: "orders",
-			// Null for a PostgreSQL sync: they are the REST connector's fields.
-			sourcePath: null,
-			recordsPath: null,
-			mode: "snapshot",
-			cursorColumn: null,
 			rowLimit: 50_000,
 		});
 	});
@@ -98,26 +93,16 @@ describe("validateSyncRequest", () => {
 		);
 	});
 
-	it("refuses an incremental sync with no cursor", () => {
-		// Without one every run re-reads the whole table and appends it, which
-		// doubles the dataset rather than failing.
-		expect(() => validateSyncRequest({ ...base, mode: "incremental" })).toThrow(/cursor column/);
-	});
-
-	it("checks the cursor column is an identifier too", () => {
-		expect(() =>
-			validateSyncRequest({ ...base, mode: "incremental", cursorColumn: "updated_at; --" }),
-		).toThrow(/not a plain identifier/);
-	});
-
 	it("bounds the reader", () => {
 		expect(() => validateSyncRequest({ ...base, rowLimit: 0 })).toThrow(/between 1 and/);
 		expect(() => validateSyncRequest({ ...base, rowLimit: 5_000_000 })).toThrow(/between 1 and/);
 		expect(validateSyncRequest({ ...base, rowLimit: 100 }).rowLimit).toBe(100);
 	});
 
-	it("needs a name", () => {
-		expect(() => validateSyncRequest({ ...base, name: "  " })).toThrow(/needs a name/);
+	it("is named for the view it copies unless told otherwise", () => {
+		expect(validateSyncRequest({ ...base, name: "  " }).name).toBe(
+			`${base.sourceSchema}.${base.sourceTable}`,
+		);
 	});
 });
 
@@ -125,7 +110,6 @@ describe("displayDsn", () => {
 	it("never carries a password", () => {
 		const dsn = displayDsn({
 			name: "source",
-			engine: "postgresql",
 			host: "db.internal",
 			port: 5432,
 			database: "warehouse",

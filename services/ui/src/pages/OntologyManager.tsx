@@ -1,13 +1,14 @@
 /**
- * Ontology manager: browse and inspect the generated model.
+ * Ontology manager: browse and inspect the object types built from datasets.
  *
  * The properties table shows the semantic role of every column, because that is
- * the thing the generator decided and the thing everything downstream depends on.
+ * what decides what may be summed and grouped, and everything downstream depends on it.
  * The links table shows the match ratio and how each link was discovered, so a
  * partial join is visibly partial rather than looking like a clean arrow.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
 	type LinkTypeRow,
 	type ObjectTypeDetail,
@@ -17,6 +18,7 @@ import {
 	round,
 } from "../api";
 import { useSpace } from "../SpaceContext";
+import { NoObjectTypesYet } from "../components/ontology/NoObjectTypesYet";
 import { ObjectTypeEditor } from "../components/ontology/OntologyEditor";
 import {
 	EditJournal,
@@ -144,10 +146,14 @@ export function OntologyManager() {
 		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
 	if (!types) return <Spinner label="Loading ontology" />;
+	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
 		<div className="split">
 			<div className="card" style={{ padding: 10 }}>
+				<Link className="btn sm" to="/browse/datasets" style={{ width: "100%", marginBottom: 8 }}>
+					New object type from a dataset
+				</Link>
 				<input
 					placeholder="Filter object types"
 					value={filter}
@@ -423,10 +429,8 @@ export function OntologyManager() {
 			</div>
 			<div className="card">
 				<div className="card-head">
-					<h3>Edit journal</h3>
-					<span className="sub">
-						replayed onto every ontology the pipeline publishes afterwards
-					</span>
+					<h3>Change history</h3>
+					<span className="sub">every creation, edit and deletion, with who made it</span>
 				</div>
 				<EditJournal
 					edits={edits}

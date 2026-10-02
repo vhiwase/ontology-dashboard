@@ -69,7 +69,7 @@ services:
           cpus: "${POSTGRES_CPUS:-2}"
           memory: ${POSTGRES_MEMORY:-1g}
 
-  # ─── Pipeline: migrations, ingestion, ontology, users, retention ─────────
+  # ─── Pipeline: migrations, the TMS snapshot, users, retention ────────────
   pipeline:
     build:
       context: ./services/pipeline
@@ -80,10 +80,7 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       PIPELINE_MIGRATIONS_DIR: /db/migrations
       PIPELINE_SOURCE_DIR: ${PIPELINE_SOURCE_DIR:-/data/api_responses}
-      PIPELINE_SIMULATE_EXECUTION: ${PIPELINE_SIMULATE_EXECUTION:-false}
-      PIPELINE_SIM_SEED: ${PIPELINE_SIM_SEED:-20260919}
       PIPELINE_FORCE_REINGEST: ${PIPELINE_FORCE_REINGEST:-false}
-      PIPELINE_LINK_MIN_MATCH_RATIO: ${PIPELINE_LINK_MIN_MATCH_RATIO:-0.05}
       # Creates the first admin when no users exist. Unset means no user is
       # created and every route answers 401, which is a visible failure rather
       # than a default credential.
@@ -96,7 +93,7 @@ services:
       # The captured TMS payloads, mounted read-only from the sibling folder.
       - ../api_responses:/data/api_responses:ro
       - ./db/migrations:/db/migrations:ro
-    # migrate -> run -> seed users -> retention, in that order, with any
+    # migrate -> land the snapshot -> seed users -> retention, in that order, with any
     # failure stopping the rest. The sequence lives in pipeline.bootstrap
     # rather than as an `entrypoint: sh -c` chain here, because overriding the
     # entrypoint would break the documented one-off form:
@@ -112,7 +109,7 @@ services:
           cpus: "${PIPELINE_CPUS:-2}"
           memory: ${PIPELINE_MEMORY:-1g}
 
-  # ─── Ontology service: @ontograph/core over the generated ontology ──────
+  # ─── Ontology service: connections, syncs, schedules, the ontology ──────
   ontology-service:
     build:
       context: ./services/ontology-service
@@ -136,11 +133,11 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       PORT: ${ONTOLOGY_SERVICE_PORT:-4000}
       ONTOLOGY_MAX_PAGE_SIZE: ${ONTOLOGY_MAX_PAGE_SIZE:-500}
-      # false refuses every KPI, widget and action derived from tms_sim, so a
-      # simulated figure cannot be served as though it were measured.
+      # false refuses every KPI, widget and action flagged as resting on
+      # generated data, so an invented figure cannot be served as measured.
       ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-false}
-      # How often the background loop checks platform.schedule for due syncs
-      # and pipelines. 0 disables scheduling entirely.
+      # How often the background loop checks platform.schedule for due syncs.
+      # 0 disables scheduling entirely.
       SCHEDULE_TICK_SECONDS: ${SCHEDULE_TICK_SECONDS:-20}
       NODE_ENV: production
     secrets:
@@ -164,7 +161,7 @@ services:
           cpus: "${ONTOLOGY_SERVICE_CPUS:-2}"
           memory: ${ONTOLOGY_SERVICE_MEMORY:-768m}
 
-  # ─── AI-FDE: the assistant that reads the ontology and builds dashboards ─
+  # ─── AI-FDE: builds the ontology from datasets, answers from it ─────────
   ai-fde:
     build:
       context: ./services/ai-fde
@@ -186,7 +183,7 @@ services:
       # misconfigured value fails loudly in the assistant's log rather than
       # being silently ignored.
       LLM_PROVIDER: ${LLM_PROVIDER:-azure_openai}
-      AI_FDE_MAX_TOOL_ROUNDS: ${AI_FDE_MAX_TOOL_ROUNDS:-8}
+      AI_FDE_MAX_TOOL_ROUNDS: ${AI_FDE_MAX_TOOL_ROUNDS:-16}
       AI_FDE_TEMPERATURE: ${AI_FDE_TEMPERATURE:-0.1}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_KEY_FILE: /run/secrets/azure_openai_key

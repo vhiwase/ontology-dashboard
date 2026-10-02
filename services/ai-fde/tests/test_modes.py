@@ -55,7 +55,7 @@ def test_default_mode_is_exploration_with_core_tools(state):
     available = tools_for(state)
     for name in ALWAYS_ON:
         assert name in available
-    for name in ("list_kpis", "execute_kpi", "search_objects", "get_lineage"):
+    for name in ("list_kpis", "execute_kpi", "search_objects", "list_datasets"):
         assert name in available
     # Capability-gated tools are absent until their capability is enabled.
     for name in ("notepad", "apply_action", "generate_plan", "browse_workspace"):
@@ -77,7 +77,11 @@ def test_every_mode_tool_and_capability_tool_is_registered():
 def test_resolve_mode_accepts_case_variants_and_rejects_the_rest():
     assert resolve_mode("applicationBuilding") == "applicationBuilding"
     assert resolve_mode("ApplicationBuilding") == "applicationBuilding"
-    assert resolve_mode(" dataIntegration ") == "dataIntegration"
+    assert resolve_mode(" dataConnection ") == "dataConnection"
+    # The pipeline and machine-learning modes went with the pipeline builder.
+    for gone in ("dataIntegration", "machineLearning"):
+        with pytest.raises(ValueError, match="Unknown mode"):
+            resolve_mode(gone)
     with pytest.raises(ValueError, match="Unknown mode"):
         resolve_mode("workshop")
 
@@ -90,6 +94,63 @@ def test_schemas_for_filters_the_full_list(state):
     assert len(schemas) < len(tools.tool_schemas())
 
 
+def _walk_properties(schema: dict, path: str, problems: list[str]) -> None:
+    """Every schema node below `properties`/`items` must itself be an object.
+
+    The failure this catches: passing a whole parameters object where a
+    properties dict belongs, which produces a property named "type" whose
+    schema is the string "object" - and Azure rejects the ENTIRE tool list
+    with 400 'Invalid schema for property ... expected object for schema,
+    got string', so every chat turn dies, not just the malformed tool's.
+    """
+    for key, value in schema.items():
+        if key in ("properties",) and isinstance(value, dict):
+            for prop_name, prop_schema in value.items():
+                where = f"{path}.{prop_name}"
+                if not isinstance(prop_schema, dict):
+                    problems.append(
+                        f"{where}: schema must be an object, got {type(prop_schema).__name__}"
+                    )
+                    continue
+                _walk_properties(prop_schema, where, problems)
+        elif key == "items":
+            if isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        _walk_properties(item, f"{path}.items[{index}]", problems)
+            elif isinstance(value, dict):
+                _walk_properties(value, f"{path}.items", problems)
+        elif key in ("anyOf", "oneOf", "allOf") and isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    _walk_properties(item, f"{path}.{key}[{index}]", problems)
+
+
+def test_every_tool_schema_is_well_formed():
+    schemas = tools.tool_schemas()
+    assert len(schemas) >= 30, f"Expected the full tool list, got {len(schemas)}"
+
+    problems: list[str] = []
+    seen: set[str] = set()
+    for schema in schemas:
+        function = schema["function"]
+        name = function["name"]
+        assert isinstance(name, str) and name.strip() and name not in seen, name
+        seen.add(name)
+        assert isinstance(function["description"], str) and function["description"].strip(), name
+
+        parameters = function["parameters"]
+        assert isinstance(parameters, dict), f"{name}: parameters must be an object"
+        assert parameters.get("type") == "object", f"{name}: parameters.type must be 'object'"
+        properties = parameters.get("properties", {})
+        assert isinstance(properties, dict), f"{name}: properties must be an object"
+        for required in parameters.get("required", []):
+            assert required in properties, f"{name}: required '{required}' is not a property"
+        _walk_properties(parameters, name, problems)
+
+    assert not problems, "\n".join(problems)
+
+
 # ── mode switching and capabilities ─────────────────────────────────────────
 
 
@@ -98,7 +159,7 @@ def test_change_mode_switches_and_reports(state):
     assert ok
     assert state.mode == "applicationBuilding"
     assert "create_dashboard" in payload["toolsNowAvailable"]
-    assert "get_exceptions" not in payload["toolsNowAvailable"]
+    assert "create_object_type" not in payload["toolsNowAvailable"]
 
 
 def test_change_mode_rejects_unknown(state):
@@ -145,17 +206,36 @@ def test_tool_outside_the_mode_points_at_the_mode(state):
     assert "exploration" in payload["error"]
 
 
-def test_new_capability_tools_are_wired_into_their_modes(state):
-    """list_schedules belongs to the data modes, list_interfaces to the
-    ontology-reading ones — the audit that found them missing also pins them."""
-    for mode in ("dataIntegration", "dataConnection"):
-        probe = SessionAgentState(mode=mode)
-        assert "list_schedules" in tools_for(probe), mode
-    for mode in ("exploration", "ontologyEditing"):
-        probe = SessionAgentState(mode=mode)
-        assert "list_interfaces" in tools_for(probe), mode
-    # And they stay out of the modes where they would be noise.
+def test_each_step_of_the_flow_lives_in_its_mode(state):
+    """Syncing lives in dataConnection, building in ontologyEditing - and
+    neither can write from exploration, where a question should not be able
+    to change the ontology on its way to an answer."""
+    connection = tools_for(SessionAgentState(mode="dataConnection"))
+    for name in ("list_connections", "list_source_views", "create_sync", "schedule_sync", "list_schedules"):
+        assert name in connection, name
+
+    building = tools_for(SessionAgentState(mode="ontologyEditing"))
+    for name in (
+        "list_datasets", "profile_dataset", "create_object_type", "suggest_links",
+        "create_link_type", "create_metric", "create_action_type", "propose_function",
+    ):
+        assert name in building, name
+
+    exploring = tools_for(SessionAgentState(mode="exploration"))
+    for name in ("create_sync", "create_object_type", "create_link_type", "create_action_type", "delete_ontology_object"):
+        assert name not in exploring, name
     assert "list_schedules" not in tools_for(SessionAgentState(mode="platformQna"))
+
+
+def test_a_build_call_from_exploration_says_which_mode_to_switch_to(state):
+    payload, ok = _run(tools.run_tool("create_object_type", {"dataset": "v_order"}))
+    assert not ok
+    assert 'mode="ontologyEditing"' in payload["error"]
+
+
+def test_removed_tools_are_gone():
+    for name in ("propose_pipeline", "get_lineage", "get_data_coverage", "get_exceptions", "list_interfaces"):
+        assert name not in tools.TOOL_IMPLEMENTATIONS, name
 
 
 def test_always_on_tools_are_in_every_mode_set(state):
@@ -318,3 +398,88 @@ def test_context_hiding_touches_only_named_tools(state):
     assert messages[3]["content"] == '{"rows": [1, 2, 3]}'
     assert "[hidden by manage_context" in messages[4]["content"]
     assert payload["applied"] == {"hidden": ["list_kpis"], "unhidden": []}
+
+
+# ── writes and the duplicate-call cache ─────────────────────────────────────
+
+
+def test_a_write_empties_the_cache_so_a_later_read_is_fresh(state, monkeypatch):
+    """list_object_types, then create_object_type, then list_object_types again
+    must see the new type - not the cached empty list from before the write."""
+    from app import agent as agent_module
+    from app.llm import ToolCall
+
+    calls: list[str] = []
+
+    async def fake_run_tool(name, arguments):
+        calls.append(name)
+        return {"n": len(calls)}, True
+
+    monkeypatch.setattr(agent_module, "run_tool", fake_run_tool)
+    runner = _agent()
+    cache: dict = {}
+    read = ToolCall(id="a", name="list_object_types", arguments={})
+    write = ToolCall(id="b", name="create_object_type", arguments={"dataset": "v_order"})
+
+    asyncio.run(runner._invoke(read, cache))
+    cached, _, _ = asyncio.run(runner._invoke(read, cache))
+    assert "_note" in cached and calls == ["list_object_types"]
+
+    asyncio.run(runner._invoke(write, cache))
+    fresh, _, _ = asyncio.run(runner._invoke(read, cache))
+    assert "_note" not in fresh
+    assert calls == ["list_object_types", "create_object_type", "list_object_types"]
+
+
+def test_create_sync_reports_a_failed_first_run_rather_than_hiding_it(state, monkeypatch):
+    from app.tools import ToolError
+
+    async def fake_post(path, body=None):
+        if path.endswith("/syncs"):
+            return {"id": 7, "targetRelation": "connection_raw.db__tms_views__v_order"}
+        if path.endswith("/run"):
+            raise ToolError("POST /api/syncs/7/run failed (400): the view went away")
+        if path.endswith("/schedule"):
+            return {"schedule": {"every": "every 2 hours"}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(tools.client, "post", fake_post)
+    state.mode = "dataConnection"
+    payload, ok = _run(
+        tools.run_tool(
+            "create_sync",
+            {"connectionId": 1, "sourceSchema": "tms_views", "sourceTable": "v_order", "every": "2h"},
+        )
+    )
+    assert ok
+    assert payload["created"] and payload["syncId"] == 7
+    assert payload["run"]["status"] == "failed" and "went away" in payload["run"]["error"]
+    assert payload["schedule"] == "every 2 hours"
+
+
+def test_create_metric_keeps_meaningful_false_values(state, monkeypatch):
+    sent: dict = {}
+
+    async def fake_post(path, body=None):
+        sent.update(body or {})
+        return {"apiName": "open_orders", "objectType": "Order", "value": 61, "dimensions": []}
+
+    monkeypatch.setattr(tools.client, "post", fake_post)
+    state.mode = "ontologyEditing"
+    _run(
+        tools.run_tool(
+            "create_metric",
+            {
+                "apiName": "open_orders",
+                "objectType": "Order",
+                "aggregation": "count",
+                "where": {"isClosed": False},
+                "higherIsBetter": False,
+                "dimensions": [],
+            },
+        )
+    )
+    # false is a condition and a direction, not an absence of one.
+    assert sent["where"] == {"isClosed": False}
+    assert sent["higherIsBetter"] is False
+    assert "dimensions" not in sent

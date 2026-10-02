@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { FunctionReview } from "../components/functions/FunctionReview";
 import { useSpace } from "../SpaceContext";
@@ -70,7 +70,10 @@ interface ProviderCatalogue {
 
 export function Assistant() {
 	const [turns, setTurns] = useState<Turn[]>([]);
-	const [input, setInput] = useState("");
+	// ?prompt= pre-fills the composer - how "Ask the AI-FDE to model it" hands a
+	// request over. It is never sent on its own; the person reads it first.
+	const [searchParams] = useSearchParams();
+	const [input, setInput] = useState(() => searchParams.get("prompt") ?? "");
 	const [busy, setBusy] = useState(false);
 	const [sessionId, setSessionId] = useState<number | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -229,12 +232,12 @@ export function Assistant() {
 							</p>
 						)}
 						<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
-							I know this TMS ontology: {" "}
-							<Link to="/ontology">object types</Link>, their links, the{" "}
-							<Link to="/dashboards">KPI catalogue</Link> and the action layer. Ask me a
-							question about the freight book, or tell me what dashboard you need and I
-							will build it. Every figure I show is measured from your TMS snapshot; where
-							the snapshot does not carry something, I will say so rather than estimate it.
+							I build the ontology from your <Link to="/browse/datasets">datasets</Link> -
+							object types, the links between them, metrics and actions - and then answer
+							from it. Ask me to sync a view, to model what has been synced, or a question
+							about the freight book, or to build a dashboard. Every figure I show is
+							measured from the synced data; where the source does not carry something, I
+							will say so rather than estimate it.
 						</p>
 						<div className="starters">
 							{starters.map((starter) => (
@@ -480,13 +483,19 @@ function TurnView({
 
 				{turn.artifacts && turn.artifacts.length > 0 && (
 					<div className="col" style={{ gap: 10, marginTop: 10 }}>
-						{turn.artifacts.map((artifact, index) => (
-							<ArtifactView
-								key={index}
-								artifact={artifact}
-								onReviewFunction={onReviewFunction}
-							/>
-						))}
+						<ChangesCard
+							changes={turn.artifacts.filter((artifact) => artifact.kind === "ontologyChange")}
+							onResource={onResource}
+						/>
+						{turn.artifacts
+							.filter((artifact) => artifact.kind !== "ontologyChange")
+							.map((artifact, index) => (
+								<ArtifactView
+									key={index}
+									artifact={artifact}
+									onReviewFunction={onReviewFunction}
+								/>
+							))}
 					</div>
 				)}
 
@@ -548,124 +557,51 @@ function TurnView({
 	);
 }
 
+const CHANGE_LABELS: Record<string, { verb: string; glyph: string }> = {
+	dataset: { verb: "Synced", glyph: "▤" },
+	objectType: { verb: "Object type", glyph: "◈" },
+	linkType: { verb: "Link", glyph: "↔" },
+	kpi: { verb: "Metric", glyph: "Σ" },
+	actionType: { verb: "Action", glyph: "⚡" },
+};
+
 /**
- * The decision card for a drafted pipeline.
+ * Everything a turn created, as one card.
  *
- * Its own component because it holds state - a card that has been accepted
- * should say so rather than keep offering the button, and the artifact list
- * re-renders around it.
+ * A build turn creates a dozen things; a card each would bury the answer. One
+ * list, each entry opening the resource it names, is what the reader needs to
+ * check the work.
  */
-function PipelineProposalCard({
-	pipeline,
-	compiled,
+function ChangesCard({
+	changes,
+	onResource,
 }: {
-	pipeline: {
-		slug: string;
-		name: string;
-		description: string | null;
-		graph: { nodes: Array<{ id: string; kind: string; name: string }> };
-		acceptedBy: string | null;
-	};
-	compiled: Array<{ node: string; ok: boolean; detail: string }>;
+	changes: ChatArtifact[];
+	onResource: (kind: string, ref: string) => void;
 }) {
-	const [state, setState] = useState<"pending" | "accepted" | "rejected">(
-		pipeline.acceptedBy ? "accepted" : "pending",
-	);
-	const [busy, setBusy] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-	const nodes = pipeline.graph?.nodes ?? [];
-
-	async function decide(action: "accept" | "reject") {
-		setBusy(true);
-		setError(null);
-		try {
-			if (action === "accept") {
-				await api.post(`/api/pipelines/${pipeline.slug}/accept`);
-				setState("accepted");
-			} else {
-				await api.del(`/api/pipelines/${pipeline.slug}`);
-				setState("rejected");
-			}
-		} catch (exc) {
-			setError((exc as Error).message);
-		} finally {
-			setBusy(false);
-		}
-	}
-
+	if (changes.length === 0) return null;
 	return (
-		<div className="card fn-proposal-card">
-			<div className="row" style={{ gap: 8, alignItems: "flex-start" }}>
-				<span className="rp-glyph" aria-hidden>
-					⑄
-				</span>
-				<div style={{ minWidth: 0, flex: "1 1 auto" }}>
-					<div className="row" style={{ gap: 6 }}>
-						<strong>{pipeline.name}</strong>
-						<span className={`chip ${state === "accepted" ? "good" : state === "rejected" ? "bad" : "warn"}`}>
-							{state === "accepted" ? "accepted" : state === "rejected" ? "rejected" : "proposed"}
-						</span>
-						<span className="chip mono">{nodes.length} nodes</span>
-					</div>
-					<p className="muted" style={{ margin: "3px 0 0", fontSize: 11.5 }}>
-						{pipeline.description || "No description."}
-					</p>
-
-					{/* The graph as a line, which is how a pipeline reads. */}
-					<p className="mono" style={{ margin: "6px 0 0", fontSize: 11 }}>
-						{nodes.map((node) => node.name).join("  →  ")}
-					</p>
-
-					{/* Anything the compiler flagged. A node that compiles but
-					    computes nothing is the failure worth surfacing here. */}
-					{compiled
-						.filter((entry) => !entry.ok || entry.detail.includes("computes nothing"))
-						.map((entry) => (
-							<p
-								key={entry.node}
-								className="muted"
-								style={{ margin: "4px 0 0", fontSize: 11 }}
-							>
-								⚠ {entry.node}: {entry.detail}
-							</p>
-						))}
-
-					{error && (
-						<p className="muted" style={{ margin: "5px 0 0", fontSize: 11, color: "var(--bad)" }}>
-							{error}
-						</p>
-					)}
-
-					<p className="muted" style={{ margin: "5px 0 0", fontSize: 11 }}>
-						{state === "accepted"
-							? "Accepted. You can run it from the Pipeline builder."
-							: state === "rejected"
-								? "Rejected and removed."
-								: "Nothing has run. Accepting makes it runnable."}
-					</p>
-				</div>
-
-				<div className="col" style={{ gap: 5, marginLeft: "auto" }}>
-					{state === "pending" && (
-						<>
-							<button className="btn sm primary" onClick={() => decide("accept")} disabled={busy}>
-								Accept
-							</button>
-							<Link className="btn sm" to="/pipeline">
-								Edit
-							</Link>
-							<button className="btn sm ghost" onClick={() => decide("reject")} disabled={busy}>
-								Reject
-							</button>
-						</>
-					)}
-					{state === "accepted" && (
-						<Link className="btn sm primary" to="/pipeline">
-							Open
-						</Link>
-					)}
-				</div>
+		<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card-head">
+				<h3>Built in this turn</h3>
+				<span className="sub">{changes.length} change{changes.length === 1 ? "" : "s"}</span>
 			</div>
+			<ul className="rb-lineage-list" style={{ margin: 0 }}>
+				{changes.map((change, index) => {
+					const kind = String(change.change);
+					const label = CHANGE_LABELS[kind] ?? { verb: "Changed", glyph: "▫" };
+					const ref = String(change.apiName);
+					return (
+						<li key={`${kind}-${ref}-${index}`}>
+							<span aria-hidden>{label.glyph}</span> <span className="muted">{label.verb}</span>{" "}
+							<button type="button" className="res-chip" onClick={() => onResource(kind, ref)}>
+								{kind === "dataset" ? ref.split(".").pop() : ref}
+							</button>
+							{change.detail ? <span className="muted"> · {String(change.detail)}</span> : null}
+						</li>
+					);
+				})}
+			</ul>
 		</div>
 	);
 }
@@ -677,25 +613,8 @@ function ArtifactView({
 	artifact: ChatArtifact;
 	onReviewFunction?: (apiName: string) => void;
 }) {
-	// A drafted pipeline. Accept / Edit / Reject, as §18 asks - and the graph
-	// is summarised inline so the decision can be made without leaving the
-	// conversation for a canvas.
-	if (artifact.kind === "pipelineProposal") {
-		const pipeline = artifact.pipeline as {
-			slug: string;
-			name: string;
-			description: string | null;
-			graph: { nodes: Array<{ id: string; kind: string; name: string }> };
-			acceptedBy: string | null;
-		};
-		const compiled = (artifact.compiled as Array<{ node: string; ok: boolean; detail: string }>) ?? [];
-		return (
-			<PipelineProposalCard pipeline={pipeline} compiled={compiled} />
-		);
-	}
-
-	// A drafted metric. Deliberately not rendered as a finished result: it
-	// computes nothing until someone approves it, so the card is an invitation
+	// A drafted function. Deliberately not rendered as a finished result: it
+	// computes nothing until an admin approves it, so the card is an invitation
 	// to review rather than a report of something done.
 	if (artifact.kind === "functionProposal") {
 		const fn = artifact.function as {
@@ -826,28 +745,6 @@ function ArtifactView({
 						{String(result.note)}
 					</p>
 				)}
-			</div>
-		);
-	}
-
-	if (artifact.kind === "lineage") {
-		const byLayer = (artifact.upstreamByLayer as Record<string, string[]>) ?? {};
-		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
-				<div className="card-head">
-					<h3>Lineage for {String(artifact.subject)}</h3>
-					<Link className="btn sm" to="/lineage" style={{ marginLeft: "auto" }}>
-						Open lineage graph
-					</Link>
-				</div>
-				<dl className="kv">
-					{Object.entries(byLayer).map(([layer, labels]) => (
-						<div key={layer} style={{ display: "contents" }}>
-							<dt>{layer}</dt>
-							<dd className="secondary">{labels.join(", ")}</dd>
-						</div>
-					))}
-				</dl>
 			</div>
 		);
 	}

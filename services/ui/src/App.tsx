@@ -9,9 +9,8 @@ import {
 } from "./api";
 import { useDebounced } from "./components/common";
 import { Actions } from "./pages/Actions";
-import { RepoDetail, RepoList } from "./pages/CodeRepos";
 import { Functions } from "./pages/Functions";
-import { BROWSE_KINDS, RESOURCE_SPECS } from "./components/spaces/resourceKinds";
+import { BROWSE_KINDS } from "./components/spaces/resourceKinds";
 import { ResourceProvider, useResources } from "./ResourceContext";
 import { ResourceBrowser } from "./pages/ResourceBrowser";
 import { Login } from "./pages/Login";
@@ -20,15 +19,12 @@ import { CostAnalysis } from "./pages/CostAnalysis";
 import { DashboardHistory } from "./pages/DashboardHistory";
 import { DashboardDetail, DashboardList } from "./pages/Dashboards";
 import { GraphView } from "./pages/GraphView";
-import { LineagePage } from "./pages/LineagePage";
 import { ObjectExplorer } from "./pages/ObjectExplorer";
-import { PipelineBuilder } from "./pages/PipelineBuilder";
 import { Spaces } from "./pages/Spaces";
 import { SpaceProvider, envTone, useSpace } from "./SpaceContext";
 import { OntologyManager } from "./pages/OntologyManager";
 import { Overview } from "./pages/Overview";
 import { Schedules } from "./pages/Schedules";
-import { Evals } from "./pages/Evals";
 
 interface HealthPayload {
 	status: string;
@@ -38,35 +34,42 @@ interface HealthPayload {
 	kpis: number;
 }
 
-const NAV = [
-	{ section: "Workspace" },
-	{ to: "/spaces", label: "Spaces", glyph: "▣" },
+/**
+ * The navigation follows the one path data takes through the platform:
+ * a connection syncs a view into a dataset on a schedule, object types are
+ * created from datasets, metrics, functions and actions are defined on them,
+ * and dashboards and the assistant use the result.
+ *
+ * An entry with `browse` opens that resource kind's list-and-data page and
+ * carries its count for the current space.
+ */
+type NavEntry =
+	| { section: string }
+	| { to: string; label: string; glyph: string; exact?: boolean; browse?: ResourceKindName };
+
+type ResourceKindName = (typeof BROWSE_KINDS)[number]["kind"];
+
+const NAV: NavEntry[] = [
+	{ section: "Data" },
+	{ to: "/browse/connections", label: "Connections", glyph: "⛁", browse: "connection" },
+	{ to: "/browse/datasets", label: "Datasets", glyph: "▤", browse: "dataset" },
+	{ to: "/schedules", label: "Schedules", glyph: "⏱" },
 	{ section: "Ontology" },
 	{ to: "/", label: "Overview", glyph: "◈", exact: true },
 	{ to: "/ontology", label: "Object types", glyph: "◇" },
 	{ to: "/graph", label: "Graph", glyph: "◉" },
-	{ to: "/lineage", label: "Lineage", glyph: "⑃" },
-	{ to: "/pipeline", label: "Pipeline builder", glyph: "⑄" },
-	// Beside the pipeline builder, because it is the other way of describing
-	// how data becomes an ontology: one is drawn, the other is written down.
-	{ to: "/repos", label: "Repositories", glyph: "⌥" },
-	// One entry per resource kind, each opening a list-and-data page like
-	// Object Explorer. These used to be an inline panel that expanded every
-	// kind under the navigation, which buried it; a kind's name is not the
-	// useful part, its data is.
-	{ panel: "browse" as const },
-	{ section: "Work" },
-	{ to: "/explorer", label: "Object explorer", glyph: "▤" },
-	{ to: "/dashboards", label: "Dashboards", glyph: "▦" },
-	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ to: "/explorer", label: "Object explorer", glyph: "▦" },
+	{ section: "Logic" },
+	{ to: "/browse/metrics", label: "Metrics", glyph: "Σ", browse: "kpi" },
 	{ to: "/functions", label: "Functions", glyph: "ƒ" },
-	// The two ways work keeps happening without someone watching: a cadence
-	// that fires itself, and a regression contract that scores what did.
-	{ to: "/schedules", label: "Schedules", glyph: "⏱" },
-	{ to: "/evals", label: "Evals", glyph: "✓" },
+	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ section: "Apps" },
+	{ to: "/dashboards", label: "Dashboards", glyph: "▥" },
 	{ section: "Assistant" },
 	{ to: "/assistant", label: "AI-FDE", glyph: "✦", exact: true },
 	{ to: "/assistant/cost", label: "Cost analysis", glyph: "$" },
+	{ section: "Workspace" },
+	{ to: "/spaces", label: "Spaces", glyph: "▣" },
 ];
 
 const TITLES: Record<string, string> = {
@@ -74,16 +77,12 @@ const TITLES: Record<string, string> = {
 	"/spaces": "Spaces",
 	"/ontology": "Object types",
 	"/graph": "Ontology graph",
-	"/lineage": "Data lineage",
-	"/pipeline": "Pipeline builder",
-	"/repos": "Code repositories",
 	"/explorer": "Object explorer",
 	"/dashboards": "Dashboards",
 	"/dashboards/history": "Dashboard history",
 	"/actions": "Actions",
 	"/functions": "Functions",
 	"/schedules": "Schedules",
-	"/evals": "Eval suites",
 	"/assistant": "AI-FDE assistant",
 	"/assistant/cost": "Assistant cost analysis",
 };
@@ -145,54 +144,20 @@ function RailBrand({ connected }: { connected: boolean }) {
 }
 
 /** A nav badge counting what its link leads to, in the current space. */
-function RailCount({
-	of,
-	title,
-}: {
-	of: "objectTypes" | "linkTypes";
-	title: string;
-}) {
+function RailCount({ entry }: { entry: Extract<NavEntry, { to: string }> }) {
 	const { space } = useSpace();
-	// No badge at all rather than a zero: an empty space has nothing to count,
-	// and a "0" beside every link reads as a failure to load.
-	if (!space?.ontology) return null;
-	return (
-		<span className="count" title={title}>
-			{space.ontology[of]}
-		</span>
-	);
-}
-
-/**
- * The resource kinds in the nav, each with a count for the current space.
- *
- * The count is omitted while loading rather than shown as 0: a badge reading
- * "Datasets 0" for half a second reads as "you have no datasets".
- */
-function RailBrowse() {
-	const { counts, projectName } = useResources();
-	return (
-		<>
-			<div className="rail-subsection" title="The resources registered in this space">
-				{projectName ?? "Workspace"}
-			</div>
-			{BROWSE_KINDS.map((item) => (
-				<NavLink
-					key={item.slug}
-					to={`/browse/${item.slug}`}
-					className={({ isActive }) => `rail-link rail-link-sub ${isActive ? "active" : ""}`}
-				>
-					<span className="glyph" aria-hidden style={{ color: RESOURCE_SPECS[item.kind].accent }}>
-						{RESOURCE_SPECS[item.kind].glyph}
-					</span>
-					<span>{item.label}</span>
-					{counts && (counts[item.kind] ?? 0) > 0 && (
-						<span className="count">{counts[item.kind]}</span>
-					)}
-				</NavLink>
-			))}
-		</>
-	);
+	const { counts } = useResources();
+	// No badge rather than a zero: an empty space has nothing to count, and a
+	// "0" beside every link reads as a failure to load.
+	const count = entry.browse
+		? (counts?.[entry.browse] ?? 0)
+		: entry.to === "/ontology"
+			? (space?.ontology?.objectTypes ?? 0)
+			: entry.to === "/graph"
+				? (space?.ontology?.linkTypes ?? 0)
+				: 0;
+	if (!count) return null;
+	return <span className="count">{count}</span>;
 }
 
 function AppShell() {
@@ -258,9 +223,7 @@ function AppShell() {
 
 				<div className="rail-nav">
 					{NAV.map((entry, index) =>
-						"panel" in entry ? (
-							<RailBrowse key={`panel-${index}`} />
-						) : "section" in entry ? (
+						"section" in entry ? (
 							<div className="rail-section" key={`section-${index}`}>
 								{entry.section}
 							</div>
@@ -275,11 +238,7 @@ function AppShell() {
 									{entry.glyph}
 								</span>
 								<span>{entry.label}</span>
-								{/* Each badge counts the thing its own link leads to. The
-								    dashboards badge used to show health.kpis, so it read as
-								    "31 dashboards" when 31 was the number of metrics. */}
-								{entry.to === "/ontology" && <RailCount of="objectTypes" title="Object types" />}
-								{entry.to === "/graph" && <RailCount of="linkTypes" title="Link types" />}
+								<RailCount entry={entry} />
 							</NavLink>
 						),
 					)}
@@ -336,24 +295,15 @@ function AppShell() {
 					<GlobalSearch />
 				</header>
 
-				{/* The builder is a full-bleed canvas: it needs the padding and the
-				    max-width off, and its own scrolling rather than the page's. */}
-				<div className={`content${location.pathname === "/pipeline" ? " content-flush" : ""}`}>
+				<div className="content">
 					<div
 						className="content-wide"
-						style={{
-							height:
-								location.pathname === "/assistant" || location.pathname === "/pipeline"
-									? "100%"
-									: undefined,
-						}}
+						style={{ height: location.pathname === "/assistant" ? "100%" : undefined }}
 					>
 						<Routes>
 							<Route path="/" element={<Overview />} />
 							<Route path="/ontology" element={<OntologyManager />} />
 							<Route path="/graph" element={<GraphView />} />
-							<Route path="/lineage" element={<LineagePage />} />
-							<Route path="/pipeline" element={<PipelineBuilder />} />
 							<Route path="/spaces" element={<Spaces />} />
 							<Route path="/explorer" element={<ObjectExplorer />} />
 							<Route path="/dashboards" element={<DashboardList />} />
@@ -362,10 +312,7 @@ function AppShell() {
 							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
 							<Route path="/actions" element={<Actions />} />
 							<Route path="/functions" element={<Functions />} />
-								<Route path="/schedules" element={<Schedules />} />
-								<Route path="/evals" element={<Evals />} />
-							<Route path="/repos" element={<RepoList />} />
-							<Route path="/repos/:slug" element={<RepoDetail />} />
+							<Route path="/schedules" element={<Schedules />} />
 							<Route path="/browse/:kind" element={<ResourceBrowser />} />
 							<Route path="/assistant" element={<Assistant />} />
 							{/* Before nothing else, but listed after /assistant so the exact

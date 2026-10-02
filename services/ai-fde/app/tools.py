@@ -1,24 +1,29 @@
 """The assistant's tools: its entire access to the platform.
 
-Two families live here. The domain tools call the ontology service: the
-assistant has no database connection and cannot write SQL, which is the point -
-it can only ask questions the ontology already knows how to answer, so a wrong
-answer is a wrong choice of metric rather than a wrong query. The capability
-tools (modes, plans, notepad, context management - the assistant managing
-itself, per the Palantir AI-FDE prompt) live in capability_tools.py and are
-merged into the same registry below.
+Two families live here. The domain tools call the ontology service with the
+signed-in user's token: the assistant has no database connection and cannot
+write SQL against the platform, so what it can do is exactly what that user can
+do through the API - and every write it makes is checked by the same rules a
+person's form is. The capability tools (modes, plans, notepad, context
+management - the assistant managing itself, per the Palantir AI-FDE prompt)
+live in capability_tools.py and are merged into the same registry below.
+
+The domain tools follow the platform's one path:
+
+    connection -> sync (scheduled) -> dataset -> object type -> links,
+                                                 actions, metrics, functions
 
 Two design decisions that shape everything here:
 
 RESULTS ARE TRIMMED FOR CONTEXT, NOT FOR TRUTH. A 500-row object search would
-swamp a 7B model's context and push the ontology description out of it. Tools cap
-rows and say so explicitly in the payload ("showing 20 of 738"), so the model
-knows it is looking at a sample and can say so too.
+swamp the context and push the ontology description out of it. Tools cap rows
+and say so explicitly in the payload ("showing 20 of 738"), so the model knows
+it is looking at a sample and can say so too.
 
-ERRORS ARE RETURNED, NOT RAISED. A tool that fails hands the model the error text
-and, where the service provided one, the list of valid alternatives. That turns a
-dead turn into a self-correction: asked for a dimension that does not exist, the
-model gets told which ones do and retries.
+ERRORS ARE RETURNED, NOT RAISED. A tool that fails hands the model the error
+text and, where the service provided one, the list of valid alternatives. That
+turns a dead turn into a self-correction: asked for a primary key that is not
+unique, the model is told which columns are, and retries.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ log = logging.getLogger("ai_fde.tools")
 MAX_OBJECT_ROWS = 20
 MAX_AGGREGATE_ROWS = 25
 MAX_SERIES_POINTS = 30
+MAX_CATALOGUE_ROWS = 80
 
 
 def _truncate(rows: list[Any], cap: int, total: int | None = None) -> dict[str, Any]:
@@ -63,7 +69,12 @@ def _truncate(rows: list[Any], cap: int, total: int | None = None) -> dict[str, 
     return payload
 
 
-# ── tool implementations ────────────────────────────────────────────────────
+def _clean(values: dict[str, Any]) -> dict[str, Any]:
+    """Drop keys the model left empty, so the service applies its defaults."""
+    return {key: value for key, value in values.items() if value not in (None, "", [], {})}
+
+
+# ── reading the ontology ────────────────────────────────────────────────────
 
 async def list_object_types(_: dict[str, Any]) -> dict[str, Any]:
     types = await client.get("/api/object-types")
@@ -72,15 +83,18 @@ async def list_object_types(_: dict[str, Any]) -> dict[str, Any]:
             {
                 "apiName": t["apiName"],
                 "label": t["label"],
-                "group": t["group"],
                 "objects": t["rowCount"],
                 "properties": t["propertyCount"],
                 "measures": t["measureCount"],
                 "links": t["linkCount"],
+                "dataset": t["sourceView"],
                 "description": t["description"],
             }
             for t in types
-        ]
+        ],
+        "note": None
+        if types
+        else "No object types yet. They are created from datasets: see list_datasets.",
     }
 
 
@@ -88,16 +102,17 @@ async def describe_object_type(arguments: dict[str, Any]) -> dict[str, Any]:
     api_name = str(arguments.get("objectType") or arguments.get("apiName") or "")
     if not api_name:
         raise ToolError("objectType is required.")
-    detail = await client.get(f"/api/object-types/{api_name}")
+    detail = await client.get(f"/api/object-types/{quote(api_name)}")
     # Properties are grouped by semantic role rather than listed flat: the model
-    # needs to know what it may aggregate versus group by, and a flat list of 68
-    # properties does not convey that.
+    # needs to know what it may aggregate versus group by, and a flat list of 70
+    # properties does not convey that. The column is included because a
+    # function's SQL, a metric's condition and a link are written against it.
     by_role: dict[str, list[dict[str, Any]]] = {}
     for prop in detail["properties"]:
         by_role.setdefault(prop["semanticRole"], []).append(
             {
                 "apiName": prop["apiName"],
-                "label": prop["label"],
+                "column": prop["sqlColumn"],
                 "type": prop["datatype"],
                 **({"unit": prop["unit"]} if prop.get("unit") else {}),
                 **(
@@ -112,7 +127,7 @@ async def describe_object_type(arguments: dict[str, Any]) -> dict[str, Any]:
         "label": detail["label"],
         "description": detail["description"],
         "objects": detail["rowCount"],
-        "sourceView": detail["sourceView"],
+        "dataset": detail["sourceView"],
         "propertiesByRole": by_role,
         "links": [
             {
@@ -134,7 +149,7 @@ async def describe_object_type(arguments: dict[str, Any]) -> dict[str, Any]:
             }
             for action in detail["actions"]
         ],
-        "relatedKpis": [k["apiName"] for k in detail["kpis"]],
+        "metrics": [k["apiName"] for k in detail["kpis"]],
     }
 
 
@@ -150,7 +165,7 @@ async def search_objects(arguments: dict[str, Any]) -> dict[str, Any]:
         "limit": min(int(arguments.get("limit") or MAX_OBJECT_ROWS), MAX_OBJECT_ROWS),
         "includeLinkTitles": True,
     }
-    result = await client.post(f"/api/objects/{api_name}/search", body)
+    result = await client.post(f"/api/objects/{quote(api_name)}/search", body)
     payload = _truncate(result["data"], MAX_OBJECT_ROWS, result["totalCount"])
     payload["objectType"] = result["objectType"]
     payload["matchingObjects"] = result["totalCount"]
@@ -169,7 +184,7 @@ async def aggregate_objects(arguments: dict[str, Any]) -> dict[str, Any]:
         "orderBy": arguments.get("orderBy"),
         "limit": min(int(arguments.get("limit") or MAX_AGGREGATE_ROWS), MAX_AGGREGATE_ROWS),
     }
-    result = await client.post(f"/api/objects/{api_name}/aggregate", body)
+    result = await client.post(f"/api/objects/{quote(api_name)}/aggregate", body)
     payload = _truncate(result["rows"], MAX_AGGREGATE_ROWS)
     payload["objectType"] = result["objectType"]
     payload["groupBy"] = result["groupBy"]
@@ -183,7 +198,8 @@ async def traverse_link(arguments: dict[str, Any]) -> dict[str, Any]:
     if not (api_name and key and link):
         raise ToolError("objectType, objectKey and linkApiName are all required.")
     result = await client.get(
-        f"/api/objects/{api_name}/{key}/links/{link}", params={"limit": MAX_OBJECT_ROWS}
+        f"/api/objects/{quote(api_name)}/{quote(key)}/links/{quote(link)}",
+        params={"limit": MAX_OBJECT_ROWS},
     )
     payload = _truncate(result["data"], MAX_OBJECT_ROWS, result["totalCount"])
     payload["linkedObjectType"] = result["targetObjectType"]
@@ -199,11 +215,13 @@ async def traverse_link(arguments: dict[str, Any]) -> dict[str, Any]:
 async def list_kpis(arguments: dict[str, Any]) -> dict[str, Any]:
     catalogue = await client.get("/api/kpis/catalogue")
     category = arguments.get("category")
+    categories = sorted({k["category"] for k in catalogue})
     if category:
         catalogue = [k for k in catalogue if k["category"] == str(category).lower()]
     return {
         "kpis": catalogue,
-        "categories": sorted({k["category"] for k in await client.get("/api/kpis/catalogue")}),
+        "categories": categories,
+        "note": None if catalogue else "No metrics yet. create_metric defines one over an object type.",
     }
 
 
@@ -218,7 +236,7 @@ async def execute_kpi(arguments: dict[str, Any]) -> dict[str, Any]:
         "sort": arguments.get("sort") or "value_desc",
         "totalOnly": bool(arguments.get("totalOnly")),
     }
-    result = await client.post(f"/api/kpis/{api_name}/execute", body)
+    result = await client.post(f"/api/kpis/{quote(api_name)}/execute", body)
     payload: dict[str, Any] = {
         "kpi": result["kpi"],
         "label": result["label"],
@@ -227,56 +245,18 @@ async def execute_kpi(arguments: dict[str, Any]) -> dict[str, Any]:
         "format": result["valueFormat"],
         "dimension": result["dimension"],
         "series": result["series"][:MAX_SERIES_POINTS],
+        "conditions": result.get("conditions") or {},
         "target": result["target"],
         "higherIsBetter": result["higherIsBetter"],
     }
     # The caveat travels with the number so it cannot be quoted without it.
     if result["dependsOnSimulation"]:
         payload["dataQualityCaveat"] = result["coverageNote"] or (
-            "This metric rests on simulated execution data, not measured data."
+            "This metric is flagged as resting on generated data, not measured data."
         )
     if len(result["series"]) > MAX_SERIES_POINTS:
         payload["note"] = f"Showing the top {MAX_SERIES_POINTS} of {len(result['series'])} groups."
     return payload
-
-
-async def get_data_coverage(_: dict[str, Any]) -> dict[str, Any]:
-    stats = await client.get("/api/stats")
-    return {
-        "coverage": [
-            {
-                "metricArea": row["metric_area"],
-                "objectType": row["object_type"],
-                "totalRows": row["total_rows"],
-                "rowsFromSource": row["rows_from_source"],
-                "rowsSimulated": row["rows_simulated"],
-                "sourceCoveragePct": row["source_coverage_pct"],
-                "note": row["note"],
-            }
-            for row in stats["dataCoverage"]
-        ],
-        "guidance": (
-            "Metric areas below 100% source coverage rest partly or wholly on the "
-            "execution data this snapshot does not carry. Say so whenever you quote a "
-            "figure from one of them."
-        ),
-    }
-
-
-async def get_exceptions(_: dict[str, Any]) -> dict[str, Any]:
-    stats = await client.get("/api/stats")
-    return {
-        "exceptions": [
-            {
-                "type": row["exception_type"],
-                "objectType": row["object_type"],
-                "severity": row["severity"],
-                "count": row["item_count"],
-                "description": row["description"],
-            }
-            for row in stats["exceptions"]
-        ]
-    }
 
 
 async def list_dashboards(_: dict[str, Any]) -> dict[str, Any]:
@@ -354,6 +334,7 @@ async def list_actions(_: dict[str, Any]) -> dict[str, Any]:
                 "readOnly": a["isReadOnly"],
                 "requiresApproval": a["requiresApproval"],
                 "targets": a["targetObjectTypes"],
+                "allowedRoles": a.get("allowedRoles") or [],
                 "parameters": [
                     {
                         "name": p.get("name"),
@@ -366,10 +347,9 @@ async def list_actions(_: dict[str, Any]) -> dict[str, Any]:
             for a in actions
         ],
         "guidance": (
-            "Every action here mutates, so you may invoke none of them: propose one "
-            "to the user and let them run it. A read-only action - one that computes "
-            "and returns a result rather than being staged - you could invoke "
-            "yourself, but the catalogue currently holds none."
+            "Actions that change something are staged, and you may run none of them: "
+            "describe one to the user and let them run it from the Actions page. A "
+            "read-only action - one that computes and returns a result - you could run."
         ),
     }
 
@@ -380,9 +360,8 @@ async def apply_action(arguments: dict[str, Any]) -> dict[str, Any]:
         raise ToolError("action is required.")
     parameters = arguments.get("parameters") or {}
 
-    # The agent runs as an analyst, so the ontology service refuses any mutating
-    # action on RBAC grounds. Checking here as well means the model gets a clear
-    # explanation instead of a bare 403, and cannot spend a round finding out.
+    # Checked here as well as by the service, so the model gets a clear
+    # explanation instead of a bare 403 and cannot spend a round finding out.
     catalogue = await client.get("/api/action-types")
     meta = next((a for a in catalogue if a["apiName"].lower() == api_name.lower()), None)
     if meta is None:
@@ -400,17 +379,13 @@ async def apply_action(arguments: dict[str, Any]) -> dict[str, Any]:
             "message": (
                 f"{meta['label']} changes operational data, so it is not something to "
                 "run from a conversation. Describe to the user what it would do and "
-                "with which parameters, and tell them they can run it from the Actions "
-                "panel on the object."
+                "with which parameters, and tell them they can run it from the Actions page."
             ),
         }
 
-    # actor and actorRole used to be sent from here as "ai-fde" plus a default
-    # role. The ontology service now takes both from the forwarded token, so
-    # the action runs as the signed-in user with their own ontology role, and
+    # The action runs as the signed-in user with their own ontology role, and
     # the audit row names a person rather than the assistant. initiatedByAi
-    # still travels in the body: it records how the request arrived and grants
-    # nothing on its own.
+    # records how the request arrived and grants nothing on its own.
     outcome = await client.post(
         f"/api/actions/{meta['apiName']}/apply",
         {
@@ -425,34 +400,6 @@ async def apply_action(arguments: dict[str, Any]) -> dict[str, Any]:
         "action": outcome["action"],
         "message": outcome["message"],
         "result": outcome["result"],
-    }
-
-
-async def get_lineage(arguments: dict[str, Any]) -> dict[str, Any]:
-    object_type = arguments.get("objectType")
-    kpi = arguments.get("kpi")
-    if not object_type and not kpi:
-        raise ToolError("Give either objectType or kpi.")
-
-    path = f"/api/lineage/kpi/{kpi}" if kpi else f"/api/lineage/object-type/{object_type}"
-    result = await client.get(path)
-    trace = result["trace"]
-
-    # The full trace is ~96 nodes. Summarised by layer, because "which endpoint and
-    # which table" is the answer being asked for, not the whole subgraph.
-    by_layer: dict[str, list[str]] = {}
-    for node in trace["nodes"]:
-        by_layer.setdefault(node["layer"] or "unknown", []).append(node["label"])
-    return {
-        "subject": kpi or object_type,
-        "upstreamByLayer": {
-            layer: sorted(set(labels))[:12] for layer, labels in by_layer.items()
-        },
-        "nodeCount": len(trace["nodes"]),
-        "sourceColumns": [
-            f"{row['source_table']}.{row['source_column']}" for row in result["columns"][:25]
-        ],
-        "sourceColumnCount": len(result["columns"]),
     }
 
 
@@ -477,8 +424,349 @@ async def global_search(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ── tool schemas handed to the model ───────────────────────────────────────
+# ── bringing data in ────────────────────────────────────────────────────────
 
+async def list_connections(_: dict[str, Any]) -> dict[str, Any]:
+    rows = await client.get("/api/connections")
+    return {
+        "connections": [
+            {
+                "connectionId": c["id"],
+                "name": c["name"],
+                "database": c["properties"].get("database"),
+                "host": c["properties"].get("host"),
+                "syncs": c["syncCount"],
+                "lastTest": (c["properties"].get("lastTest") or {}).get("detail"),
+            }
+            for c in rows
+        ]
+    }
+
+
+async def list_source_views(arguments: dict[str, Any]) -> dict[str, Any]:
+    connection_id = arguments.get("connectionId")
+    if connection_id is None:
+        raise ToolError("connectionId is required - call list_connections first.")
+    catalog = await client.get(f"/api/resources/{int(connection_id)}/catalog")
+    schema = str(arguments.get("schema") or "").strip()
+    relations = [r for r in catalog["relations"] if not schema or r["schema"] == schema]
+    views = [
+        {
+            "schema": r["schema"],
+            "name": r["name"],
+            "kind": r["kind"],
+            **({"estimatedRows": r["estimatedRows"]} if r["estimatedRows"] is not None else {}),
+        }
+        for r in relations
+    ]
+    payload = _truncate(views, MAX_CATALOGUE_ROWS)
+    payload["connection"] = catalog["connection"]
+    payload["schemas"] = sorted({r["schema"] for r in catalog["relations"]})
+    return payload
+
+
+def _sync_summary(sync: dict[str, Any]) -> dict[str, Any]:
+    last = sync.get("lastRun") or {}
+    schedule = sync.get("schedule")
+    return {
+        "syncId": sync["id"],
+        "source": f"{sync['sourceSchema']}.{sync['sourceTable']}",
+        "dataset": sync["targetRelation"],
+        "connection": sync["connectionName"],
+        "schedule": f"every {schedule['intervalSeconds']}s" if schedule else "manual",
+        "lastRun": last.get("status"),
+        "rows": last.get("rowsAfter"),
+        "truncated": last.get("truncated"),
+    }
+
+
+async def list_syncs(_: dict[str, Any]) -> dict[str, Any]:
+    return {"syncs": [_sync_summary(s) for s in await client.get("/api/syncs")]}
+
+
+async def create_sync(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Define a sync, run it once so the dataset exists, and set its cadence.
+
+    One tool for the whole step because the three are one intention: "bring
+    this view in, and keep it fresh". Each part reports separately, so a sync
+    that was created but whose first run failed says exactly that.
+    """
+    connection_id = arguments.get("connectionId")
+    schema = str(arguments.get("sourceSchema") or "").strip()
+    table = str(arguments.get("sourceTable") or "").strip()
+    if connection_id is None or not schema or not table:
+        raise ToolError("connectionId, sourceSchema and sourceTable are required.")
+
+    sync = await client.post(
+        f"/api/resources/{int(connection_id)}/syncs",
+        _clean({"sourceSchema": schema, "sourceTable": table, "rowLimit": arguments.get("rowLimit")}),
+    )
+    outcome: dict[str, Any] = {"created": True, "syncId": sync["id"], "dataset": sync["targetRelation"]}
+
+    try:
+        ran = await client.post(f"/api/syncs/{sync['id']}/run", {})
+        outcome["run"] = {
+            "status": ran["run"]["status"],
+            "rows": ran["run"]["rowsAfter"],
+            "truncated": ran["run"]["truncated"],
+            "widenedColumns": ran["widenedColumns"],
+        }
+    except ToolError as exc:
+        outcome["run"] = {"status": "failed", "error": str(exc)}
+
+    every = arguments.get("every")
+    if every:
+        try:
+            scheduled = await client.post(f"/api/syncs/{sync['id']}/schedule", {"every": every})
+            outcome["schedule"] = (scheduled.get("schedule") or {}).get("every", "manual")
+        except ToolError as exc:
+            outcome["schedule"] = {"error": str(exc)}
+    else:
+        outcome["schedule"] = "manual - it refreshes only when run"
+    return outcome
+
+
+async def run_sync(arguments: dict[str, Any]) -> dict[str, Any]:
+    sync_id = arguments.get("syncId")
+    if sync_id is None:
+        raise ToolError("syncId is required - call list_syncs first.")
+    ran = await client.post(f"/api/syncs/{int(sync_id)}/run", {})
+    return {
+        "status": ran["run"]["status"],
+        "rowsBefore": ran["run"]["rowsBefore"],
+        "rowsAfter": ran["run"]["rowsAfter"],
+        "truncated": ran["run"]["truncated"],
+        "objectTypesRefreshed": ran.get("objectTypesRefreshed"),
+        "brokenProperties": ran.get("brokenProperties") or [],
+    }
+
+
+async def schedule_sync(arguments: dict[str, Any]) -> dict[str, Any]:
+    sync_id = arguments.get("syncId")
+    every = arguments.get("every")
+    if sync_id is None or not every:
+        raise ToolError("syncId and every are required, e.g. every='2h' or 'manual'.")
+    result = await client.post(f"/api/syncs/{int(sync_id)}/schedule", {"every": every})
+    schedule = result.get("schedule")
+    return {
+        "syncId": int(sync_id),
+        "schedule": schedule["every"] if schedule else "manual",
+        "nextRunAt": schedule["nextRunAt"] if schedule else None,
+    }
+
+
+# ── building the ontology ───────────────────────────────────────────────────
+
+async def list_datasets(_: dict[str, Any]) -> dict[str, Any]:
+    datasets = await client.get("/api/datasets")
+    return {
+        "datasets": [
+            {
+                "dataset": d["relation"],
+                "name": d["name"],
+                "source": d["source"],
+                "rows": d["rowCount"],
+                "columns": d["columnCount"],
+                "lastSyncedAt": d["lastSyncedAt"],
+                "objectTypes": d["objectTypes"],
+            }
+            for d in datasets
+        ],
+        "note": (
+            "A dataset with no objectTypes has not been modelled yet."
+            if datasets
+            else "Nothing has been synced yet. Sync a view from a connection first (dataConnection mode)."
+        ),
+    }
+
+
+async def profile_dataset(arguments: dict[str, Any]) -> dict[str, Any]:
+    dataset = str(arguments.get("dataset") or "").strip()
+    if not dataset:
+        raise ToolError("dataset is required - its name or connection_raw.<table> from list_datasets.")
+    profile = await client.get(f"/api/datasets/{quote(dataset, safe='')}/profile")
+    return {
+        "dataset": profile["dataset"]["relation"],
+        "source": profile["dataset"]["source"],
+        "rows": profile["rowCount"],
+        "sampled": profile["sampled"],
+        "primaryKeyCandidates": profile["primaryKeyCandidates"],
+        "suggestion": profile["suggestion"],
+        "existingObjectTypes": profile["existingObjectTypes"],
+        # One compact line per column: what it is, how full, and the role the
+        # data suggests. Empty columns are flagged so they are not modelled as
+        # though the source carried them.
+        "columns": [
+            {
+                "column": c["column"],
+                "type": c["sqlType"],
+                "distinct": c["distinct"],
+                "nulls": c["nulls"],
+                **({"empty": True} if c.get("empty") else {}),
+                "role": c["suggested"]["semanticRole"],
+                **(
+                    {"aggregate": c["suggested"]["defaultAggregation"]}
+                    if c["suggested"]["defaultAggregation"]
+                    else {}
+                ),
+                # Two short samples are enough to recognise a column; more is
+                # context a seventy-column dataset cannot spare.
+                **({"samples": [str(v)[:40] for v in c["samples"][:2]]} if c["samples"] else {}),
+            }
+            for c in profile["columns"]
+        ],
+    }
+
+
+async def create_object_type(arguments: dict[str, Any]) -> dict[str, Any]:
+    if not arguments.get("dataset"):
+        raise ToolError("dataset is required - call list_datasets, then profile_dataset.")
+    body = _clean(
+        {
+            "dataset": arguments.get("dataset"),
+            "apiName": arguments.get("apiName"),
+            "label": arguments.get("label"),
+            "pluralLabel": arguments.get("pluralLabel"),
+            "description": arguments.get("description"),
+            "primaryKey": arguments.get("primaryKey"),
+            "titleColumn": arguments.get("titleColumn"),
+            "group": arguments.get("group"),
+            "properties": arguments.get("properties"),
+            "excludeColumns": arguments.get("excludeColumns"),
+        }
+    )
+    created = await client.post("/api/ontology/object-types", body)
+    roles: dict[str, int] = {}
+    for prop in created["properties"]:
+        roles[prop["role"]] = roles.get(prop["role"], 0) + 1
+    return {
+        "created": True,
+        "objectType": created["apiName"],
+        "dataset": created["dataset"],
+        "objects": created["objects"],
+        "primaryKey": created["primaryKey"],
+        "titleColumn": created["titleColumn"],
+        "propertiesByRole": roles,
+        "measures": [p["apiName"] for p in created["properties"] if p["role"] == "measure"],
+    }
+
+
+async def suggest_links(arguments: dict[str, Any]) -> dict[str, Any]:
+    params = {"objectType": arguments["objectType"]} if arguments.get("objectType") else None
+    suggestions = await client.get("/api/ontology/link-suggestions", params=params)
+    return {
+        "suggestions": suggestions,
+        "note": (
+            "Each is measured against the data: matchRatio is the share of values that "
+            "really resolve. Nothing has been created - call create_link_type for the ones "
+            "worth keeping."
+            if suggestions
+            else "No candidate links: no column in one object type is named for another's key."
+        ),
+    }
+
+
+async def create_link_type(arguments: dict[str, Any]) -> dict[str, Any]:
+    body = _clean(
+        {
+            "apiName": arguments.get("apiName"),
+            "label": arguments.get("label"),
+            "description": arguments.get("description"),
+            "sourceObjectType": arguments.get("sourceObjectType"),
+            "sourceProperty": arguments.get("sourceProperty"),
+            "targetObjectType": arguments.get("targetObjectType"),
+            "targetProperty": arguments.get("targetProperty"),
+            "cardinality": arguments.get("cardinality"),
+            "inverseApiName": arguments.get("inverseApiName"),
+            "inverseLabel": arguments.get("inverseLabel"),
+        }
+    )
+    created = await client.post("/api/ontology/link-types", body)
+    link = created.get("link") or {}
+    return {
+        "created": True,
+        "link": link.get("apiName"),
+        "inverse": link.get("inverseApiName"),
+        "matched": created["matched"],
+        "candidates": created["candidates"],
+        "matchRatio": round(created["matchRatio"], 4),
+    }
+
+
+async def create_metric(arguments: dict[str, Any]) -> dict[str, Any]:
+    body = _clean(
+        {
+            "apiName": arguments.get("apiName"),
+            "label": arguments.get("label"),
+            "description": arguments.get("description"),
+            "businessQuestion": arguments.get("businessQuestion"),
+            "category": arguments.get("category"),
+            "objectType": arguments.get("objectType"),
+            "aggregation": arguments.get("aggregation"),
+            "measure": arguments.get("measure"),
+            "numerator": arguments.get("numerator"),
+            "denominator": arguments.get("denominator"),
+            "dimensions": arguments.get("dimensions"),
+            "defaultDimension": arguments.get("defaultDimension"),
+            "timeProperty": arguments.get("timeProperty"),
+            "unit": arguments.get("unit"),
+            "valueFormat": arguments.get("valueFormat"),
+            "target": arguments.get("target"),
+        }
+    )
+    # where and higherIsBetter carry meaningful falsy values (false, 0), so they
+    # are passed whenever they were given at all.
+    if isinstance(arguments.get("where"), dict) and arguments["where"]:
+        body["where"] = arguments["where"]
+    if isinstance(arguments.get("higherIsBetter"), bool):
+        body["higherIsBetter"] = arguments["higherIsBetter"]
+    created = await client.post("/api/ontology/metrics", body)
+    return {
+        "created": True,
+        "metric": created["apiName"],
+        "objectType": created["objectType"],
+        "value": created["value"],
+        "unit": created.get("unit"),
+        "dimensions": created["dimensions"],
+        "conditions": created.get("conditions") or {},
+    }
+
+
+async def create_action_type(arguments: dict[str, Any]) -> dict[str, Any]:
+    body = _clean(
+        {
+            "apiName": arguments.get("apiName"),
+            "label": arguments.get("label"),
+            "description": arguments.get("description"),
+            "objectType": arguments.get("objectType"),
+            "parameters": arguments.get("parameters"),
+            "allowedRoles": arguments.get("allowedRoles"),
+            "approverRoles": arguments.get("approverRoles"),
+        }
+    )
+    if isinstance(arguments.get("requiresApproval"), bool):
+        body["requiresApproval"] = arguments["requiresApproval"]
+    created = await client.post("/api/ontology/action-types", body)
+    return {
+        "created": True,
+        "action": created["apiName"],
+        "objectType": created["objectType"],
+        "parameters": [p["name"] for p in created["parameters"]],
+        "allowedRoles": created["allowedRoles"],
+        "note": created.get("note"),
+    }
+
+
+async def delete_ontology_object(arguments: dict[str, Any]) -> dict[str, Any]:
+    kind = str(arguments.get("kind") or "").strip()
+    api_name = str(arguments.get("apiName") or "").strip()
+    if kind not in ("objectType", "linkType", "actionType", "metric") or not api_name:
+        raise ToolError("kind (objectType, linkType, actionType or metric) and apiName are required.")
+    await client.delete(f"/api/ontology/{kind}/{quote(api_name)}")
+    return {"deleted": True, "kind": kind, "apiName": api_name}
+
+
+# ── documentation, clarification, functions ─────────────────────────────────
 
 async def search_documentation(arguments: dict[str, Any]) -> dict[str, Any]:
     """Search the platform's documentation so a claim can be cited.
@@ -533,29 +821,25 @@ async def request_clarification(arguments: dict[str, Any]) -> dict[str, Any]:
         "allowFreeText": bool(arguments.get("allowFreeText", True)),
     }
 
+
 async def propose_function(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Draft a metric that does not exist yet, for a person to approve.
+    """Draft a function over datasets, for a person to approve.
 
-    The gap this closes: the assistant may not invent a KPI, so asked for
-    something the catalogue does not cover it can only say no and the
-    conversation dead-ends. This gives it a third option — write the
-    definition down and hand it over.
+    For what a metric cannot express - a ratio across two datasets, a
+    percentile, a derived figure. The draft is saved as `proposed`: it
+    computes nothing and nothing may use it until an admin approves it, so the
+    turn can carry on building around it without anything depending on it.
 
-    It is a TERMINAL step, like request_clarification. The draft is saved as
-    `proposed`, which computes nothing and cannot back a dashboard, and the
-    turn ends so the user can read it. Continuing would mean building a
-    dashboard on a metric nobody has approved, which is the exact thing the
-    proposal step exists to prevent.
-
-    The server validates the SQL before storing it, so a definition that will
-    not run is refused here rather than discovered by whoever approves it.
+    The server plans the SQL before storing it, and refuses a definition that
+    reads anything but synced datasets or does not run, so a guessed column
+    comes straight back with the database's own message.
     """
     name = str(arguments.get("name") or "").strip()
     definition = str(arguments.get("definition") or "").strip()
     if not name:
         raise ToolError("name is required.")
     if not definition:
-        raise ToolError("definition is required - the SQL the metric computes.")
+        raise ToolError("definition is required - the SQL the function computes.")
 
     payload = {
         "name": name,
@@ -574,82 +858,27 @@ async def propose_function(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         created = await client.post("/api/functions", payload)
     except ToolError as exc:
-        # The server refused the definition. Handed back rather than raised so
-        # the model can correct the SQL and try once more, which is usually a
-        # column name it guessed instead of looking up.
+        # Handed back rather than raised so the model can correct the SQL and
+        # try once more - usually a column it guessed instead of looking up.
         return {
             "functionProposed": False,
             "error": str(exc),
             "hint": (
-                "Fix the definition and call propose_function again. Use "
-                "describe_object_type or list_kpis first to get real column names."
+                "Fix the definition and call propose_function again. Read real column "
+                "names from profile_dataset or describe_object_type, and read FROM the "
+                "dataset relation (connection_raw.<table>)."
             ),
         }
 
     return {
         "functionProposed": True,
-        # The UI opens its review dialog on this flag; the payload is what it
-        # renders, including the two identifiers it must not let anyone edit.
+        # The UI renders a review card from this; the payload includes the two
+        # identifiers it must not let anyone edit.
         "function": created,
         "awaitingApproval": True,
         "note": (
-            "Saved as a PROPOSAL. It computes nothing and no dashboard can use it "
-            "until a person approves it. Tell the user what it measures and that "
-            "it is waiting for their approval."
-        ),
-    }
-
-
-async def propose_pipeline(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Draft a pipeline graph for a person to accept (§18).
-
-    Terminal, like propose_function and for the same reason. A pipeline that
-    runs writes real tables which dashboards and this assistant then read, so
-    a graph nobody has reviewed must not become a dataset because a sentence
-    asked for it.
-
-    The server compiles every node before storing the draft, so a filter on a
-    column that does not exist is refused here rather than discovered by the
-    reviewer.
-    """
-    name = str(arguments.get("name") or "").strip()
-    graph = arguments.get("graph")
-    if not name:
-        raise ToolError("name is required.")
-    if not isinstance(graph, dict) or not graph.get("nodes"):
-        raise ToolError("graph must be an object with a nodes array.")
-
-    payload = {
-        "name": name,
-        "description": str(arguments.get("description") or "").strip(),
-        "graph": graph,
-        "proposedFrom": str(arguments.get("proposedFrom") or "").strip() or None,
-    }
-
-    try:
-        created = await client.post("/api/pipelines/propose", payload)
-    except ToolError as exc:
-        # Handed back rather than raised, so the model can correct the graph.
-        # Usually a column it guessed instead of looking up.
-        return {
-            "pipelineProposed": False,
-            "error": str(exc),
-            "hint": (
-                "Fix the graph and call propose_pipeline again. Use "
-                "describe_object_type for real sqlColumn names, and remember a "
-                "source node needs sourceView set to a published view."
-            ),
-        }
-
-    return {
-        "pipelineProposed": True,
-        "pipeline": created.get("pipeline"),
-        "compiled": created.get("compiled"),
-        "awaitingAcceptance": True,
-        "note": (
-            "Saved as a PROPOSAL. Every node compiles, but nothing has run and it "
-            "cannot run until a person accepts it. Describe what it does and that "
-            "it is waiting for them."
+            "Saved as a PROPOSAL. It computes nothing until an admin approves it on the "
+            "Functions page. Tell the user what it measures and that it is waiting."
         ),
     }
 
@@ -658,7 +887,6 @@ TOOL_IMPLEMENTATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, A
     "search_documentation": search_documentation,
     "request_clarification": request_clarification,
     "propose_function": propose_function,
-    "propose_pipeline": propose_pipeline,
     "list_object_types": list_object_types,
     "describe_object_type": describe_object_type,
     "search_objects": search_objects,
@@ -666,14 +894,25 @@ TOOL_IMPLEMENTATIONS: dict[str, Callable[[dict[str, Any]], Awaitable[dict[str, A
     "traverse_link": traverse_link,
     "list_kpis": list_kpis,
     "execute_kpi": execute_kpi,
-    "get_data_coverage": get_data_coverage,
-    "get_exceptions": get_exceptions,
     "list_dashboards": list_dashboards,
     "create_dashboard": create_dashboard,
     "list_actions": list_actions,
     "apply_action": apply_action,
-    "get_lineage": get_lineage,
     "global_search": global_search,
+    "list_connections": list_connections,
+    "list_source_views": list_source_views,
+    "list_syncs": list_syncs,
+    "create_sync": create_sync,
+    "run_sync": run_sync,
+    "schedule_sync": schedule_sync,
+    "list_datasets": list_datasets,
+    "profile_dataset": profile_dataset,
+    "create_object_type": create_object_type,
+    "suggest_links": suggest_links,
+    "create_link_type": create_link_type,
+    "create_metric": create_metric,
+    "create_action_type": create_action_type,
+    "delete_ontology_object": delete_ontology_object,
 }
 
 # The capability tools (modes, plans, notepad, context) are part of the same
@@ -722,9 +961,63 @@ WIDGET_SCHEMA = {
     "required": ["type"],
 }
 
+PROPERTY_SPEC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "column": {"type": "string", "description": "The dataset column."},
+        "apiName": {"type": "string", "description": "camelCase; defaults from the column."},
+        "label": {"type": "string"},
+        "semanticRole": {
+            "type": "string",
+            "enum": [
+                "identity", "title", "measure", "dimension", "temporal",
+                "geo", "flag", "attribute", "provenance",
+            ],
+        },
+        "defaultAggregation": {"type": "string", "enum": ["sum", "avg", "count", "min", "max"]},
+        "unit": {"type": "string"},
+    },
+    "required": ["column"],
+}
+
+ACTION_PARAMETER_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "camelCase."},
+        "type": {
+            "type": "string",
+            "enum": ["string", "integer", "float", "decimal", "boolean", "date", "datetime"],
+        },
+        "label": {"type": "string"},
+        "description": {"type": "string"},
+        "required": {"type": "boolean"},
+        "enum": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Allowed values, when the parameter is a choice.",
+        },
+    },
+    "required": ["name"],
+}
+
+
+def _fn(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                **({"required": required} if required else {}),
+            },
+        },
+    }
+
 
 def tool_schemas() -> list[dict[str, Any]]:
-    """The OpenAI-style function schemas both providers accept."""
+    """The OpenAI-style function schemas the provider receives."""
     return _BASE_TOOL_SCHEMAS + CAPABILITY_TOOL_SCHEMAS
 
 
@@ -733,9 +1026,7 @@ def schemas_for(names: set[str]) -> list[dict[str, Any]]:
 
     The agent calls this once per round with the set derived from the
     conversation's mode and enabled capabilities. A model is only ever handed
-    the tools it may actually run: offering apply_action while the
-    executeAction capability is off would invite a refusal round instead of
-    preventing one.
+    the tools it may actually run.
     """
     return [schema for schema in tool_schemas() if schema["function"]["name"] in names]
 
@@ -743,485 +1034,366 @@ def schemas_for(names: set[str]) -> list[dict[str, Any]]:
 # The domain tool schemas, built once at import. The capability schemas are
 # appended by tool_schemas(); both are filtered per turn by schemas_for().
 _BASE_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    _fn(
+        "search_documentation",
+        "Search this platform's documentation for how something works - the data "
+        "flow, how object types, links, metrics and actions are checked, roles, "
+        "schedules, what the data measures. Use it before asserting how the "
+        "platform behaves, then cite the result.",
         {
-            "type": "function",
-            "function": {
-                "name": "search_documentation",
-                "description": (
-                    "Search this platform's documentation for a definition, a data-quality "
-                    "caveat, or how something behaves. Use it before asserting anything "
-                    "about how a metric is computed, what is simulated, how roles work or "
-                    "how actions behave - then cite the result."
-                ),
-                "parameters": {
+            "query": {"type": "string", "description": "What you need to know, in a few words."},
+            "limit": {"type": "integer", "description": "Max results, default 6."},
+        },
+        ["query"],
+    ),
+    _fn(
+        "request_clarification",
+        "Ask the user a question instead of guessing. Use this when the request "
+        "is genuinely ambiguous in a way that changes the answer. Do NOT use it for "
+        "something you could look up yourself. Calling it ends your turn.",
+        {
+            "question": {"type": "string", "description": "One specific question, in the user's language."},
+            "options": {
+                "type": "array",
+                "description": "Two to six concrete choices, taken from the data.",
+                "items": {
                     "type": "object",
                     "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "What you need to know, in a few words.",
-                        },
-                        "limit": {"type": "integer", "description": "Max results, default 6."},
+                        "label": {"type": "string"},
+                        "detail": {"type": "string", "description": "One short line on what this choice means."},
                     },
-                    "required": ["query"],
+                    "required": ["label"],
                 },
             },
+            "allowFreeText": {"type": "boolean", "description": "Whether a typed answer is also acceptable."},
         },
+        ["question"],
+    ),
+    # ── data ────────────────────────────────────────────────────────────────
+    _fn(
+        "list_connections",
+        "List the PostgreSQL connections in this space, with how many syncs each has.",
+        {},
+    ),
+    _fn(
+        "list_source_views",
+        "List the views and tables a connection can read - what could be synced.",
         {
-            "type": "function",
-            "function": {
-                "name": "propose_pipeline",
-                "description": (
-                    "Draft a data pipeline from a description, for a person to accept. "
-                    "Use this when the user asks you to BUILD or CREATE a pipeline. "
-                    "The draft is saved but inert: nothing runs until they accept it. "
-                    "Calling this ends your turn. "
-                    "Call describe_object_type first to get real sqlColumn names - a "
-                    "graph referencing a column that does not exist is refused."
-                ),
-                "parameters": {
+            "connectionId": {"type": "integer"},
+            "schema": {"type": "string", "description": "Only this schema, e.g. tms_views."},
+        },
+        ["connectionId"],
+    ),
+    _fn(
+        "list_syncs",
+        "List the syncs in this space: source view, dataset, schedule, last run and rows.",
+        {},
+    ),
+    _fn(
+        "create_sync",
+        "Sync a view (or table) from a connection into a dataset, exactly as it is: "
+        "defines the sync, runs it once, and optionally sets how often it refreshes.",
+        {
+            "connectionId": {"type": "integer"},
+            "sourceSchema": {"type": "string", "description": "e.g. tms_views"},
+            "sourceTable": {"type": "string", "description": "The view or table, e.g. v_order"},
+            "every": {
+                "type": "string",
+                "description": "How often to refresh: 20m, 2h, 1d, 8d, 1w. Omit for manual.",
+            },
+            "rowLimit": {"type": "integer", "description": "Max rows per run. Default 50,000."},
+        },
+        ["connectionId", "sourceSchema", "sourceTable"],
+    ),
+    _fn(
+        "run_sync",
+        "Run a sync now, rebuilding its dataset from the source. Reports rows before "
+        "and after, and any object-type property whose column the source dropped.",
+        {"syncId": {"type": "integer"}},
+        ["syncId"],
+    ),
+    _fn(
+        "schedule_sync",
+        "Set how often a sync runs: 20m, 2h, 1d, 8d, 1w, or 'manual' to stop it running on its own.",
+        {"syncId": {"type": "integer"}, "every": {"type": "string"}},
+        ["syncId", "every"],
+    ),
+    _fn(
+        "list_datasets",
+        "List the synced datasets: source view, rows, last sync, and which object "
+        "types are built on each. A dataset with no object types is not modelled yet.",
+        {},
+    ),
+    _fn(
+        "profile_dataset",
+        "Profile one dataset before modelling it: every column's type, distinct and "
+        "null counts, sample values, whether it is empty, and its suggested role; the "
+        "columns that could be a primary key; and a suggested object type name.",
+        {"dataset": {"type": "string", "description": "Name or connection_raw.<table> from list_datasets."}},
+        ["dataset"],
+    ),
+    # ── ontology building ───────────────────────────────────────────────────
+    _fn(
+        "create_object_type",
+        "Create an object type from a dataset, one property per column. Profile the "
+        "dataset first. primaryKey must be one of its primaryKeyCandidates. Omit "
+        "`properties` to take every column with its suggested role; pass properties "
+        "only to override a role, label or unit.",
+        {
+            "dataset": {"type": "string"},
+            "apiName": {"type": "string", "description": "PascalCase singular, e.g. Order."},
+            "label": {"type": "string"},
+            "pluralLabel": {"type": "string"},
+            "description": {"type": "string", "description": "What one object is, in business terms."},
+            "primaryKey": {"type": "string", "description": "A column that is unique and never null."},
+            "titleColumn": {"type": "string", "description": "The column a person recognises an object by."},
+            "group": {"type": "string", "description": "A domain to group it under, e.g. Demand, Network."},
+            "properties": {"type": "array", "items": PROPERTY_SPEC_SCHEMA},
+            "excludeColumns": {"type": "array", "items": {"type": "string"}},
+        },
+        ["dataset"],
+    ),
+    _fn(
+        "suggest_links",
+        "Find links the data supports between object types: columns named for "
+        "another type's key, each measured for how many values really resolve.",
+        {"objectType": {"type": "string", "description": "Only links from this type."}},
+    ),
+    _fn(
+        "create_link_type",
+        "Link two object types: a property of the source that holds the target's key. "
+        "The match ratio is measured; a link where nothing matches is refused.",
+        {
+            "apiName": {"type": "string", "description": "camelCase, e.g. orderAccount."},
+            "sourceObjectType": {"type": "string"},
+            "sourceProperty": {"type": "string"},
+            "targetObjectType": {"type": "string"},
+            "targetProperty": {"type": "string", "description": "Usually the target's primary key."},
+            "cardinality": {"type": "string", "enum": ["MANY_TO_ONE", "ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_MANY"]},
+            "label": {"type": "string"},
+            "inverseApiName": {"type": "string"},
+            "inverseLabel": {"type": "string"},
+        },
+        ["apiName", "sourceObjectType", "sourceProperty", "targetObjectType", "targetProperty"],
+    ),
+    _fn(
+        "create_metric",
+        "Define a metric over an object type. It is computed once before it is kept. "
+        "count needs no measure; sum/avg/min/max need a numeric measure; ratio needs a "
+        "numerator and denominator (sum over sum). `where` fixes a condition, e.g. "
+        "{\"isUnplanned\": true} counts only unplanned orders.",
+        {
+            "apiName": {"type": "string", "description": "snake_case, e.g. total_gross_weight_kg."},
+            "label": {"type": "string"},
+            "description": {"type": "string"},
+            "businessQuestion": {"type": "string"},
+            "category": {"type": "string", "description": "demand, service, finance, operations, network, data_quality"},
+            "objectType": {"type": "string"},
+            "aggregation": {"type": "string", "enum": ["count", "count_distinct", "sum", "avg", "min", "max", "ratio"]},
+            "measure": {"type": "string", "description": "Property to aggregate."},
+            "numerator": {"type": "string"},
+            "denominator": {"type": "string"},
+            "dimensions": {"type": "array", "items": {"type": "string"}, "description": "Properties it can be grouped by."},
+            "defaultDimension": {"type": "string"},
+            "timeProperty": {"type": "string"},
+            "where": {"type": "object", "description": "Property -> value (or list of values) always applied."},
+            "unit": {"type": "string"},
+            "valueFormat": {
+                "type": "string",
+                "enum": ["number", "integer", "currency", "percent", "duration_hours", "duration_days", "weight_kg", "distance_km"],
+            },
+            "higherIsBetter": {"type": "boolean"},
+            "target": {"type": "number"},
+        },
+        ["apiName", "objectType", "aggregation"],
+    ),
+    _fn(
+        "create_action_type",
+        "Declare an action on an object type - a verb a person runs on one object, "
+        "like HoldOrder. The object's key parameter is added for you. Running it "
+        "validates, checks the role and records the request; it is staged, not "
+        "written back.",
+        {
+            "apiName": {"type": "string", "description": "PascalCase verb + noun, e.g. HoldOrder."},
+            "label": {"type": "string"},
+            "description": {"type": "string", "description": "What it would do, in business terms."},
+            "objectType": {"type": "string"},
+            "parameters": {"type": "array", "items": ACTION_PARAMETER_SCHEMA},
+            "allowedRoles": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["OperationsManagerRole", "DispatcherRole", "FinanceRole"]},
+                "description": "Who may run it besides the admin. Default: OperationsManagerRole.",
+            },
+            "requiresApproval": {"type": "boolean"},
+        },
+        ["apiName", "objectType"],
+    ),
+    _fn(
+        "delete_ontology_object",
+        "Delete an object type, link, action or metric you created by mistake. Needs "
+        "the admin role; an object type with links, actions or metrics must lose those first.",
+        {
+            "kind": {"type": "string", "enum": ["objectType", "linkType", "actionType", "metric"]},
+            "apiName": {"type": "string"},
+        },
+        ["kind", "apiName"],
+    ),
+    _fn(
+        "propose_function",
+        "Draft a function for something a metric cannot express - a ratio across two "
+        "datasets, a percentile, a derived figure. Saved as a PROPOSAL that computes "
+        "nothing until an admin approves it. The SQL is one SELECT that reads only "
+        "datasets (FROM connection_raw.<table>), using real column names.",
+        {
+            "name": {"type": "string", "description": "Short business name, e.g. 'Average Weight Per Piece'."},
+            "description": {"type": "string"},
+            "businessQuestion": {"type": "string"},
+            "definition": {"type": "string", "description": "A single SELECT over datasets. No semicolons, no writes."},
+            "returns": {"type": "string", "enum": ["scalar", "table"]},
+            "unit": {"type": "string"},
+            "valueFormat": {
+                "type": "string",
+                "enum": ["number", "integer", "currency", "percent", "duration_hours", "duration_days", "weight_kg", "distance_km"],
+            },
+            "proposedFrom": {"type": "string", "description": "The user's own words that prompted this."},
+        },
+        ["name", "definition", "returns"],
+    ),
+    # ── reading and answering ──────────────────────────────────────────────
+    _fn(
+        "list_object_types",
+        "List every object type with its object count and the dataset it was created from.",
+        {},
+    ),
+    _fn(
+        "describe_object_type",
+        "Get one object type's properties grouped by semantic role (measure, "
+        "dimension, temporal, flag) with their columns, plus its links, actions and "
+        "metrics. Call this before searching or aggregating so you use real names.",
+        {"objectType": {"type": "string", "description": "e.g. Order, Shipment."}},
+        ["objectType"],
+    ),
+    _fn(
+        "search_objects",
+        "Find individual objects with filters and sorting. Use for questions about "
+        "specific records ('which orders are unplanned'), not for totals.",
+        {
+            "objectType": {"type": "string"},
+            "where": {"type": "array", "items": FILTER_CLAUSE_SCHEMA},
+            "search": {"type": "string", "description": "Free-text match on identifiers and names."},
+            "orderBy": {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Short business name for the pipeline."},
-                        "description": {"type": "string", "description": "What it produces and from what."},
-                        "proposedFrom": {
-                            "type": "string",
-                            "description": "The user's own words that prompted this.",
-                        },
-                        "graph": {
-                            "type": "object",
-                            "description": (
-                                "nodes[] and edges[]. Each node: id, kind, name, "
-                                "position{x,y}, config{}. Kinds that run SQL: dataSource "
-                                "(config.sourceView = a published view), filter "
-                                "(config.mode = filter|select|sort|dedupe|calculate|"
-                                "normalize|lookup|union), join, aggregate, sql, output. "
-                                "Each edge: id, source, target. Lay nodes left to "
-                                "right, 260px apart. An aggregate needs measures[] as "
-                                "well as groupBy[], each {aggregation, field, alias} - "
-                                "groupBy alone computes nothing."
-                            ),
-                            "properties": {
-                                "nodes": {"type": "array", "items": {"type": "object"}},
-                                "edges": {"type": "array", "items": {"type": "object"}},
-                            },
-                            "required": ["nodes", "edges"],
-                        },
+                        "property": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["asc", "desc"]},
                     },
-                    "required": ["name", "graph"],
+                    "required": ["property"],
                 },
             },
+            "select": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Properties to return. Omit for all; naming a few keeps results readable.",
+            },
+            "limit": {"type": "integer", "description": f"Max {MAX_OBJECT_ROWS}."},
         },
+        ["objectType"],
+    ),
+    _fn(
+        "aggregate_objects",
+        "Group objects and compute totals. Only properties whose semantic role is "
+        "'measure' can be summed or averaged. Prefer execute_kpi when a metric already "
+        "answers the question.",
         {
-            "type": "function",
-            "function": {
-                "name": "propose_function",
-                "description": (
-                    "Draft a NEW metric when the user needs one the KPI catalogue does "
-                    "not have. Call list_kpis first: if a published KPI already answers "
-                    "the question, use it instead of proposing a duplicate. "
-                    "The draft is saved as a PROPOSAL for a person to approve - it "
-                    "computes nothing and no dashboard can use it until they do. "
-                    "Calling this ends your turn. "
-                    "The SQL must be a single SELECT over views the ontology publishes; "
-                    "use describe_object_type to get real column names rather than "
-                    "guessing them."
-                ),
-                "parameters": {
+            "objectType": {"type": "string"},
+            "groupBy": {"type": "array", "items": {"type": "string"}},
+            "metrics": {
+                "type": "array",
+                "items": {
                     "type": "object",
                     "properties": {
-                        "name": {
+                        "property": {"type": "string"},
+                        "aggregation": {
                             "type": "string",
-                            "description": (
-                                "Short business name, e.g. 'Distance Travelled Per Month'. "
-                                "The permanent id and api name are derived from this by the "
-                                "server and cannot be set or changed afterwards."
-                            ),
+                            "enum": ["count", "countDistinct", "sum", "avg", "min", "max"],
                         },
-                        "description": {
-                            "type": "string",
-                            "description": "What it measures and any caveat about the data behind it.",
-                        },
-                        "businessQuestion": {
-                            "type": "string",
-                            "description": "The question a user would ask that this answers.",
-                        },
-                        "definition": {
-                            "type": "string",
-                            "description": (
-                                "A single SELECT over published views. No semicolons, no "
-                                "writes. For a scalar metric return one row and one column. "
-                                "Use each property's sqlColumn (snake_case) from "
-                                "describe_object_type, NOT its apiName (camelCase) - the "
-                                "apiName is not a column and the definition will be rejected."
-                            ),
-                        },
-                        "returns": {
-                            "type": "string",
-                            "enum": ["scalar", "table"],
-                            "description": "scalar for a KPI tile, table for a chart.",
-                        },
-                        "returnType": {
-                            "type": "string",
-                            "description": "numeric, percent, currency, duration_hours, distance_km, …",
-                        },
-                        "unit": {"type": "string", "description": "km, hours, USD, …"},
-                        "valueFormat": {
-                            "type": "string",
-                            "enum": [
-                                "number", "integer", "currency", "percent",
-                                "duration_hours", "duration_days", "weight_kg", "distance_km",
-                            ],
-                        },
-                        "readsObjectTypes": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Ontology object types this reads, for lineage.",
-                        },
-                        "proposedFrom": {
-                            "type": "string",
-                            "description": "The user's own words that prompted this, for the audit trail.",
-                        },
+                        "alias": {"type": "string"},
                     },
-                    "required": ["name", "definition", "returns"],
+                    "required": ["aggregation"],
                 },
             },
+            "where": {"type": "array", "items": FILTER_CLAUSE_SCHEMA},
+            "limit": {"type": "integer"},
         },
+        ["objectType", "metrics"],
+    ),
+    _fn(
+        "traverse_link",
+        "Follow a link from one object to related objects, e.g. from an Order to its "
+        "Account. Link api names come from describe_object_type.",
         {
-            "type": "function",
-            "function": {
-                "name": "request_clarification",
-                "description": (
-                    "Ask the user a question instead of guessing. Use this when the request "
-                    "is genuinely ambiguous in a way that changes the answer - which lane, "
-                    "which time window, which of two metrics they mean. Do NOT use it for "
-                    "something you could look up yourself. Calling it ends your turn: you "
-                    "will be given the user's reply on the next one."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "One specific question, in the user's language.",
-                        },
-                        "options": {
-                            "type": "array",
-                            "description": (
-                                "Two to six concrete choices. Offer these whenever the "
-                                "possibilities are known - picking from a list is far less "
-                                "work than typing."
-                            ),
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": {"type": "string"},
-                                    "detail": {
-                                        "type": "string",
-                                        "description": "One short line on what this choice means.",
-                                    },
-                                },
-                                "required": ["label"],
-                            },
-                        },
-                        "allowFreeText": {
-                            "type": "boolean",
-                            "description": "Whether a typed answer is also acceptable. Default true.",
-                        },
-                    },
-                    "required": ["question"],
-                },
-            },
+            "objectType": {"type": "string"},
+            "objectKey": {"type": "string", "description": "The object's primary key value."},
+            "linkApiName": {"type": "string"},
         },
+        ["objectType", "objectKey", "linkApiName"],
+    ),
+    _fn(
+        "list_kpis",
+        "List the metrics with the object type each is over, its aggregation, "
+        "conditions and the dimensions it can be sliced by.",
+        {"category": {"type": "string", "description": "Optional category filter."}},
+    ),
+    _fn(
+        "execute_kpi",
+        "Compute a metric, optionally broken down by one of its dimensions. Returns "
+        "the headline total plus the series.",
         {
-            "type": "function",
-            "function": {
-                "name": "list_object_types",
-                "description": (
-                    "List every object type in the TMS ontology with its object count. "
-                    "Start here when you do not yet know what data exists."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
+            "kpi": {"type": "string", "description": "Metric api name from list_kpis."},
+            "dimension": {"type": "string", "description": "One of the metric's dimensions (a column)."},
+            "filters": {"type": "object", "description": "Equality filters keyed by column."},
+            "limit": {"type": "integer"},
+            "sort": {"type": "string", "enum": ["value_desc", "value_asc", "dimension_asc", "dimension_desc"]},
+            "totalOnly": {"type": "boolean", "description": "Skip the breakdown."},
         },
+        ["kpi"],
+    ),
+    _fn("list_dashboards", "List the saved dashboards.", {}),
+    _fn(
+        "create_dashboard",
+        "Build and save a dashboard. Every widget must name a metric from list_kpis "
+        "and, for charts and tables, a dimension that metric supports. Aim for up to 4 "
+        "stat tiles across the top then 2 to 4 charts. Widths are grid columns out of 4.",
         {
-            "type": "function",
-            "function": {
-                "name": "describe_object_type",
-                "description": (
-                    "Get one object type's properties grouped by semantic role (measure, "
-                    "dimension, temporal, flag), plus its links and actions. Call this "
-                    "before searching or aggregating so you use real property names."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "objectType": {"type": "string", "description": "e.g. Order, Shipment, Transport."}
-                    },
-                    "required": ["objectType"],
-                },
-            },
+            "title": {"type": "string"},
+            "description": {"type": "string"},
+            "audience": {"type": "string", "description": "Who this is for."},
+            "layout": {"type": "array", "items": WIDGET_SCHEMA},
+            "sourcePrompt": {"type": "string", "description": "The user's request, recorded for provenance."},
         },
-        {
-            "type": "function",
-            "function": {
-                "name": "search_objects",
-                "description": (
-                    "Find individual objects with filters and sorting. Use for questions "
-                    "about specific records ('which orders are unplanned'), not for totals."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "objectType": {"type": "string"},
-                        "where": {"type": "array", "items": FILTER_CLAUSE_SCHEMA},
-                        "search": {"type": "string", "description": "Free-text match on identifiers and names."},
-                        "orderBy": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "property": {"type": "string"},
-                                    "direction": {"type": "string", "enum": ["asc", "desc"]},
-                                },
-                                "required": ["property"],
-                            },
-                        },
-                        "select": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Properties to return. Omit for all; naming a few keeps results readable.",
-                        },
-                        "limit": {"type": "integer", "description": f"Max {MAX_OBJECT_ROWS}."},
-                    },
-                    "required": ["objectType"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "aggregate_objects",
-                "description": (
-                    "Group objects and compute totals. Only properties whose semantic role "
-                    "is 'measure' can be summed or averaged. Prefer execute_kpi when a "
-                    "defined metric already answers the question."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "objectType": {"type": "string"},
-                        "groupBy": {"type": "array", "items": {"type": "string"}},
-                        "metrics": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "property": {"type": "string"},
-                                    "aggregation": {
-                                        "type": "string",
-                                        "enum": ["count", "countDistinct", "sum", "avg", "min", "max"],
-                                    },
-                                    "alias": {"type": "string"},
-                                },
-                                "required": ["aggregation"],
-                            },
-                        },
-                        "where": {"type": "array", "items": FILTER_CLAUSE_SCHEMA},
-                        "limit": {"type": "integer"},
-                    },
-                    "required": ["objectType", "metrics"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "traverse_link",
-                "description": (
-                    "Follow a link from one object to related objects, e.g. from an Order "
-                    "to its Shipments. Link api names come from describe_object_type."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "objectType": {"type": "string"},
-                        "objectKey": {"type": "string", "description": "The object's primary key value."},
-                        "linkApiName": {"type": "string"},
-                    },
-                    "required": ["objectType", "objectKey", "linkApiName"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_kpis",
-                "description": (
-                    "List the defined business metrics with the question each answers and "
-                    "the dimensions it can be sliced by. Use this before answering any "
-                    "'how are we doing on X' question or building a dashboard."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "category": {
-                            "type": "string",
-                            "description": "Optional filter: demand, service, cost, finance, operations, network, data_quality.",
-                        }
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "execute_kpi",
-                "description": (
-                    "Compute a KPI, optionally broken down by one of its dimensions. "
-                    "Returns the headline total plus the series. This is the preferred way "
-                    "to answer a metric question."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "kpi": {"type": "string", "description": "KPI api name from list_kpis."},
-                        "dimension": {"type": "string", "description": "One of the KPI's dimensions."},
-                        "filters": {
-                            "type": "object",
-                            "description": "Equality filters keyed by dimension column.",
-                        },
-                        "limit": {"type": "integer"},
-                        "sort": {
-                            "type": "string",
-                            "enum": ["value_desc", "value_asc", "dimension_asc", "dimension_desc"],
-                        },
-                        "totalOnly": {"type": "boolean", "description": "Skip the breakdown."},
-                    },
-                    "required": ["kpi"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_data_coverage",
-                "description": (
-                    "Report how much of each metric area is measured versus simulated. Call "
-                    "this when the user asks whether a number can be trusted, and whenever "
-                    "you are about to present execution, cost or carrier figures."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_exceptions",
-                "description": (
-                    "The operational worklist: counts of unplanned orders, unrated "
-                    "shipments, late stops, holds and data faults. Use for 'what needs "
-                    "attention' questions."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_dashboards",
-                "description": "List the saved dashboards.",
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "create_dashboard",
-                "description": (
-                    "Build and save a dashboard. Every widget must name a KPI from "
-                    "list_kpis and, for charts and tables, a dimension that KPI supports. "
-                    "Aim for 4 stat tiles across the top then 2 to 4 charts. Widths are "
-                    "grid columns out of 4."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "audience": {"type": "string", "description": "Who this is for."},
-                        "layout": {"type": "array", "items": WIDGET_SCHEMA},
-                        "sourcePrompt": {
-                            "type": "string",
-                            "description": "The user's request, recorded for provenance.",
-                        },
-                    },
-                    "required": ["title", "layout"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_actions",
-                "description": (
-                    "List the ontology's actions. Read-only ones you may run; mutating ones "
-                    "must be proposed to the user instead."
-                ),
-                "parameters": {"type": "object", "properties": {}},
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "apply_action",
-                "description": (
-                    "Run a read-only action such as a what-if rate change or an on-time "
-                    "projection. Mutating actions are refused here by design."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {"type": "string"},
-                        "parameters": {"type": "object"},
-                    },
-                    "required": ["action", "parameters"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_lineage",
-                "description": (
-                    "Trace where an object type or KPI's data comes from, through the "
-                    "views and raw tables back to the source API endpoint."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "objectType": {"type": "string"},
-                        "kpi": {"type": "string"},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "global_search",
-                "description": (
-                    "Find an object by name or identifier across every object type. Use "
-                    "when the user mentions something like 'O100918', 'S45435' or 'Tesla' "
-                    "and you need its key."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"term": {"type": "string"}},
-                    "required": ["term"],
-                },
-            },
-        },
-    ]
+        ["title", "layout"],
+    ),
+    _fn(
+        "list_actions",
+        "List the ontology's actions, the object type each acts on, its parameters and who may run it.",
+        {},
+    ),
+    _fn(
+        "apply_action",
+        "Run a read-only action. Actions that change something are refused here by design.",
+        {"action": {"type": "string"}, "parameters": {"type": "object"}},
+        ["action", "parameters"],
+    ),
+    _fn(
+        "global_search",
+        "Find an object by name or identifier across every object type. Use when the "
+        "user mentions something like 'O100918' or 'Tesla' and you need its key.",
+        {"term": {"type": "string"}},
+        ["term"],
+    ),
+]
 
 
 TOOL_NAMES = set(TOOL_IMPLEMENTATIONS)
@@ -1243,14 +1415,14 @@ def _how_to_get(name: str, state: Any) -> str | None:
                 f"It needs the {entry['label']} capability: call "
                 f"enable_capabilities with [\"{capability}\"]."
             )
-    if name in CAPABILITY_TOOLS:
-        return None  # a meta-tool outside every mode set should not happen
     for mode, entry in MODES.items():
         if name in entry["tools"]:
             return (
                 f"It belongs to the {mode} mode: call change_mode with "
                 f"mode=\"{mode}\"."
             )
+    if name in CAPABILITY_TOOLS:
+        return None  # a meta-tool outside every mode set should not happen
     return None
 
 

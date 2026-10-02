@@ -21,15 +21,32 @@ function secret(name: string, fallback: string): string {
 	return process.env[name] ?? fallback;
 }
 
+const DSN = secret("DATABASE_URL", "postgresql://ontology:ontology@127.0.0.1:55432/tms_ontology");
+
+/**
+ * Where this service's own database is: host, port and name, never the
+ * password. A connection pointing here reads the platform's own bookkeeping
+ * as well as its source data, so it is treated differently (connections.ts).
+ */
+export function ownDatabase(): { host: string; port: number; database: string } | null {
+	try {
+		const url = new URL(DSN);
+		return {
+			host: url.hostname.toLowerCase(),
+			port: Number(url.port) || 5432,
+			database: decodeURIComponent(url.pathname.replace(/^\//, "")),
+		};
+	} catch {
+		return null;
+	}
+}
+
 /**
  * One pool for the process. The service is read-mostly; writes are confined to
  * dashboards, the action audit trail and chat history.
  */
 export const pool = new Pool({
-	connectionString: secret(
-		"DATABASE_URL",
-		"postgresql://ontology:ontology@127.0.0.1:55432/tms_ontology",
-	),
+	connectionString: DSN,
 	max: Number(process.env.PG_POOL_MAX ?? 10),
 	idleTimeoutMillis: 30_000,
 	// A query that has not returned in 30 s is a bug, not slow hardware: the
@@ -57,19 +74,26 @@ export async function queryOne<T extends QueryResultRow = QueryResultRow>(
 	return rows[0] ?? null;
 }
 
-/** Wait for Postgres, then for the pipeline to have published an ontology. */
-export async function waitForOntology(timeoutMs = 120_000): Promise<void> {
+/**
+ * Wait for Postgres, then for the migrations to have run.
+ *
+ * The pipeline container runs the migrations before this service starts, but
+ * a restart of Postgres alone can leave this waiting on a database that is up
+ * and not yet accepting queries, so both are waited for.
+ */
+export async function waitForDatabase(timeoutMs = 120_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	let reportedWaiting = false;
 
 	while (Date.now() < deadline) {
 		try {
-			const row = await queryOne<{ n: string }>(
-				"SELECT count(*)::text AS n FROM platform.ontology_version WHERE is_active",
+			const row = await queryOne<{ n: string; migrated: boolean }>(
+				`SELECT (SELECT count(*) FROM platform.space)::text AS n,
+				        EXISTS (SELECT 1 FROM platform.schema_migration WHERE version = '0030') AS migrated`,
 			);
-			if (row && Number(row.n) > 0) return;
+			if (row && Number(row.n) > 0 && row.migrated) return;
 			if (!reportedWaiting) {
-				console.log("[db] connected; waiting for the pipeline to publish an ontology...");
+				console.log("[db] connected; waiting for the migrations to run...");
 				reportedWaiting = true;
 			}
 		} catch (error) {
@@ -81,7 +105,7 @@ export async function waitForOntology(timeoutMs = 120_000): Promise<void> {
 		await new Promise((resolve) => setTimeout(resolve, 2000));
 	}
 	throw new Error(
-		"No active ontology after waiting. Run the pipeline:\n" +
-			"    docker compose run --rm pipeline python -m pipeline.run",
+		"The database is not migrated after waiting. Run:\n" +
+			"    docker compose run --rm pipeline python -m pipeline.migrate",
 	);
 }

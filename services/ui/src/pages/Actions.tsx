@@ -84,10 +84,8 @@ export function Actions() {
 				setActions(actionRows);
 				setRoles(roleRows);
 				// A read-only action first when there is one, because it is the one
-				// a visitor can actually run. There are none today — all three
-				// were withdrawn with the generated execution data they computed
-				// from — so this falls back to the first action rather than
-				// opening the page with nothing selected.
+				// a visitor can actually run; otherwise the first action, rather
+				// than opening the page with nothing selected.
 				setSelected(
 					(current) =>
 						current ?? actionRows.find((a) => a.isReadOnly)?.apiName ?? actionRows[0]?.apiName ?? null,
@@ -227,9 +225,10 @@ export function Actions() {
 						))}
 					{!actions.some((entry) => entry.isReadOnly) && (
 						<p className="muted" style={{ fontSize: 11, margin: "10px 4px 2px" }}>
-							Every action here is staged rather than run. The three read-only ones —
-							a rate what-if, an on-time projection, a cost recalculation — computed
-							from generated execution data and were withdrawn with it.
+							Every action here is staged: validated, permission-checked and recorded,
+							but not written back, because an object's data is a synced copy of its
+							source. Actions are declared on an object type, from its page or by the
+							AI-FDE.
 						</p>
 					)}
 				</div>

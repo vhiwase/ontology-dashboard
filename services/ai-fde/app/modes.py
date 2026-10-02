@@ -5,21 +5,21 @@ The reference prompt (secrets/prompt) does not hand the assistant one flat tool
 list. It loads a MODE - a named bundle of tool categories plus the documentation
 for the task at hand - and layers toggleable CAPABILITIES on top, which stay
 enabled across mode switches. The point is context economy and least privilege:
-a question about the platform does not need the dashboard builder, and a
-dashboard builder does not need the action catalogue, so neither turn pays for
-the other's schemas. That matters twice over here, because a 7B local model with
-a thirty-tool schema will simply drown.
+a question about the platform does not need the ontology builder, and building
+a dashboard does not need the sync tools, so neither turn pays for the other's
+schemas.
 
-Two deviations from the reference, both deliberate:
+The modes follow the platform's one path:
 
-  * Modes here map onto tools this platform actually has. There is no
-    dataConnection mode tool for creating a sync from chat, because creating a
-    sync is a write against an external system and that stays a human act in
-    the UI - the mode instead gives the assistant what it needs to PREPARE one
-    (browse the workspace, read coverage, trace lineage).
-  * Capabilities the reference lists but this platform cannot honour honestly -
-    subagents, skills, an issue tracker - are declared NOT_IMPLEMENTED and
-    refuse, rather than being offered and doing nothing.
+    dataConnection   connection -> sync (on a schedule) -> dataset
+    ontologyEditing  dataset -> object types, links, actions, metrics
+    functionsEditing metric functions over datasets, for a person to approve
+    exploration      answering questions from what was built
+    applicationBuilding  dashboards on the metrics
+
+Capabilities the reference lists but this platform cannot honour honestly -
+subagents, skills, an issue tracker - are declared NOT_IMPLEMENTED and refuse,
+rather than being offered and doing nothing.
 
 Session state (the active mode, enabled capabilities, plan, todos) is context
 the agent loop reads each round; it is persisted onto the chat session so a
@@ -97,7 +97,7 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
     "viewPermissions": {
         "label": "View permissions",
         "description": "Report who can read or operate a resource, and what gates apply.",
-        "tools": ["get_access_requirements"],
+        "tools": ["get_access_requirements", "get_action_audit"],
     },
     "resourceDocumentation": {
         "label": "Resource documentation",
@@ -109,11 +109,6 @@ CAPABILITIES: dict[str, dict[str, Any]] = {
         "description": "Browse the workspace: spaces, projects, folders, resources.",
         "tools": ["browse_workspace"],
     },
-    "workflowLineage": {
-        "label": "Workflow lineage",
-        "description": "Trace a resource's dependencies and dependents.",
-        "tools": ["get_lineage"],
-    },
 }
 
 # Capabilities the reference prompt names that this platform deliberately does
@@ -124,6 +119,10 @@ NOT_IMPLEMENTED: dict[str, str] = {
     "loadSkills": "There is no skill registry on this platform yet.",
     "editSkills": "There is no skill registry on this platform yet.",
     "foundryIssues": "This platform has no issue tracker to attach to.",
+    "workflowLineage": (
+        "A dataset's lineage is its sync and an object type's is its dataset; "
+        "list_datasets and describe_object_type report both."
+    ),
     "solutionDesign": (
         "Covered by Mermaid diagrams in answers rather than a separate tool - "
         "no capability to enable."
@@ -151,8 +150,8 @@ MODES: dict[str, dict[str, Any]] = {
     "exploration": {
         "label": "Exploration",
         "introduction": (
-            "Answer business questions from the ontology: objects, metrics, "
-            "exceptions and lineage."
+            "Answer business questions from the ontology: objects, links, "
+            "metrics and the datasets behind them."
         ),
         "tools": [
             "list_object_types",
@@ -162,79 +161,74 @@ MODES: dict[str, dict[str, Any]] = {
             "traverse_link",
             "list_kpis",
             "execute_kpi",
-            "get_data_coverage",
-            "get_exceptions",
+            "list_datasets",
             "list_dashboards",
             "list_actions",
-            "get_lineage",
-            "list_interfaces",
             "global_search",
         ],
-        "docs": ["platform/simulated-data"],
-    },
-    "dataIntegration": {
-        "label": "Data integration",
-        "introduction": (
-            "Prepare pipelines and datasets: what the sources carry, what is "
-            "measured, and what a proposed pipeline would read."
-        ),
-        "tools": [
-            "list_object_types",
-            "describe_object_type",
-            "get_data_coverage",
-            "get_lineage",
-            "list_schedules",
-            "global_search",
-            "propose_pipeline",
-        ],
-        "docs": ["platform/simulated-data"],
+        "docs": ["platform/data-quality"],
     },
     "dataConnection": {
         "label": "Data connection",
         "introduction": (
-            "Work with registered sources: what a connection can reach, what "
-            "its syncs landed, and where it feeds the ontology."
+            "Bring data in: list connections and the views they can read, sync "
+            "a view into a dataset as it is, and set how often it refreshes."
         ),
         "tools": [
-            "browse_workspace",
-            "get_data_coverage",
-            "get_lineage",
+            "list_connections",
+            "list_source_views",
+            "create_sync",
+            "run_sync",
+            "schedule_sync",
+            "list_syncs",
             "list_schedules",
-            "global_search",
+            "list_datasets",
+            "profile_dataset",
         ],
-        "docs": [],
+        "docs": ["platform/data-flow", "platform/schedules"],
     },
     "ontologyEditing": {
-        "label": "Ontology editing",
+        "label": "Ontology building",
         "introduction": (
-            "Read the ontology the way an editor would: types, properties, "
-            "links and their match ratios, before changing anything in the UI."
+            "Build the ontology from datasets: create object types, link them, "
+            "and define the actions and metrics that make them useful."
         ),
         "tools": [
+            "list_datasets",
+            "profile_dataset",
             "list_object_types",
             "describe_object_type",
+            "create_object_type",
+            "suggest_links",
+            "create_link_type",
+            "create_metric",
+            "create_action_type",
+            "delete_ontology_object",
+            "list_kpis",
+            "execute_kpi",
             "list_actions",
-            "get_lineage",
-            "list_interfaces",
-            "global_search",
+            "list_functions",
+            "propose_function",
         ],
-        "docs": [],
+        "docs": ["platform/building-the-ontology", "platform/data-quality"],
     },
     "functionsEditing": {
         "label": "Functions editing",
         "introduction": (
-            "Work with the metric function catalogue: what is proposed, what "
-            "is active, and drafting new definitions for a person to approve."
+            "Work with metric functions: what is proposed, what is active, and "
+            "drafting new definitions over datasets for a person to approve."
         ),
         "tools": [
+            "list_datasets",
+            "profile_dataset",
+            "describe_object_type",
             "list_kpis",
+            "execute_kpi",
+            "create_metric",
             "list_functions",
             "propose_function",
-            "describe_object_type",
-            "execute_kpi",
-            "get_lineage",
         ],
-        "docs": [],
+        "docs": ["platform/building-the-ontology"],
     },
     "governance": {
         "label": "Governance",
@@ -244,28 +238,29 @@ MODES: dict[str, dict[str, Any]] = {
         ),
         "tools": [
             "list_actions",
-            "get_data_coverage",
-            "get_exceptions",
             "list_object_types",
+            "list_datasets",
             "global_search",
+            "get_access_requirements",
+            "get_action_audit",
         ],
         "docs": ["platform/roles", "platform/actions"],
     },
     "applicationBuilding": {
         "label": "Application building",
         "introduction": (
-            "Build dashboards and the metrics behind them, on the catalogue "
-            "rather than on ad hoc queries."
+            "Build dashboards on the metric catalogue, adding a metric first "
+            "where one the dashboard needs is missing."
         ),
         "tools": [
             "list_object_types",
             "describe_object_type",
             "list_kpis",
             "execute_kpi",
+            "create_metric",
             "list_dashboards",
             "create_dashboard",
             "propose_function",
-            "get_data_coverage",
         ],
         "docs": [],
     },
@@ -278,27 +273,11 @@ MODES: dict[str, dict[str, Any]] = {
         "tools": [
             "list_object_types",
             "list_kpis",
+            "list_datasets",
             "list_dashboards",
             "list_actions",
         ],
-        "docs": ["platform/roles", "platform/spaces", "platform/actions"],
-    },
-    "machineLearning": {
-        "label": "Machine learning",
-        "introduction": (
-            "Prepare the data an external model would train on: what is "
-            "measured, feature tables as proposed pipelines, and honest "
-            "coverage limits. Training itself happens outside this platform."
-        ),
-        "tools": [
-            "list_object_types",
-            "describe_object_type",
-            "search_objects",
-            "aggregate_objects",
-            "get_data_coverage",
-            "propose_pipeline",
-        ],
-        "docs": ["platform/simulated-data"],
+        "docs": ["platform/data-flow", "platform/roles", "platform/spaces"],
     },
 }
 

@@ -94,7 +94,7 @@ describe("interfacesOf", () => {
 		);
 		// An interface nothing implements is reported with an empty implementor
 		// list and the raw ref, not silently dropped — the definition said it.
-		expect(phantom.implementors).toEqual([]);
-		expect(phantom.requiredAttributes[0].apiName).toBe("attr-nope");
+		expect(phantom!.implementors).toEqual([]);
+		expect(phantom!.requiredAttributes[0]!.apiName).toBe("attr-nope");
 	});
 });

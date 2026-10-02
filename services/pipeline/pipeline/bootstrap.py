@@ -13,7 +13,7 @@ read an empty stdin and exit 0 having done nothing at all.
 
 Order matters:
   1. migrate   the schema has to be current before anything writes to it
-  2. run       ingestion, ontology generation, lineage, dashboards
+  2. run       land the captured TMS snapshot (the source a connection syncs)
   3. users     seed the first admin, which needs app_user to exist
   4. retention purge chat history past the policy window
 

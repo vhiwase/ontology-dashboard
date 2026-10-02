@@ -1,18 +1,15 @@
 /**
- * Schedules: named, recurring triggers for the work that otherwise only ran
- * when someone pressed a button.
+ * Schedules: how often a sync runs.
  *
- * Foundry ships a Schedules application; until now this platform shipped the
- * README's admission that "there is no schedule". A schedule names one target
- * - a connection sync or a pipeline - and an interval, and the ontology
- * service fires it when due.
+ * A schedule names one sync and an interval - every 20 minutes, every 2
+ * hours, every day, every 8 days - and the ontology service fires it when due.
+ * One schedule per sync: two cadences on one landing table would each rebuild
+ * it under the other.
  *
  * The scheduler lives here because this service is the always-running process
- * that already owns both execution paths. runSync and runPipeline are the same
- * exported functions the API routes call, so a scheduled run is the same work
- * as a manual one, lands in the same run history, and honors the same
- * validation. The scheduler adds only the trigger, never a second way to
- * execute.
+ * that owns the sync path. runSync is the same function the Run button calls,
+ * so a scheduled run is the same work as a manual one and lands in the same run
+ * history. The scheduler adds only the trigger, never a second way to execute.
  *
  * Two properties the implementation is built around:
  *
@@ -20,27 +17,29 @@
  *    UPDATE that records the firing, so two ticks can never double-run one
  *    schedule, and a schedule disabled between SELECT and UPDATE is not run.
  *  - A FAILED SCHEDULE IS A RECORD, NOT AN EXCEPTION. The loop never throws;
- *    a failing target writes a failed schedule_run and updates the schedule's
- *    last_status/last_error, and the cadence continues. A schedule that dies
- *    quietly because one run failed would be worse than one that keeps
- *    reporting failure.
+ *    a failing sync writes a failed schedule_run and updates the schedule's
+ *    last_status/last_error, and the cadence continues.
  */
 
 import { query, queryOne } from "./db";
-import { BadRequest, NotFound, withSpace } from "./registry";
-import { runSync } from "./connections";
-import { getPipeline, runPipeline } from "./pipelines";
+import { BadRequest, currentSpace, NotFound, withSpace } from "./registry";
+import { getSync, runSync } from "./connections";
 
+/** A sub-minute schedule is a misconfiguration, not a cadence. */
 const MIN_INTERVAL_SECONDS = 60;
+/** A year. Anything longer is not a schedule anyone is waiting on. */
+const MAX_INTERVAL_SECONDS = 366 * 24 * 3600;
 
 export interface ScheduleRecord {
 	scheduleId: number;
 	spaceId: number;
 	spaceSlug?: string;
 	name: string;
-	kind: "sync" | "pipeline";
+	kind: "sync";
 	targetRef: string;
 	intervalSeconds: number;
+	/** The interval as a person would say it: "every 2 hours". */
+	every: string;
 	enabled: boolean;
 	createdBy: string;
 	createdAt: string;
@@ -71,13 +70,14 @@ interface ScheduleRow extends Record<string, unknown> {
 
 function toRecord(row: ScheduleRow): ScheduleRecord {
 	return {
-		scheduleId: row.schedule_id,
-		spaceId: row.space_id,
+		scheduleId: Number(row.schedule_id),
+		spaceId: Number(row.space_id),
 		spaceSlug: row.space_slug,
 		name: row.name,
-		kind: row.kind as "sync" | "pipeline",
+		kind: "sync",
 		targetRef: row.target_ref,
 		intervalSeconds: row.interval_seconds,
+		every: describeInterval(row.interval_seconds),
 		enabled: row.enabled,
 		createdBy: row.created_by,
 		createdAt: row.created_at,
@@ -94,25 +94,86 @@ const SELECT_SCHEDULES = `
 	  FROM platform.schedule s
 	  JOIN platform.space sp ON sp.space_id = s.space_id`;
 
-/** Exported for the tests: the whole validation surface of a cadence. */
+// ── intervals ───────────────────────────────────────────────────────────────
+
+const UNITS: Record<string, number> = {
+	s: 1,
+	sec: 1,
+	second: 1,
+	m: 60,
+	min: 60,
+	minute: 60,
+	h: 3600,
+	hr: 3600,
+	hour: 3600,
+	d: 86_400,
+	day: 86_400,
+	w: 604_800,
+	wk: 604_800,
+	week: 604_800,
+};
+
+/**
+ * An interval, in seconds, from what a person or the assistant would write:
+ * 1200, "20m", "20 min", "2h", "2 hours", "1d", "8 days", "1w".
+ *
+ * Exported for the tests: this is the whole validation surface of a cadence.
+ */
 export function parseIntervalSeconds(raw: unknown): number {
-	const seconds = Number(raw);
-	if (!Number.isInteger(seconds) || seconds < MIN_INTERVAL_SECONDS) {
-		throw new BadRequest(
-			`intervalSeconds must be a whole number of at least ${MIN_INTERVAL_SECONDS} seconds.`,
-		);
+	let seconds: number;
+	if (typeof raw === "number") {
+		seconds = raw;
+	} else {
+		const text = String(raw ?? "").trim().toLowerCase().replace(/^every\s+/, "");
+		const match = /^(\d+(?:\.\d+)?)\s*([a-z]*)$/.exec(text);
+		const unit = match ? UNITS[match[2]!.replace(/s$/, "") || "s"] : undefined;
+		if (!match || unit === undefined) {
+			throw new BadRequest(
+				`'${String(raw)}' is not an interval. Write it as a number and a unit: 20m, 2h, 1d, 8d.`,
+			);
+		}
+		seconds = Number(match[1]) * unit;
+	}
+	if (!Number.isFinite(seconds)) {
+		throw new BadRequest("An interval must be a number of seconds.");
+	}
+	seconds = Math.round(seconds);
+	if (seconds < MIN_INTERVAL_SECONDS) {
+		throw new BadRequest(`An interval must be at least ${MIN_INTERVAL_SECONDS} seconds (1m).`);
+	}
+	if (seconds > MAX_INTERVAL_SECONDS) {
+		throw new BadRequest("An interval must be at most a year.");
 	}
 	return seconds;
 }
 
-/** A sync target must exist, in this space, and be enabled. */
-async function assertSyncTarget(ref: string, spaceSlug: string): Promise<void> {
+/** 7200 -> "every 2 hours"; 691200 -> "every 8 days". */
+export function describeInterval(seconds: number): string {
+	const units: Array<[number, string]> = [
+		[604_800, "week"],
+		[86_400, "day"],
+		[3600, "hour"],
+		[60, "minute"],
+	];
+	for (const [size, name] of units) {
+		if (seconds % size === 0) {
+			const count = seconds / size;
+			return count === 1 ? `every ${name}` : `every ${count} ${name}s`;
+		}
+	}
+	return `every ${seconds} seconds`;
+}
+
+// ── reads ───────────────────────────────────────────────────────────────────
+
+/** A sync target must exist, in this space. */
+async function assertSyncTarget(ref: string, spaceSlug: string): Promise<{ name: string }> {
 	const syncId = Number(ref);
 	if (!Number.isInteger(syncId)) {
-		throw new BadRequest("A sync target_ref must be the sync's numeric id.");
+		throw new BadRequest("A schedule's target must be a sync's numeric id.");
 	}
-	const found = await queryOne<{ name: string; enabled: boolean }>(
-		`SELECT cs.name, cs.enabled
+	const found = await queryOne<{ name: string }>(
+		`SELECT cs.name
 		   FROM platform.connection_sync cs
 		   JOIN platform.resource r ON r.resource_id = cs.resource_id
 		   JOIN platform.project p ON p.project_id = r.project_id
@@ -120,9 +181,8 @@ async function assertSyncTarget(ref: string, spaceSlug: string): Promise<void> {
 		  WHERE cs.sync_id = $1 AND sp.slug = $2`,
 		[syncId, spaceSlug],
 	);
-	if (!found) {
-		throw new NotFound(`No sync ${syncId} in the '${spaceSlug}' space.`);
-	}
+	if (!found) throw new NotFound(`No sync ${syncId} in the '${spaceSlug}' space.`);
+	return found;
 }
 
 /**
@@ -151,43 +211,45 @@ export async function getSchedule(scheduleId: number, spaceSlug?: string): Promi
 	return toRecord(row);
 }
 
+// ── writes ──────────────────────────────────────────────────────────────────
+
+/**
+ * Create a schedule for a sync. `every` ("2h") or `intervalSeconds` (7200).
+ * A sync that already has one is refused: change that one instead.
+ */
 export async function createSchedule(
 	body: Record<string, unknown>,
 	createdBy: string,
-	spaceSlug?: string,
+	spaceSlug = currentSpace(),
 ): Promise<ScheduleRecord> {
-	const name = String(body.name ?? "").trim();
-	if (!name) throw new BadRequest("A schedule needs a name.");
-	const kind = String(body.kind ?? "").trim();
-	if (kind !== "sync" && kind !== "pipeline") {
-		throw new BadRequest("kind must be 'sync' or 'pipeline'.");
-	}
-	const targetRef = String(body.targetRef ?? "").trim();
-	if (!targetRef) throw new BadRequest("A schedule needs a targetRef: the sync id or pipeline slug.");
-	const seconds = parseIntervalSeconds(body.intervalSeconds);
+	const targetRef = String(body.targetRef ?? body.syncId ?? "").trim();
+	if (!targetRef) throw new BadRequest("A schedule needs the id of the sync it runs.");
+	const target = await assertSyncTarget(targetRef, spaceSlug);
+	const seconds = parseIntervalSeconds(body.every ?? body.intervalSeconds);
+	const name = String(body.name ?? "").trim() || `${target.name} ${describeInterval(seconds)}`;
 
-	const space = spaceSlug ?? "sandbox";
-	if (kind === "sync") {
-		await assertSyncTarget(targetRef, space);
-	} else {
-		// getPipeline is space-scoped and throws NotFound for a slug that is
-		// not in this space - the check and the reason in one call.
-		await getPipeline(targetRef, space);
-	}
-	const spaceRow = await queryOne<{ space_id: number }>(
-		`SELECT space_id FROM platform.space WHERE slug = $1`,
-		[space],
+	const existing = await queryOne<{ schedule_id: number }>(
+		`SELECT s.schedule_id FROM platform.schedule s
+		   JOIN platform.space sp ON sp.space_id = s.space_id
+		  WHERE sp.slug = $1 AND s.target_ref = $2`,
+		[spaceSlug, targetRef],
 	);
-	if (!spaceRow) throw new NotFound(`No space '${space}'.`);
+	if (existing) {
+		throw new BadRequest(
+			`Sync ${targetRef} already runs on schedule ${existing.schedule_id}. Change its interval instead.`,
+		);
+	}
 
 	const row = await queryOne<ScheduleRow>(
 		`INSERT INTO platform.schedule
 		        (space_id, name, kind, target_ref, interval_seconds, created_by, next_run_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $5::int))
+		 SELECT sp.space_id, $2, 'sync', $3, $4, $5, now() + make_interval(secs => $4::int)
+		   FROM platform.space sp WHERE sp.slug = $1
 		 RETURNING *`,
-		[spaceRow.space_id, name, kind, targetRef, seconds, createdBy],
+		[spaceSlug, name, targetRef, seconds, createdBy],
 	);
-	return toRecord({ ...row, space_slug: space } as ScheduleRow);
+	if (!row) throw new NotFound(`No space '${spaceSlug}'.`);
+	return toRecord({ ...row, space_slug: spaceSlug } as ScheduleRow);
 }
 
 export async function updateSchedule(
@@ -205,8 +267,8 @@ export async function updateSchedule(
 		values.push(name);
 		sets.push(`name = $${values.length}`);
 	}
-	if (body.intervalSeconds !== undefined) {
-		values.push(parseIntervalSeconds(body.intervalSeconds));
+	if (body.every !== undefined || body.intervalSeconds !== undefined) {
+		values.push(parseIntervalSeconds(body.every ?? body.intervalSeconds));
 		sets.push(`interval_seconds = $${values.length}`);
 		// A new cadence re-anchors the next run from now, not from the old
 		// schedule's drift.
@@ -215,16 +277,14 @@ export async function updateSchedule(
 	if (body.enabled !== undefined) {
 		values.push(Boolean(body.enabled));
 		sets.push(`enabled = $${values.length}`);
-		// Re-enabling fires on the new cadence from now, not retroactively - and
-		// reads the row's own interval_seconds column, so the anchor never
-		// mistakes another parameter for the number of seconds.
+		// Re-enabling fires on the cadence from now, not retroactively.
 		sets.push(
 			`next_run_at = CASE WHEN $${values.length} AND next_run_at IS NULL
 			 THEN now() + make_interval(secs => interval_seconds::int)
 			 ELSE next_run_at END`,
 		);
 	}
-	if (!sets.length) throw new BadRequest("Nothing to update: pass name, intervalSeconds or enabled.");
+	if (!sets.length) throw new BadRequest("Nothing to update: pass name, every or enabled.");
 
 	const row = await queryOne<ScheduleRow>(
 		`UPDATE platform.schedule s SET ${sets.join(", ")}
@@ -239,6 +299,31 @@ export async function updateSchedule(
 export async function deleteSchedule(scheduleId: number, spaceSlug?: string): Promise<void> {
 	await getSchedule(scheduleId, spaceSlug);
 	await query(`DELETE FROM platform.schedule WHERE schedule_id = $1`, [scheduleId]);
+}
+
+/**
+ * Set how often a sync runs, in one call: `every` creates or changes its
+ * schedule, and "manual" (or null) removes it. What the sync panel and the
+ * assistant use, so neither has to know whether a schedule exists yet.
+ */
+export async function setSyncSchedule(
+	syncId: number,
+	every: unknown,
+	actor: string,
+	spaceSlug = currentSpace(),
+): Promise<ScheduleRecord | null> {
+	const sync = await getSync(syncId);
+	await assertSyncTarget(String(syncId), spaceSlug);
+
+	const manual = every === null || every === undefined || /^(manual|off|none|never)$/i.test(String(every).trim());
+	if (manual) {
+		if (sync.schedule) await deleteSchedule(sync.schedule.id, spaceSlug);
+		return null;
+	}
+	if (sync.schedule) {
+		return updateSchedule(sync.schedule.id, { every, enabled: true }, spaceSlug);
+	}
+	return createSchedule({ targetRef: String(syncId), every }, actor, spaceSlug);
 }
 
 export async function listScheduleRuns(scheduleId: number, limit = 25): Promise<unknown[]> {
@@ -296,21 +381,9 @@ async function executeSchedule(schedule: ScheduleRecord, triggeredBy: string): P
 	const started = Date.now();
 	const space = schedule.spaceSlug ?? "sandbox";
 	try {
-		// The scheduled run executes inside the target's own space, so the
-		// registry, the compiled views and the run history it hits are the
-		// ones that space published - a sandbox schedule cannot write into
-		// production by being pointed at a slug that exists there.
+		// Run inside the schedule's own space, so the registry it refreshes is
+		// the one that space's object types live in.
 		const detail = await withSpace(space, async () => {
-			if (schedule.kind === "pipeline") {
-				const run = await runPipeline(schedule.targetRef, triggeredBy, space);
-				return {
-					pipelineRunId: run.id,
-					status: run.status,
-					records: run.records,
-					errors: run.errors,
-					durationMs: run.durationMs,
-				};
-			}
 			const outcome = await runSync(Number(schedule.targetRef), triggeredBy);
 			return {
 				syncRunId: outcome.run.id,
@@ -319,6 +392,7 @@ async function executeSchedule(schedule: ScheduleRecord, triggeredBy: string): P
 				rowsWritten: outcome.run.rowsWritten,
 				truncated: outcome.run.truncated,
 				widenedColumns: outcome.widenedColumns,
+				brokenProperties: outcome.brokenProperties,
 			};
 		});
 		await query(
@@ -354,8 +428,8 @@ export async function runDueSchedules(): Promise<number> {
 		// Not awaited: one slow sync must not delay the next schedule's
 		// firing. executeSchedule records its own outcome either way.
 		void executeSchedule(schedule, `schedule:${schedule.name}`).catch((error) => {
-			// The catch inside executeSchedule handles target failures; this
-			// guards the recording itself failing (database gone, say).
+			// The catch inside executeSchedule handles sync failures; this guards
+			// the recording itself failing (database gone, say).
 			console.error(`[schedules] recording run of '${schedule.name}' failed:`, error);
 		});
 	}
@@ -375,8 +449,8 @@ export function startScheduler(): void {
 		return;
 	}
 
-	// Rows created by migration 0028 and schedules re-enabled after an outage
-	// have no next_run_at; anchor them from now rather than firing immediately.
+	// Schedules re-enabled after an outage have no next_run_at; anchor them
+	// from now rather than firing immediately.
 	void query(
 		`UPDATE platform.schedule
 		    SET next_run_at = ${nextRunSql("interval_seconds::int")}

@@ -18,7 +18,7 @@ interface ColumnMeta {
 }
 
 // Metric views are not object types, so their columns are not in the registry.
-// Cached on first use; the set only changes when the pipeline reruns.
+// Cached on first use; cleared when a sync rebuilds a dataset or the ontology changes.
 const columnCache = new Map<string, Map<string, ColumnMeta>>();
 
 async function metricViewColumns(view: string): Promise<Map<string, ColumnMeta>> {
@@ -94,6 +94,8 @@ export interface KpiExecuteResult {
 	/** How the number was computed, so a tile can always be audited. */
 	sql: string;
 	appliedFilters: Record<string, unknown>;
+	/** The metric's own conditions, applied to every computation of it. */
+	conditions: Record<string, unknown>;
 }
 
 export function resolveKpi(apiName: string): KpiMeta {
@@ -207,7 +209,13 @@ export async function executeKpi(
 	assertSimulationAllowed(`KPI ${kpi.apiName}`, kpi.dependsOnSimulation);
 	const columns = await metricViewColumns(kpi.sourceView);
 	const expression = valueExpression(kpi, columns);
-	const { sql: whereSql, values, applied } = buildFilters(kpi, columns, request.filters ?? {});
+	// The metric's own conditions are part of what it IS, so they are applied
+	// last and win over a caller's filter on the same column.
+	const conditions = kpi.conditions ?? {};
+	const { sql: whereSql, values, applied } = buildFilters(kpi, columns, {
+		...(request.filters ?? {}),
+		...conditions,
+	});
 	const view = quoteQualified(kpi.sourceView);
 
 	// Headline figure first: it is what a stat tile needs and what the assistant
@@ -290,6 +298,7 @@ export async function executeKpi(
 		coverageNote: kpi.coverageNote,
 		sql: dimension ? seriesSql : totalSql,
 		appliedFilters: applied,
+		conditions,
 	};
 }
 
@@ -318,13 +327,16 @@ export async function dimensionValues(
 		throw new BadRequest(`${kpi.sourceView} has no column '${dimension}'.`);
 	}
 	const column = quoteIdentifier(dimension);
+	// Only the values the metric can actually show: its conditions apply here too.
+	const { sql: whereSql, values } = buildFilters(kpi, columns, kpi.conditions ?? {});
 	const rows = await query<{ value: string; n: string }>(
 		`SELECT ${column}::text AS value, count(*)::bigint AS n
 		   FROM ${quoteQualified(kpi.sourceView)}
-		  WHERE ${column} IS NOT NULL
+		  ${whereSql ? `${whereSql} AND` : "WHERE"} ${column} IS NOT NULL
 		  GROUP BY ${column}
 		  ORDER BY count(*) DESC, ${column}
 		  LIMIT ${clampLimit(limit, 100, 1000)}`,
+		values,
 	);
 	return rows.map((r) => ({ value: r.value, count: Number(r.n) }));
 }

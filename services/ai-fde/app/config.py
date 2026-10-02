@@ -62,10 +62,11 @@ class Config:
         default_factory=lambda: os.environ.get("LLM_PROVIDER", "azure_openai").strip().lower()
     )
     temperature: float = field(default_factory=lambda: _num("AI_FDE_TEMPERATURE", 0.1))
-    # How many tool-calling rounds the agent gets before it must answer. Eight is
-    # enough for "describe the type, query it, chart it, save the dashboard" with
-    # room for one wrong turn; beyond that a model is usually looping.
-    max_tool_rounds: int = field(default_factory=lambda: int(_num("AI_FDE_MAX_TOOL_ROUNDS", 8)))
+    # How many tool-calling rounds the agent gets before it must answer. A
+    # question takes two or three; building an ontology from several datasets -
+    # plan, profile, create, link, metrics, actions, answer - takes around ten,
+    # so sixteen leaves room for a few refused calls to be corrected.
+    max_tool_rounds: int = field(default_factory=lambda: int(_num("AI_FDE_MAX_TOOL_ROUNDS", 16)))
 
     azure_endpoint: str = field(
         default_factory=lambda: os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")

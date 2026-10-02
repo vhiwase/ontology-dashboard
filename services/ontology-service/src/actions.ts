@@ -28,8 +28,8 @@ import {
  *
  * THE READ-ONLY GATE is the important one. Read-only actions (the what-ifs and
  * recalculations) genuinely execute and return computed results. Mutating actions
- * cannot: this platform reads the TMS through a captured snapshot and has no
- * write-back endpoint. Rather than pretend, a mutating action is validated,
+ * cannot: an object's data is a synced copy of its source, and this platform
+ * has no write-back to that source. Rather than pretend, a mutating action is validated,
  * permission-checked, recorded in the audit trail with the exact payload that
  * would be sent to the TMS, and returned as `staged`. A dashboard that says a
  * shipment was held when nothing was held is worse than one that says the request
@@ -267,10 +267,9 @@ async function stageMutation(
 		},
 		note:
 			"Parameters and permissions were checked and the request was recorded in " +
-			"platform.action_audit. Nothing was sent: this platform reads the TMS " +
-			"through the captured snapshot in TMS_MCP/api_responses and has no " +
-			"write-back endpoint. Wiring one means POSTing the payload above to the " +
-			"corresponding TMS endpoint.",
+			"platform.action_audit. Nothing was changed: the object's data is a synced " +
+			"copy of its source, and this platform has no write-back to that source. " +
+			"Wiring one means sending the payload above to the system of record.",
 	};
 }
 
@@ -392,8 +391,8 @@ export async function executeAction(
 		const result = await stageMutation(meta, parameters);
 		return record(
 			"staged",
-			`${meta.label} was validated and recorded, but not sent: this platform has no ` +
-				"write-back endpoint to the TMS.",
+			`${meta.label} was validated and recorded, but not applied: the data is a synced ` +
+				"copy and this platform has no write-back to its source.",
 			validation,
 			result,
 		);

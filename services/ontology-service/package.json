@@ -2,7 +2,7 @@
   "name": "tms-ontology-service",
   "version": "1.0.0",
   "private": true,
-  "description": "Serves the generated TMS ontology, object-set queries, KPIs, lineage and actions via @ontograph/core",
+  "description": "Connections, scheduled syncs, datasets and the ontology built from them, via @ontograph/core",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",

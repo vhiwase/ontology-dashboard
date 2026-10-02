@@ -2,15 +2,14 @@
  * Spaces, projects, folders and resources: where things live.
  *
  * The hierarchy is space → project → folder → resource. A resource is the
- * addressable unit — a dataset, an object type, an action, a pipeline, a
- * dashboard, a connection — and is what the UI opens in a preview window.
+ * addressable unit — a connection, a dataset, an object type, a link, an
+ * action, a metric, a dashboard — and is what the UI opens in a preview window.
  *
  * Resources point at the rest of the platform by api_name or slug rather than
- * by foreign key, because the pipeline replaces every row in the ontology
- * tables on each run. A real foreign key would either block regeneration or
- * cascade a user's workspace away with it. The cost is that a reference can go
- * stale, so `resolveResource` reports a dangling target instead of pretending
- * it is fine.
+ * by foreign key, so a card outlives a change to what it points at rather than
+ * blocking it. The cost is that a reference can go stale, so a preview reports
+ * a dangling target instead of pretending it is fine. Ontology cards are kept
+ * in step by definition.ts after every authoring change.
  */
 
 import { pool, query, queryOne } from "./db";
@@ -18,13 +17,13 @@ import {
 	type ConnectionSpec,
 	type ConnectionTest,
 	displayDsn,
+	getSync,
 	isPlatformWrittenRelation,
 	listSyncs,
 	remoteDatabaseInfo,
 	specFromProperties,
 	testConnection,
 } from "./connections";
-import { findRepo } from "./repos";
 import {
 	BadRequest,
 	NotFound,
@@ -35,15 +34,13 @@ import {
 } from "./registry";
 
 export type ResourceKind =
+	| "connection"
 	| "dataset"
 	| "objectType"
-	| "actionType"
 	| "linkType"
-	| "pipeline"
-	| "dashboard"
-	| "connection"
-	| "codeRepo"
-	| "kpi";
+	| "actionType"
+	| "kpi"
+	| "dashboard";
 
 export interface SpaceRecord {
 	id: number;
@@ -94,7 +91,7 @@ export interface ResourceRecord {
 	description: string | null;
 	targetRef: string | null;
 	/**
-	 * The relation this is ultimately read from, e.g. tms_views.v_kpi_mode_mix.
+	 * The relation this is ultimately read from, e.g. connection_raw.<table>.
 	 * Null where there is none rather than a placeholder, so the UI can show
 	 * nothing instead of something misleading.
 	 */
@@ -343,16 +340,15 @@ export interface ProjectTree {
 }
 
 /**
- * The relation a resource is ultimately backed by, e.g. tms_views.v_kpi_mode_mix.
+ * The relation a resource is ultimately backed by: the synced table.
  *
  * Only a dataset stores this on itself. An object type, a metric, a link and
  * an action all resolve theirs through the registry, because the ontology owns
  * that mapping and duplicating it onto the resource row would let the two
- * drift apart the moment a pipeline republishes.
+ * drift apart.
  *
- * Null where there genuinely is none — a dashboard reads many views, a
- * pipeline writes rather than reads — and null is shown as nothing rather
- * than as a guess.
+ * Null where there genuinely is none - a dashboard reads many metrics - and
+ * null is shown as nothing rather than as a guess.
  */
 function backingViewOf(
 	kind: ResourceKind,
@@ -382,7 +378,7 @@ function backingViewOf(
 
 	switch (kind) {
 		case "dataset":
-			// Registered from a view, so the reference is the view itself.
+			// The landed table, connection_raw.<table>.
 			return targetRef.includes(".") ? targetRef : null;
 		case "objectType":
 			return registry.objectTypeByApiName.get(targetRef)?.sourceView ?? null;
@@ -790,10 +786,8 @@ async function sampleOf(
 	qualified: string,
 	limit: number,
 ): Promise<{ rows: Array<Record<string, unknown>>; total: number | null }> {
-	// Two ways a relation earns the right to be read here: the published
-	// ontology exposes it, or this platform wrote it itself — a synced landing
-	// table, a built transform, a pipeline output. The second was missing, so a
-	// dataset a sync had just filled previewed as empty.
+	// Two ways a relation earns the right to be read here: an object type or a
+	// metric is built on it, or a sync landed it.
 	const known = hasOntology(currentSpace())
 		? (() => {
 				const registry = getRegistry();
@@ -855,7 +849,7 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 					downstream: syncs.map((sync) => ({
 						kind: "dataset" as const,
 						name: sync.targetTable,
-						relation: `synced ${sync.mode}`,
+						relation: "synced as",
 						detail:
 							`${sync.sourceSchema}.${sync.sourceTable}` +
 							(sync.lastRun
@@ -866,59 +860,51 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 			};
 		}
 
-		case "codeRepo": {
-			const repo = await findRepo(currentSpace(), String(resource.targetRef ?? ""));
-			if (!repo) return { ...empty, resolved: false };
-			return {
-				...empty,
-				detail: {
-					slug: repo.slug,
-					kind: repo.kind,
-					branch: repo.defaultBranch,
-					files: repo.fileCount,
-					commits: repo.commitCount,
-					lastCommit: repo.lastCommitAt,
-					lastBuild: repo.lastBuild
-						? `${repo.lastBuild.status} · ${repo.lastBuild.startedAt}`
-						: "never built",
-				},
-				lineage: {
-					upstream: [],
-					downstream: [],
-				},
-			};
-		}
-
 		case "dataset": {
 			const view = String(resource.properties.sourceView ?? "");
 			const schema = view ? await columnsOf(view) : [];
 			const { rows, total } = view ? await sampleOf(view, 12) : { rows: [], total: null };
-			// An object type built on this same view is its natural downstream.
+			const syncId = resource.properties.syncId;
+			const sync = syncId === undefined ? null : await getSync(Number(syncId)).catch(() => null);
+			// The object types built on this dataset are its downstream.
 			const downstream: LineageEntry[] = registry.objectTypes
 				.filter((type) => type.sourceView === view)
 				.map((type) => ({
 					kind: "objectType" as const,
 					name: type.apiName,
-					relation: "materialised as",
+					relation: "modelled as",
 					detail: `${type.rowCount.toLocaleString("en-US")} objects`,
 				}));
 			return {
 				...empty,
 				resolved: schema.length > 0,
-				detail: { sourceView: view, backing: resource.properties.backing ?? "view" },
+				detail: {
+					sourceView: view,
+					source: resource.properties.source ?? null,
+					connection: resource.properties.connectionName ?? null,
+					lastSyncedAt: resource.properties.lastSyncedAt ?? null,
+					syncId: sync?.id ?? null,
+					schedule: sync?.schedule ?? null,
+					lastRun: sync?.lastRun ?? null,
+				},
 				schema,
 				sample: rows,
 				rowCount: total,
 				lineage: {
-					upstream: view
+					upstream: sync
 						? [
 								{
 									kind: "connection" as const,
-									name: "tms_ontology",
+									name: sync.connectionName,
 									relation: "read from",
 									detail: "PostgreSQL",
 								},
-								{ kind: "view" as const, name: view, relation: "backed by" },
+								{
+									kind: "view" as const,
+									name: `${sync.sourceSchema}.${sync.sourceTable}`,
+									relation: "synced as it is",
+									detail: sync.schedule ? `every ${sync.schedule.intervalSeconds}s` : "on demand",
+								},
 							]
 						: [],
 					downstream,
@@ -961,13 +947,7 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 				rowCount: type.rowCount,
 				lineage: {
 					upstream: [
-						{
-							kind: "connection" as const,
-							name: "tms_ontology",
-							relation: "read from",
-							detail: "PostgreSQL",
-						},
-						{ kind: "view" as const, name: type.sourceView, relation: "built from" },
+						{ kind: "dataset" as const, name: type.sourceView, relation: "created from" },
 					],
 					downstream: [
 						...links.map((link) => ({
@@ -1094,32 +1074,6 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 			};
 		}
 
-		case "pipeline": {
-			const pipeline = await queryOne<{
-				name: string;
-				slug: string;
-				version: number;
-				environment: string;
-				graph: { nodes?: unknown[]; edges?: unknown[] };
-				validation: { status?: string };
-				updated_at: Date;
-			}>("SELECT * FROM platform.pipeline WHERE slug = $1", [resource.targetRef]);
-			if (!pipeline) return { ...empty, resolved: false };
-			return {
-				...empty,
-				detail: {
-					slug: pipeline.slug,
-					name: pipeline.name,
-					version: pipeline.version,
-					environment: pipeline.environment,
-					status: pipeline.validation?.status ?? "unknown",
-					nodes: pipeline.graph?.nodes?.length ?? 0,
-					edges: pipeline.graph?.edges?.length ?? 0,
-					updatedAt: pipeline.updated_at.toISOString(),
-				},
-			};
-		}
-
 		case "dashboard": {
 			const dashboard = await queryOne<{
 				slug: string;
@@ -1131,10 +1085,9 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 			}>("SELECT * FROM platform.dashboard WHERE slug = $1", [resource.targetRef]);
 			if (!dashboard) return { ...empty, resolved: false };
 
-			// A dashboard's lineage is its widgets' KPIs, and the views those are
-			// computed from. Without it, the board at the end of a pipeline was
-			// the one thing in the platform that could not answer "where did this
-			// number come from" — which is the question a dashboard most invites.
+			// A dashboard's lineage is its widgets' metrics, and the datasets those
+			// are computed from: "where did this number come from" is the question
+			// a dashboard most invites.
 			const widgets = Array.isArray(dashboard.layout) ? dashboard.layout : [];
 			const referenced = [
 				...new Set(
@@ -1150,9 +1103,7 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 					kind: "kpi" as const,
 					name: apiName,
 					relation: "shows",
-					detail: kpi
-						? `${kpi.label}${kpi.dependsOnSimulation ? " · simulated" : ""}`
-						: "not in the current catalogue",
+					detail: kpi ? kpi.label : "not in the current catalogue",
 				};
 			});
 
@@ -1178,16 +1129,7 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 					updatedAt: dashboard.updated_at.toISOString(),
 				},
 				lineage: {
-					upstream: [
-						{
-							kind: "connection" as const,
-							name: "tms_ontology",
-							relation: "read from",
-							detail: "PostgreSQL",
-						},
-						...viewEntries,
-						...kpiEntries,
-					],
+					upstream: [...viewEntries, ...kpiEntries],
 					downstream: [],
 				},
 			};
@@ -1198,80 +1140,13 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
 	}
 }
 
-// ── registering a dataset from a pipeline ───────────────────────────────────
-
-export interface RegisterDatasetRequest {
-	name: string;
-	description?: string | null;
-	folderId?: number | null;
-	/** The view this dataset is backed by. Must be one the ontology publishes. */
-	sourceView: string;
-	pipelineSlug?: string | null;
-	nodeId?: string | null;
-}
-
 /**
- * Turn a pipeline node into a dataset resource.
+ * Set the sandbox up for the flow: a project with /Connections, /Datasets,
+ * /Ontology and /Outputs, and the platform's own database registered as a
+ * connection, so its tms_views can be synced straight away.
  *
- * This is the step the platform was missing: a pipeline could describe how
- * data becomes an ontology, but produced no addressable artefact anyone could
- * open, share or build on. The view is checked against the published ontology
- * first, so a dataset always points at something real.
- */
-export async function registerDataset(
-	spaceSlug: string,
-	projectSlug: string,
-	request: RegisterDatasetRequest,
-	createdBy: string,
-): Promise<ResourceRecord> {
-	const view = String(request.sourceView ?? "").trim();
-	if (!view) throw new BadRequest("A dataset needs a source view.");
-
-	const registry = getRegistry();
-	const known =
-		registry.objectTypes.some((type) => type.sourceView === view) ||
-		registry.kpis.some((kpi) => kpi.sourceView === view);
-	if (!known) {
-		throw new BadRequest(
-			`'${view}' is not a view the published ontology exposes, so a dataset on it ` +
-				"would point at nothing. Run the pipeline first, or pick a published view.",
-		);
-	}
-
-	const columns = await columnsOf(view);
-
-	return createResource(
-		spaceSlug,
-		projectSlug,
-		{
-			kind: "dataset",
-			name: request.name,
-			description: request.description ?? `Dataset backed by ${view}.`,
-			folderId: request.folderId ?? null,
-			targetRef: view,
-			properties: {
-				sourceView: view,
-				backing: "view",
-				columnCount: columns.length,
-				// Snapshotted so the resource can say what it looked like when it
-				// was registered, even if the view is later changed.
-				schemaAtRegistration: columns,
-				pipelineSlug: request.pipelineSlug ?? null,
-				nodeId: request.nodeId ?? null,
-				registeredAt: new Date().toISOString(),
-			},
-		},
-		createdBy,
-	);
-}
-
-/**
- * Populate the sandbox on first use.
- *
- * Idempotent: it does nothing once the sandbox has a project, so it can be
- * called on every boot. Everything it creates points at something real - the
- * live connection, the published object types, the views behind them - so the
- * workspace is not a set of empty folders.
+ * Idempotent: it adds only what is missing, so it runs on every boot. Datasets
+ * are not seeded: a dataset is what a sync lands, so they appear when one runs.
  */
 export async function seedSandbox(
 	createdBy = "system",
@@ -1284,242 +1159,84 @@ export async function seedSandbox(
 		: await createProject(
 				"sandbox",
 				"TMS Platform",
-				"The ontology, its datasets and the pipelines that build them.",
+				"Connections, the datasets they sync, and the ontology built on them.",
 				createdBy,
 			);
 	if (!project) throw new BadRequest("The sandbox project could not be resolved.");
 
 	let added = 0;
-
-	/** Create a folder, or return the one already at that path. */
-	const ensureFolder = async (name: string, parentId: number | null) => {
-		const path = `${
-			parentId === null
-				? ""
-				: (
-						await queryOne<{ path: string }>(
-							"SELECT path FROM platform.folder WHERE folder_id = $1",
-							[parentId],
-						)
-					)?.path ?? ""
-		}/${name}`;
+	const ensureFolder = async (name: string) => {
 		const found = await queryOne<{ folder_id: number }>(
 			"SELECT folder_id FROM platform.folder WHERE project_id = $1 AND path = $2",
-			[project.id, path],
+			[project.id, `/${name}`],
 		);
-		if (found) {
-			return { id: found.folder_id, projectId: project.id, parentId, name, path };
-		}
-		return createFolder("sandbox", project.slug, name, parentId, createdBy);
+		if (found) return Number(found.folder_id);
+		added += 1;
+		return (await createFolder("sandbox", project.slug, name, null, createdBy)).id;
 	};
 
-	/**
-	 * Create a resource unless one already points at the same thing.
-	 *
-	 * Keyed on (kind, target_ref) rather than on name, so a resource the user
-	 * has since RENAMED is still recognised and not duplicated.
-	 */
-	const ensureResource = async (request: CreateResourceRequest) => {
-		if (request.targetRef) {
-			const found = await queryOne<{ resource_id: number }>(
-				`SELECT resource_id FROM platform.resource
-				  WHERE project_id = $1 AND kind = $2 AND target_ref = $3`,
-				[project.id, request.kind, request.targetRef],
-			);
-			if (found) return;
-		}
-		try {
-			await createResource("sandbox", project.slug, request, createdBy);
-			added += 1;
-		} catch (error) {
-			// A name clash means something equivalent is already there under a
-			// different target; seeding must not fail the whole pass for it.
-			if (!(error instanceof BadRequest)) throw error;
-		}
-	};
+	const connections = await ensureFolder("Connections");
+	await ensureFolder("Datasets");
+	await ensureFolder("Ontology");
+	await ensureFolder("Outputs");
 
-	const connections = await ensureFolder("Connections", null);
-	const datasets = await ensureFolder("Datasets", null);
-	const ontology = await ensureFolder("Ontology", null);
-	const objectTypes = await ensureFolder("Object types", ontology.id);
-	const links = await ensureFolder("Links", ontology.id);
-	// "Action Types", matching the navigation and migration 0023. Kept in step
-	// with that migration: seeding matches by path, so this name and the
-	// renamed folder's path must agree or a reseed makes a duplicate.
-	const actions = await ensureFolder("Action Types", ontology.id);
-	// Metrics were missing entirely, so a :resource[kpi:…] chip in an assistant
-	// reply had nothing to open.
-	const metrics = await ensureFolder("Metrics", ontology.id);
-	const outputs = await ensureFolder("Outputs", null);
-
-	const info = await databaseInfo();
-	await ensureResource({
-			kind: "connection",
-			name: info.database,
-			description: `PostgreSQL. ${info.sizePretty}, ${info.schemas.length} schemas.`,
-			folderId: connections.id,
-			targetRef: null,
-			// The host, user and credential REFERENCE as well as the display
-			// DSN. Without them this was a card describing a database it had no
-			// way to reach: it could not be tested and nothing could be synced
-			// through it, which made the Connections folder describe a
-			// capability the platform did not have.
-			properties: { engine: "PostgreSQL", dsn: info.dsn, ...platformConnectionProperties() },
-		});
-
-	const registry = getRegistry();
-
-	// One dataset per distinct source view behind the ontology.
-	const views = [...new Set(registry.objectTypes.map((type) => type.sourceView))].sort();
-	for (const view of views) {
-		const columns = await columnsOf(view);
-		await ensureResource({
-				kind: "dataset",
-				name: view.split(".").pop() ?? view,
-				description: `Dataset backed by ${view}.`,
-				folderId: datasets.id,
-				targetRef: view,
+	const hasConnection = await queryOne(
+		"SELECT 1 FROM platform.resource WHERE project_id = $1 AND kind = 'connection'",
+		[project.id],
+	);
+	if (!hasConnection) {
+		const info = await databaseInfo();
+		await createResource(
+			"sandbox",
+			project.slug,
+			{
+				kind: "connection",
+				name: info.database,
+				description:
+					"PostgreSQL: the TMS database this platform runs beside. Its tms_views " +
+					"schema presents the captured TMS data as views.",
+				folderId: connections,
+				targetRef: null,
+				// Host, user and the credential REFERENCE, so it can be tested and
+				// synced through like any other connection.
 				properties: {
-					sourceView: view,
-					backing: "view",
-					columnCount: columns.length,
-					schemaAtRegistration: columns,
-					registeredAt: new Date().toISOString(),
+					engine: "PostgreSQL",
+					connector: "PostgreSQL",
+					dsn: info.dsn,
+					...platformConnectionProperties(),
 				},
-			});
-	}
-
-	for (const type of registry.objectTypes) {
-		await ensureResource({
-				kind: "objectType",
-				name: type.apiName,
-				description: type.description,
-				folderId: objectTypes.id,
-				targetRef: type.apiName,
-				properties: { rowCount: type.rowCount, group: type.group },
-			});
-	}
-
-	for (const link of registry.linkTypes) {
-		await ensureResource({
-				kind: "linkType",
-				name: link.apiName,
-				description: `${link.sourceObjectType} → ${link.targetObjectType}`,
-				folderId: links.id,
-				targetRef: link.apiName,
-				properties: { cardinality: link.cardinality, isVerified: link.isVerified },
-			});
-	}
-
-	for (const action of registry.actionTypes) {
-		await ensureResource({
-				kind: "actionType",
-				name: action.apiName,
-				description: action.description,
-				folderId: actions.id,
-				targetRef: action.apiName,
-				properties: { isReadOnly: action.isReadOnly },
-			});
-	}
-
-	// Metrics. These were absent entirely, so an assistant reply citing
-	// :resource[kpi:on_time_pct] had a chip that opened nothing.
-	for (const kpi of registry.kpis) {
-		await ensureResource({
-			kind: "kpi",
-			name: kpi.apiName,
-			description: kpi.description ?? kpi.label,
-			folderId: metrics.id,
-			targetRef: kpi.apiName,
-			properties: {
-				category: kpi.category,
-				unit: kpi.unit,
-				dependsOnSimulation: kpi.dependsOnSimulation,
 			},
-		});
-	}
-
-	const dashboards = await query<{ slug: string; title: string; description: string | null }>(
-		"SELECT slug, title, description FROM platform.dashboard ORDER BY title",
-	);
-	for (const dashboard of dashboards) {
-		await ensureResource({
-				kind: "dashboard",
-				name: dashboard.title,
-				description: dashboard.description,
-				folderId: outputs.id,
-				targetRef: dashboard.slug,
-				properties: {},
-			});
-	}
-
-	const pipelines = await query<{ slug: string; name: string; description: string | null }>(
-		"SELECT slug, name, description FROM platform.pipeline ORDER BY name",
-	);
-	for (const pipeline of pipelines) {
-		await ensureResource({
-				kind: "pipeline",
-				name: pipeline.name,
-				description: pipeline.description,
-				folderId: outputs.id,
-				targetRef: pipeline.slug,
-				properties: {},
-			});
-	}
-
-	// Code repositories. Seeded from platform.code_repo rather than created
-	// here: a repository exists in a space whether or not anyone has filled the
-	// workspace, and this only gives it a card to open.
-	const repos = await query<{
-		slug: string;
-		name: string;
-		description: string | null;
-		kind: string;
-		default_branch: string;
-	}>(
-		`SELECT r.slug, r.name, r.description, r.kind, r.default_branch
-		   FROM platform.code_repo r
-		   JOIN platform.space s ON s.space_id = r.space_id
-		  WHERE s.slug = 'sandbox' ORDER BY r.name`,
-	);
-	if (repos.length > 0) {
-		const code = await ensureFolder("Code", null);
-		for (const repo of repos) {
-			await ensureResource({
-				kind: "codeRepo",
-				name: repo.name,
-				description: repo.description,
-				folderId: code.id,
-				targetRef: repo.slug,
-				properties: { repoKind: repo.kind, branch: repo.default_branch },
-			});
-		}
+			createdBy,
+		);
+		added += 1;
 	}
 
 	return { created: !hadProject, added };
 }
 
 /**
- * Views the ontology publishes, offered when registering a dataset.
- *
- * Empty rather than an error where the space has no ontology: the Spaces page
- * still works there — projects, folders and the connection are all real — so
- * the honest answer is that there is nothing yet to register, not that the
- * request failed.
+ * Every connection in a space, whichever project holds it, with how many
+ * syncs pull through it. What the Connections page and the assistant list.
  */
-export function publishedViews(): Array<{ view: string; usedBy: string[] }> {
-	if (!hasOntology(currentSpace())) return [];
-	const registry = getRegistry();
-	const map = new Map<string, string[]>();
-	for (const type of registry.objectTypes) {
-		map.set(type.sourceView, [...(map.get(type.sourceView) ?? []), type.apiName]);
-	}
-	for (const kpi of registry.kpis) {
-		map.set(kpi.sourceView, [...(map.get(kpi.sourceView) ?? []), kpi.apiName]);
-	}
-	return [...map.entries()]
-		.map(([view, usedBy]) => ({ view, usedBy }))
-		.sort((a, b) => a.view.localeCompare(b.view));
+export async function listConnections(spaceSlug = currentSpace()): Promise<
+	Array<ResourceRecord & { syncCount: number; projectSlug: string }>
+> {
+	const rows = await query<Parameters<typeof toResource>[0] & { sync_count: string; project_slug: string }>(
+		`SELECT r.*, p.slug AS project_slug,
+		        (SELECT count(*) FROM platform.connection_sync cs WHERE cs.resource_id = r.resource_id)::text
+		          AS sync_count
+		   FROM platform.resource r
+		   JOIN platform.project p ON p.project_id = r.project_id
+		   JOIN platform.space s ON s.space_id = p.space_id
+		  WHERE s.slug = $1 AND r.kind = 'connection'
+		  ORDER BY r.name`,
+		[spaceSlug],
+	);
+	return rows.map((row) => ({
+		...toResource(row),
+		syncCount: Number(row.sync_count),
+		projectSlug: row.project_slug,
+	}));
 }
 
 /** Kept so the pool is reachable for a health probe without another import. */
@@ -1531,11 +1248,11 @@ export const _pool = pool;
  * api_name or slug.
  *
  * This is what lets any page open the preview window for a thing it is already
- * showing — a node on the pipeline canvas, a row in the object explorer —
+ * showing — a row in the object explorer, a chip in an assistant answer —
  * without that page having to load and walk the whole resource tree to find
  * the matching id.
  *
- * Returns null rather than throwing when nothing matches: a node pointing at
+ * Returns null rather than throwing when nothing matches: a reference to
  * an object type that was never registered as a resource is an ordinary state,
  * not an error, and the caller simply does not offer the preview.
  */
@@ -1550,9 +1267,12 @@ export async function lookupResource(
 		   FROM platform.resource r
 		   JOIN platform.project p ON p.project_id = r.project_id
 		   JOIN platform.space   s ON s.space_id   = p.space_id
-		  WHERE r.kind = $1 AND r.target_ref = $2
+		  WHERE r.kind = $1
+		    -- A dataset is also found by its name (v_order), which is how people
+		    -- and the assistant refer to it, not only by connection_raw.<table>.
+		    AND (r.target_ref = $2 OR (r.kind = 'dataset' AND r.name = $2))
 		    AND ($3::text IS NULL OR s.slug = $3)
-		  ORDER BY (s.slug = 'sandbox') DESC, r.resource_id
+		  ORDER BY (s.slug = 'sandbox') DESC, (r.target_ref = $2) DESC, r.resource_id
 		  LIMIT 1`,
 		[kind, targetRef, spaceSlug ?? null],
 	);
@@ -1576,82 +1296,27 @@ export async function createConnection(
 ): Promise<{ resource: ResourceRecord; test: ConnectionTest }> {
 	if (!spec.name?.trim()) throw new BadRequest("A connection needs a name.");
 
-	const connector = spec.engine === "rest" ? "rest" : "postgresql";
-	let normalised: ConnectionSpec;
-	let properties: Record<string, unknown>;
+	if (!spec.host?.trim()) throw new BadRequest("A connection needs a host.");
+	if (!spec.database?.trim()) throw new BadRequest("A connection needs a database.");
+	if (!spec.username?.trim()) throw new BadRequest("A connection needs a username.");
 
-	if (connector === "rest") {
-		const baseUrl = String(spec.baseUrl ?? "").trim().replace(/\/+$/, "");
-		if (!baseUrl) throw new BadRequest("A REST connection needs a base URL.");
-		let parsed: URL;
-		try {
-			parsed = new URL(baseUrl);
-		} catch {
-			throw new BadRequest(
-				`'${baseUrl}' is not a URL. Give the scheme too, e.g. https://api.example.com/v1.`,
-			);
-		}
-		if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-			throw new BadRequest(`'${parsed.protocol}' is not a scheme this connector speaks. Use http or https.`);
-		}
+	const port = Number(spec.port) || 5432;
+	const normalised: ConnectionSpec = { ...spec, port, host: spec.host.trim() };
+	const properties = {
+		engine: "PostgreSQL",
+		connector: "PostgreSQL",
+		host: normalised.host,
+		port,
+		database: normalised.database,
+		username: normalised.username,
+		// The reference, never the credential.
+		secretRef: normalised.secretRef ?? null,
+		sslMode: normalised.sslMode ?? "prefer",
+		dsn: displayDsn(normalised),
+	};
 
-		const authScheme = spec.authScheme ?? "none";
-		if (authScheme !== "none" && !spec.secretRef) {
-			throw new BadRequest(
-				`A ${authScheme} credential needs a secret to read it from: the NAME of an ` +
-					"environment variable, or the PATH of a Docker secret. The credential itself " +
-					"is never stored here.",
-			);
-		}
-		if (authScheme === "header" && !spec.headerName?.trim()) {
-			throw new BadRequest("A header credential needs the header's name, e.g. X-API-Key.");
-		}
-		if (authScheme === "basic" && !spec.username?.trim()) {
-			throw new BadRequest("Basic authentication needs a username as well as a secret.");
-		}
-
-		normalised = {
-			...spec,
-			engine: "rest",
-			baseUrl,
-			authScheme,
-			headerName: spec.headerName?.trim() || undefined,
-			healthPath: spec.healthPath?.trim() || undefined,
-		};
-		properties = {
-			engine: "rest",
-			connector: "REST API",
-			baseUrl,
-			authScheme,
-			headerName: normalised.headerName ?? null,
-			healthPath: normalised.healthPath ?? null,
-			username: normalised.username ?? null,
-			secretRef: normalised.secretRef ?? null,
-			dsn: displayDsn(normalised),
-		};
-	} else {
-		if (!spec.host?.trim()) throw new BadRequest("A connection needs a host.");
-		if (!spec.database?.trim()) throw new BadRequest("A connection needs a database.");
-		if (!spec.username?.trim()) throw new BadRequest("A connection needs a username.");
-
-		const port = Number(spec.port) || 5432;
-		normalised = { ...spec, port, engine: "postgresql" };
-		properties = {
-			engine: "PostgreSQL",
-			connector: "PostgreSQL",
-			host: normalised.host,
-			port,
-			database: normalised.database,
-			username: normalised.username,
-			// The reference, never the credential.
-			secretRef: normalised.secretRef ?? null,
-			sslMode: normalised.sslMode ?? "prefer",
-			dsn: displayDsn(normalised),
-		};
-	}
-
-	// Tested before it is stored, so a wrong host, an unreadable secret or a
-	// rejected token is found now rather than by whoever tries to sync.
+	// Tested before it is stored, so a wrong host or an unreadable secret is
+	// found now rather than by whoever tries to sync.
 	const test = await testConnection(normalised);
 
 	const resource = await createResource(
@@ -1660,11 +1325,7 @@ export async function createConnection(
 		{
 			kind: "connection",
 			name: normalised.name.trim(),
-			description:
-				normalised.description ??
-				(connector === "rest"
-					? `REST API at ${normalised.baseUrl}`
-					: `PostgreSQL at ${normalised.host}:${normalised.port}`),
+			description: normalised.description ?? `PostgreSQL at ${normalised.host}:${normalised.port}`,
 			folderId: normalised.folderId ?? null,
 			targetRef: null,
 			properties: { ...properties, lastTest: test },

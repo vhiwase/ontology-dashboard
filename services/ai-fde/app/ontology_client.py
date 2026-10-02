@@ -84,6 +84,9 @@ class OntologyClient:
     async def post(self, path: str, json_body: Any = None) -> Any:
         return await self._request("POST", path, json=json_body or {})
 
+    async def delete(self, path: str) -> Any:
+        return await self._request("DELETE", path)
+
 
 class ToolError(RuntimeError):
     pass

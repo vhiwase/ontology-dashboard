@@ -39,6 +39,26 @@ from .tools import TOOL_NAMES, run_tool, schemas_for, serialise_result
 
 log = logging.getLogger("ai_fde.agent")
 
+# Tools that change the platform. Their results are never served from the
+# duplicate-call cache, and a successful one empties it, because a read made
+# before it may no longer be true.
+WRITE_TOOLS = frozenset(
+    {
+        "create_sync",
+        "run_sync",
+        "schedule_sync",
+        "create_object_type",
+        "create_link_type",
+        "create_metric",
+        "create_action_type",
+        "delete_ontology_object",
+        "propose_function",
+        "create_dashboard",
+        "apply_action",
+        "notepad",
+    }
+)
+
 
 @dataclass
 class ToolInvocation:
@@ -103,13 +123,47 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "status": payload.get("status"),
             "result": payload.get("result"),
         }
-    if name == "get_lineage":
+    # What the assistant built, one card per change, so the reply shows the
+    # ontology growing rather than asking the reader to take the prose's word.
+    if name == "create_object_type" and payload.get("created"):
         return {
-            "kind": "lineage",
-            "subject": payload.get("subject"),
-            "upstreamByLayer": payload.get("upstreamByLayer"),
-            "sourceColumnCount": payload.get("sourceColumnCount"),
+            "kind": "ontologyChange",
+            "change": "objectType",
+            "apiName": payload.get("objectType"),
+            "detail": f"{payload.get('objects')} objects from {payload.get('dataset')}",
         }
+    if name == "create_link_type" and payload.get("created"):
+        ratio = payload.get("matchRatio") or 0
+        return {
+            "kind": "ontologyChange",
+            "change": "linkType",
+            "apiName": payload.get("link"),
+            "detail": f"{payload.get('matched')}/{payload.get('candidates')} resolve ({ratio:.0%})",
+        }
+    if name == "create_metric" and payload.get("created"):
+        return {
+            "kind": "ontologyChange",
+            "change": "kpi",
+            "apiName": payload.get("metric"),
+            "detail": f"= {payload.get('value')} {payload.get('unit') or ''}".strip(),
+        }
+    if name == "create_action_type" and payload.get("created"):
+        return {
+            "kind": "ontologyChange",
+            "change": "actionType",
+            "apiName": payload.get("action"),
+            "detail": f"on {payload.get('objectType')}",
+        }
+    if name == "create_sync" and payload.get("created"):
+        run = payload.get("run") or {}
+        return {
+            "kind": "ontologyChange",
+            "change": "dataset",
+            "apiName": payload.get("dataset"),
+            "detail": f"{run.get('rows', '?')} rows, {payload.get('schedule')}",
+        }
+    if name == "propose_function" and payload.get("functionProposed"):
+        return {"kind": "functionProposal", "function": payload.get("function")}
     if name in ("generate_plan", "manage_plan") and payload.get("plan"):
         return {"kind": "plan", "plan": payload["plan"]}
     if name == "manage_todo_list":
@@ -121,6 +175,30 @@ def _artifact_from(name: str, arguments: dict[str, Any], payload: dict[str, Any]
             "label": payload.get("label"),
         }
     return None
+
+
+_CHANGE_NOUNS = {
+    "dataset": "Synced",
+    "objectType": "Created object type",
+    "linkType": "Linked",
+    "kpi": "Defined metric",
+    "actionType": "Declared action",
+}
+
+
+def _summarise_changes(artifacts: list[dict[str, Any]]) -> str:
+    """What a turn changed, as a Markdown list, from its artifacts."""
+    lines = [
+        f"- {_CHANGE_NOUNS.get(a.get('change') or '', 'Changed')} `{a.get('apiName')}` ({a.get('detail')})"
+        for a in artifacts
+        if a.get("kind") == "ontologyChange"
+    ]
+    lines += [
+        f"- Proposed function `{(a.get('function') or {}).get('apiName')}`, awaiting approval"
+        for a in artifacts
+        if a.get("kind") == "functionProposal"
+    ]
+    return "\n".join(lines)
 
 
 def _looks_temporal(dimension: str | None) -> bool:
@@ -225,13 +303,24 @@ class Agent:
             try:
                 reply = await self.provider.chat(messages, None if is_final_round else schemas)
             except LlmError as exc:
+                # The rounds already run spent real tokens and may have built
+                # real things, so both are reported: the usage is recorded
+                # against the user, and the reply says what was done before
+                # the model stopped answering rather than only that it did.
+                done = _summarise_changes(artifacts)
                 return AgentResult(
-                    content=f"I could not reach the language model: {exc}",
+                    content=(
+                        f"I could not reach the language model: {exc}"
+                        + (f"\n\nBefore it stopped answering I had done this:\n\n{done}" if done else "")
+                    ),
                     tool_invocations=invocations,
                     artifacts=artifacts,
                     rounds=rounds,
+                    usage=usage,
                     latency_ms=int((time.monotonic() - started) * 1000),
                     stopped_because="llm_error",
+                    provider=provider_used,
+                    model=model_used,
                 )
 
             if reply.usage:
@@ -329,66 +418,6 @@ class Agent:
                         model=model_used,
                         )
 
-                # propose_pipeline is terminal too: a graph that runs writes
-                # real tables the dashboards read, so the turn ends and a
-                # person decides whether it becomes one.
-                if ok and call.name == "propose_pipeline" and payload.get("pipelineProposed"):
-                    drafted = payload.get("pipeline", {})
-                    nodes = len((drafted.get("graph") or {}).get("nodes") or [])
-                    return AgentResult(
-                        content=(
-                            f"I have drafted **{drafted.get('name')}** - a {nodes}-node "
-                            "pipeline. Every node compiles against the published views, "
-                            "but nothing has run."
-                            "\n\n"
-                            "Review the graph and accept it to make it runnable."
-                        ),
-                        tool_invocations=invocations,
-                        artifacts=[
-                            *artifacts,
-                            {
-                                "kind": "pipelineProposal",
-                                "pipeline": drafted,
-                                "compiled": payload.get("compiled", []),
-                            },
-                        ],
-                        rounds=rounds,
-                        usage=usage,
-                        latency_ms=int((time.monotonic() - started) * 1000),
-                        stopped_because="awaiting_pipeline_acceptance",
-                        provider=provider_used,
-                        model=model_used,
-                        )
-
-                # propose_function is terminal for the same reason. The draft
-                # computes nothing and cannot back a dashboard, so continuing
-                # would only let the model build on a metric nobody has
-                # approved - which is precisely what the proposal step exists
-                # to prevent. The turn ends and the review dialog opens.
-                if ok and call.name == "propose_function" and payload.get("functionProposed"):
-                    proposed = payload.get("function", {})
-                    return AgentResult(
-                        content=(
-                            f"There is no published metric for that, so I have drafted one: "
-                            f"**{proposed.get('name')}**. "
-                            f"{proposed.get('description') or ''}"
-                            "\n\n"
-                            "It is saved as a proposal and computes nothing yet. Review the "
-                            "definition and approve it to start using it."
-                        ),
-                        tool_invocations=invocations,
-                        artifacts=[
-                            *artifacts,
-                            {"kind": "functionProposal", "function": proposed},
-                        ],
-                        rounds=rounds,
-                        usage=usage,
-                        latency_ms=int((time.monotonic() - started) * 1000),
-                        stopped_because="awaiting_function_approval",
-                        provider=provider_used,
-                        model=model_used,
-                        )
-
                 messages.append(
                     {
                         "role": "tool",
@@ -398,11 +427,17 @@ class Agent:
                     }
                 )
 
+        done = _summarise_changes(artifacts)
         return AgentResult(
             content=(
-                "I ran out of steps before finishing that. Here is what I gathered: "
-                + ", ".join(f"{i.name}" for i in invocations[-4:])
-                + ". Ask me again more narrowly and I will get further."
+                "I ran out of steps before finishing that. "
+                + (
+                    f"This much is done:\n\n{done}\n\nAsk me to carry on and I will pick up from here."
+                    if done
+                    else "Here is what I gathered: "
+                    + ", ".join(f"{i.name}" for i in invocations[-4:])
+                    + ". Ask me again more narrowly and I will get further."
+                )
             ),
             tool_invocations=invocations,
             artifacts=artifacts,
@@ -431,7 +466,11 @@ class Agent:
         started = time.monotonic()
         payload, ok = await run_tool(call.name, call.arguments)
         duration_ms = int((time.monotonic() - started) * 1000)
-        if ok:
+        if ok and call.name in WRITE_TOOLS:
+            # Something changed, so every answer read before it may be stale:
+            # list_object_types after create_object_type must see the new type.
+            cache.clear()
+        elif ok:
             cache[key] = payload
         log.info(
             "tool %s %s in %dms", call.name, "ok" if ok else "FAILED", duration_ms

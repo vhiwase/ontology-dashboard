@@ -289,8 +289,8 @@ export function FunctionReview({
 						<section className="fn-section">
 							<h4>Definition</h4>
 							<p className="fn-hint">
-								A single read-only SELECT. It is re-checked against the published
-								ontology when you approve.
+								A single read-only SELECT over synced datasets. It is planned and run
+								again when you approve, in case a sync has changed a column since.
 							</p>
 							<textarea
 								className="fn-sql mono"

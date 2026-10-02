@@ -3,9 +3,9 @@ import type { OntologyDefinition } from "@ontograph/core";
 import { query, queryOne } from "./db";
 
 /**
- * The in-memory view of the published ontology.
+ * The in-memory view of each space's ontology.
  *
- * Loaded once at boot and refreshable on demand. Everything that builds SQL goes
+ * Loaded at boot and reloaded after every authoring change (definition.ts). Everything that builds SQL goes
  * through this registry, and only through it: a column name reaches a query only
  * after being matched against a property this registry knows about. That is the
  * single defence against injection in the whole service, so it is deliberately
@@ -108,6 +108,8 @@ export interface KpiMeta {
 	relatedObjectTypes: string[];
 	dependsOnSimulation: boolean;
 	coverageNote: string | null;
+	/** Equality conditions always applied: {sql_column: value | values}. */
+	conditions?: Record<string, unknown>;
 	displayOrder: number;
 }
 
@@ -135,19 +137,19 @@ export interface Registry {
 }
 
 /**
- * Raised when a space has no published ontology.
+ * Raised when a space has no ontology loaded.
  *
- * Distinct from "not loaded yet": an empty Staging is a NORMAL state with a
- * sensible answer ("nothing has been promoted here"), not a server fault. It
- * carries a 409 so routes render an empty state rather than a 500.
+ * Every space is given an (initially empty) ontology at boot, so this means a
+ * space created since - a normal state, not a server fault. It carries a 409
+ * so routes render an empty state rather than a 500.
  */
 export class NoOntologyInSpace extends Error {
 	readonly status = 409;
 
 	constructor(readonly spaceSlug: string) {
 		super(
-			`No ontology has been published in the '${spaceSlug}' space. ` +
-				"Run a pipeline in this space, or promote one from the sandbox.",
+			`The '${spaceSlug}' space has no ontology loaded yet. ` +
+				"Create an object type from one of its datasets to start one.",
 		);
 	}
 }
@@ -189,10 +191,9 @@ export function spacesWithOntology(): string[] {
 }
 
 // ── interfaces ──────────────────────────────────────────────────────────────
-// The pipeline emits InterfaceDefinitions (Geolocatable, Party,
-// ProvenanceTracked) and stamps `implements` on the entity types that satisfy
-// them. Until now nothing read them back: they existed only inside the raw
-// definition document and the OWL export. This is the read side.
+// InterfaceDefinitions in the document, and the types declaring `implements`
+// for them. The authored ontology declares none yet; this is the read side
+// for the day it does.
 
 export interface InterfaceMeta {
 	rid: string;
@@ -287,7 +288,13 @@ const registries = new Map<string, Registry>();
  * because a half-published ontology in staging should not take the sandbox
  * down with it.
  */
-export async function loadRegistry(): Promise<Registry> {
+export async function loadRegistry(onlySpace?: string): Promise<Registry> {
+	// One space's change reloads that space; everything else is left as it is.
+	if (onlySpace) {
+		registries.set(onlySpace, await loadRegistryForSpace(onlySpace));
+		return registries.get(onlySpace)!;
+	}
+
 	const spaces = await query<{ slug: string }>(
 		`SELECT s.slug
 		   FROM platform.space s
@@ -313,10 +320,7 @@ export async function loadRegistry(): Promise<Registry> {
 
 	const first = registries.get(DEFAULT_SPACE) ?? [...registries.values()][0];
 	if (!first) {
-		throw new Error(
-			"No active ontology in any space. Run the pipeline: " +
-				"docker compose run --rm pipeline python -m pipeline.run",
-		);
+		throw new Error("No active ontology in any space; ensureOntologies() runs before this at boot.");
 	}
 	return first;
 }
@@ -520,9 +524,8 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		tags: row.tags ?? [],
 	}));
 
-	// The catalogue is per-space (0012), so it is filtered by slug rather than
-	// by ontology version: the pipeline upserts it outside the version it
-	// publishes, so there is no version id on these rows to join through.
+	// The metric catalogue is per-space (0012), so it is filtered by slug
+	// rather than by ontology version: kpi_definition has no version column.
 	const kpiRows = await query<Record<string, any>>(
 		`SELECT k.*
 		   FROM platform.kpi_definition k
@@ -555,6 +558,7 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		relatedObjectTypes: row.related_object_types ?? [],
 		dependsOnSimulation: row.depends_on_simulation,
 		coverageNote: row.coverage_note,
+		conditions: row.conditions ?? {},
 		displayOrder: row.display_order,
 	}));
 

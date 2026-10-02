@@ -187,8 +187,8 @@ def _plan_status(plan: dict[str, Any]) -> str:
 async def generate_plan(arguments: dict[str, Any]) -> dict[str, Any]:
     """Write the plan this conversation will work through, for the user to read.
 
-    A plan is the artefact that turns "I will look at coverage, then propose a
-    pipeline, then you review it" from prose the user must trust into steps
+    A plan is the artefact that turns "I will profile the datasets, create the
+    object types, then link them" from prose the user must trust into steps
     they can watch being ticked off. It replaces any previous plan, with
     overwrite: true acknowledged explicitly, because silently discarding a
     plan someone was following is worse than an extra round trip.
@@ -472,7 +472,7 @@ async def get_resource_documentation(arguments: dict[str, Any]) -> dict[str, Any
     kind = str(arguments.get("kind") or "").strip()
     ref = str(arguments.get("ref") or "").strip()
     if not kind or not ref:
-        raise ToolError("kind and ref are both required, e.g. kind=kpi, ref=on_time_pct.")
+        raise ToolError("kind and ref are both required, e.g. kind=kpi, ref=order_count.")
     template = _DOC_PATHS.get(kind)
     if template is None:
         raise ToolError(
@@ -488,7 +488,7 @@ async def get_access_requirements(arguments: dict[str, Any]) -> dict[str, Any]:
 
     This platform is deliberately plain about access: platform role decides
     which routes answer, space decides which ontology is read, ontology role
-    decides which actions may run, and the simulation gate refuses anything
+    decides which actions may run, and the generated-data gate refuses anything
     flagged as resting on generated data. There are no markings and no
     restricted views yet - saying so plainly is the feature; implying a
     classification exists when it does not would be the failure mode.
@@ -525,10 +525,11 @@ async def get_access_requirements(arguments: dict[str, Any]) -> dict[str, Any]:
         "accessModel": {
             "readRoutes": "platform role viewer or above",
             "buildRoutes": (
-                "platform role analyst - dashboard create, action validate"
+                "platform role analyst - syncs, schedules, object types, links, "
+                "actions, metrics, function proposals, dashboards"
             ),
             "adminRoutes": (
-                "platform role admin - audit trail, registry reload, deletes"
+                "platform role admin - function approval, audit trail, deletes"
             ),
             "actions": "ontology role, checked against each action's allowedRoles",
         },
@@ -546,8 +547,8 @@ async def get_access_requirements(arguments: dict[str, Any]) -> dict[str, Any]:
         "actionsOnThisObject": related,
         "gates": [
             "Space isolation: this conversation reads only its own space's ontology.",
-            "Simulation gate: anything flagged dependsOnSimulation is refused "
-            "while ALLOW_SIMULATED_DATA is false.",
+            "Generated-data gate: anything flagged dependsOnSimulation is refused "
+            "while ALLOW_SIMULATED_DATA is false. Nothing is flagged today.",
             "Connection credentials are never stored - only the name of the "
             "secret that holds them.",
             "No markings or restricted views are configured on this platform.",
@@ -573,9 +574,9 @@ async def browse_workspace(arguments: dict[str, Any]) -> dict[str, Any]:
     """Read the workspace tree: spaces, then projects, then folders/resources.
 
     The Compass shape - space, project, folder, resource - exists in the UI;
-    this is the assistant's read-only window onto it. Creating and moving
-    things stays a human act in /spaces, the same way ontology edits stay in
-    the workbench.
+    this is the assistant's read-only window onto it. Connections, syncs and
+    ontology objects are created through their own tools, which file their
+    cards in the workspace themselves.
     """
     scope = str(arguments.get("scope") or "spaces").strip()
     space = current_space.get()
@@ -632,38 +633,15 @@ async def list_functions(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def list_interfaces(_: dict[str, Any]) -> dict[str, Any]:
-    """The interfaces object types declare `implements` for.
-
-    An interface is the ontology's claim that several types share a shape -
-    everything Geolocatable has coordinates, everything Party is a
-    counterparty. Knowing them lets an answer generalise honestly ("every
-    Party type carries entity_name") instead of enumerating types by hand.
-    """
-    rows = await client.get("/api/interfaces")
-    return {
-        "interfaces": rows,
-        "note": (
-            "implementors are the object types declaring this interface; "
-            "requiredAttributes are the properties they all carry."
-        ),
-    }
-
-
 async def list_schedules(_: dict[str, Any]) -> dict[str, Any]:
-    """What fires itself in this space, and when it last did.
-
-    Read-only by design: creating or pausing a schedule writes the cadence
-    other people rely on, which stays a human act on /schedules.
-    """
+    """How often each sync runs in this space, and how its last run went."""
     rows = await client.get("/api/schedules")
     return {
         "schedules": [
             {
                 "name": s["name"],
-                "kind": s["kind"],
-                "target": s["targetRef"],
-                "intervalSeconds": s["intervalSeconds"],
+                "syncId": s["targetRef"],
+                "every": s.get("every") or f"every {s['intervalSeconds']}s",
                 "enabled": s["enabled"],
                 "nextRunAt": s["nextRunAt"],
                 "lastStatus": s["lastStatus"],
@@ -673,9 +651,8 @@ async def list_schedules(_: dict[str, Any]) -> dict[str, Any]:
             for s in rows
         ],
         "note": (
-            "Enabled schedules fire automatically; lastStatus 'failed' means "
-            "the target errored and the reason is in lastError. To create or "
-            "pause one, point the user at the Schedules page."
+            "Enabled schedules run their sync automatically; lastStatus 'failed' means "
+            "the sync errored and the reason is in lastError. schedule_sync changes one."
         ),
     }
 
@@ -697,7 +674,6 @@ CAPABILITY_TOOLS: dict[str, Any] = {
     "get_action_audit": get_action_audit,
     "browse_workspace": browse_workspace,
     "list_functions": list_functions,
-    "list_interfaces": list_interfaces,
     "list_schedules": list_schedules,
 }
 
@@ -722,9 +698,10 @@ CAPABILITY_TOOL_SCHEMAS: list[dict[str, Any]] = [
     _schema(
         "change_mode",
         "Switch your operational mode, which changes which tools are loaded. "
-        "Switch when the task moves to a different kind of work - building a "
-        "pipeline, working with metrics, governance questions. The turn "
-        "continues with the new tool set; capabilities you enabled stay on.",
+        "Switch when the task moves to a different kind of work - syncing data "
+        "(dataConnection), building object types, links, actions and metrics "
+        "(ontologyEditing), functions, dashboards, governance. The turn continues "
+        "with the new tool set; capabilities you enabled stay on.",
         {
             "mode": {
                 "type": "string",
@@ -847,7 +824,7 @@ CAPABILITY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "Load one documentation page in full, by the path a "
         "search_documentation result gave you. Use when a scored excerpt is "
         "not enough to answer or cite accurately.",
-        {"path": {"type": "string", "description": "e.g. metric/on_time_pct"}},
+        {"path": {"type": "string", "description": "e.g. platform/data-flow"}},
         ["path"],
     ),
     _schema(
@@ -892,19 +869,11 @@ CAPABILITY_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     ),
     _schema(
-        "list_interfaces",
-        "List the interfaces object types implement - the shared shapes in this "
-        "ontology (e.g. everything Party carries entity_name and is_active). Use "
-        "when an answer should generalise across types rather than enumerate them.",
-        {"type": "object", "properties": {}},
-    ),
-    _schema(
         "list_schedules",
-        "List the schedules in this space: what fires itself (a sync or a "
-        "pipeline), its interval, whether it is enabled, and the last run's "
-        "status. Use for 'what runs automatically' or 'why didn't the nightly "
-        "sync happen' questions.",
-        {"type": "object", "properties": {}},
+        "List how often each sync runs in this space, whether it is enabled, and "
+        "how its last run went. Use for 'what refreshes automatically' or 'why is "
+        "this dataset stale' questions.",
+        {},
     ),
     _schema(
         "list_functions",

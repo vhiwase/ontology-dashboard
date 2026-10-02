@@ -20,6 +20,7 @@ import {
 	round,
 } from "../api";
 import { useSpace } from "../SpaceContext";
+import { NoObjectTypesYet } from "../components/ontology/NoObjectTypesYet";
 import {
 	DataTable,
 	Empty,
@@ -180,6 +181,7 @@ export function ObjectExplorer() {
 	if (missing)
 		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (!types) return <Spinner label="Loading object types" />;
+	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
 		<div className="col" style={{ gap: 12 }}>
