@@ -33,7 +33,7 @@
  * is reported as `truncated` rather than quietly reported as complete.
  */
 
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { vetHost } from "./connectionPolicy";
 import { ownDatabase, pool, query, queryOne } from "./db";
 import { clearColumnCache } from "./kpi";
@@ -1118,6 +1118,62 @@ export async function runSync(syncId: number, triggeredBy: string): Promise<Sync
 	}
 }
 
+/**
+ * Whether an existing landing table can be refilled in place: every column it
+ * has is still read, with the same type. Returns the columns to add, or null
+ * when the table has to be rebuilt. Mapped types carry no modifiers (see
+ * TYPE_MAP), so PostgreSQL's canonical type name is enough to compare them.
+ */
+async function reusableLanding(
+	client: PoolClient,
+	targetTable: string,
+	columns: Array<{ name: string; localType: string }>,
+): Promise<{ added: Array<{ name: string; localType: string }> } | null> {
+	const current = await client.query<{ name: string; type: string }>(
+		`SELECT a.attname AS name, a.atttypid::regtype::text AS type
+		   FROM pg_attribute a
+		   JOIN pg_class c ON c.oid = a.attrelid
+		   JOIN pg_namespace n ON n.oid = c.relnamespace
+		  WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped`,
+		[LANDING_SCHEMA, targetTable],
+	);
+	const canonical = await client.query<{ type: string }>(
+		"SELECT t::regtype::text AS type FROM unnest($1::text[]) WITH ORDINALITY AS u(t, i) ORDER BY i",
+		[columns.map((column) => column.localType)],
+	);
+	const wanted = new Map(columns.map((column, i) => [column.name, canonical.rows[i]?.type]));
+	for (const existing of current.rows) {
+		if (wanted.get(existing.name) !== existing.type) return null;
+	}
+	const have = new Set(current.rows.map((row) => row.name));
+	return { added: columns.filter((column) => !have.has(column.name)) };
+}
+
+/**
+ * A landing table whose columns changed cannot be dropped while views read
+ * it. Say which, rather than PostgreSQL's "other objects depend on it".
+ */
+async function refuseIfDependedOn(client: PoolClient, targetTable: string): Promise<void> {
+	const dependants = await client.query<{ view: string }>(
+		`SELECT DISTINCT vn.nspname || '.' || v.relname AS view
+		   FROM pg_depend d
+		   JOIN pg_rewrite r ON r.oid = d.objid
+		   JOIN pg_class v ON v.oid = r.ev_class
+		   JOIN pg_namespace vn ON vn.oid = v.relnamespace
+		   JOIN pg_class t ON t.oid = d.refobjid
+		   JOIN pg_namespace tn ON tn.oid = t.relnamespace
+		  WHERE tn.nspname = $1 AND t.relname = $2 AND v.oid <> t.oid
+		  ORDER BY 1`,
+		[LANDING_SCHEMA, targetTable],
+	);
+	if (dependants.rowCount) {
+		throw new Error(
+			`the source table's columns changed and ${dependants.rows.map((row) => row.view).join(", ")} ` +
+				"read the old ones. Remove the datasets built on it, then sync again.",
+		);
+	}
+}
+
 /** Rebuild the landing table from the rows a run read, in one transaction. */
 async function writeLanding(
 	targetTable: string,
@@ -1145,8 +1201,24 @@ async function writeLanding(
 		}
 
 		// Rebuilt, not appended to: the dataset is what the source holds now.
-		await client.query(`DROP TABLE IF EXISTS ${target}`);
-		await client.query(`CREATE TABLE ${target} (${definition})`);
+		// When the columns are unchanged, or only gained some, the table is
+		// emptied in place: views built on it (combinations, timing datasets)
+		// stay valid. Only a real change of shape drops it.
+		const kept = exists.rowCount
+			? await reusableLanding(client, targetTable, columns)
+			: null;
+		if (kept) {
+			await client.query(`TRUNCATE ${target}`);
+			for (const column of kept.added) {
+				await client.query(
+					`ALTER TABLE ${target} ADD COLUMN ${quoteIdentifier(column.name)} ${column.localType}`,
+				);
+			}
+		} else {
+			if (exists.rowCount) await refuseIfDependedOn(client, targetTable);
+			await client.query(`DROP TABLE IF EXISTS ${target}`);
+			await client.query(`CREATE TABLE ${target} (${definition})`);
+		}
 
 		if (rows.length > 0 && columns.length > 0) {
 			// Batched multi-row inserts, sized from the column count so a statement

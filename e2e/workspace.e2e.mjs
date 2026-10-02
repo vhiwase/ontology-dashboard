@@ -135,6 +135,27 @@ test("a dashboard request is built, or proposed and built on approval", { skip: 
 	assert.ok((await page.locator(".report-doc .report-section").count()) > 0);
 });
 
+test("syncing again keeps what was approved on top of the data", { skip: !configured && "E2E_SOURCE_* not set" }, async () => {
+	// A refresh (by hand or on a schedule) must not trip over the datasets an
+	// approval built on the synced tables.
+	const login = await fetch(`${BASE}/api/auth/login`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ username: user, password }),
+	});
+	assert.equal(login.status, 200);
+	const { token } = await login.json();
+	const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+	const syncs = await (await fetch(`${BASE}/api/syncs`, { headers })).json();
+	assert.ok(syncs.length > 0, "the import created syncs");
+	for (const sync of syncs) {
+		const response = await fetch(`${BASE}/api/syncs/${sync.id}/run`, { method: "POST", headers, body: "{}" });
+		const body = await response.json();
+		assert.equal(response.status, 200, `${sync.name}: ${JSON.stringify(body)}`);
+		assert.equal(body.run.status, "success", `${sync.name}: ${body.run.errorMessage}`);
+	}
+});
+
 test("approvals are listed with their outcome", { skip: !configured && "E2E_SOURCE_* not set" }, async () => {
 	await page.goto(`${BASE}/approvals`);
 	await page.getByRole("tab", { name: /All/ }).click();
