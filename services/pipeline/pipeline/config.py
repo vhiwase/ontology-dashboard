@@ -74,6 +74,14 @@ class Config:
     )
     sim_seed: int = field(default_factory=lambda: int(_num("PIPELINE_SIM_SEED", 20260919)))
     force_reingest: bool = field(default_factory=lambda: _flag("PIPELINE_FORCE_REINGEST", False))
+    # Whether a missing snapshot is an error. Off by default: without the
+    # snapshot the platform starts as an empty workspace that people fill by
+    # connecting their own PostgreSQL tables (see pipeline/workspace.py). Set
+    # it where the TMS snapshot is the whole point of the deployment and its
+    # absence means a volume was not mounted.
+    require_snapshot: bool = field(
+        default_factory=lambda: _flag("PIPELINE_REQUIRE_SNAPSHOT", False)
+    )
 
     # A discovered join is promoted to a link type once at least this share of
     # non-null source values resolve to a target row. Deliberately low: the TMS

@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from typing import Any
@@ -39,8 +40,49 @@ from .lineage_gen import build_lineage
 from .ontology_gen import generate
 from .relationships import discover_links
 from .simulate import run_simulation
+from .workspace import ensure_workspace_ontology
 
 log = logging.getLogger("pipeline")
+
+
+def snapshot_available(source_dir: str) -> bool:
+    """Whether the captured TMS payloads are mounted where the config says."""
+    return os.path.isdir(source_dir)
+
+
+def run_workspace_mode(conn, dry_run: bool) -> int:
+    """Start the platform as an empty workspace when there is no snapshot.
+
+    Every stage after ingest is TMS-specific - the views it introspects, the
+    KPI catalogue, the starter dashboards - and would publish an ontology of
+    twenty empty object types. Instead the space gets an empty ontology that
+    connected tables are modelled into, and nothing is generated to fill it.
+    """
+    log.warning(
+        "No TMS snapshot at %s. Starting as an empty workspace: connect a PostgreSQL "
+        "database from the UI and model its tables, or mount the snapshot and re-run. "
+        "Set PIPELINE_REQUIRE_SNAPSHOT=true to make this an error instead.",
+        CONFIG.source_dir,
+    )
+    stages = StageLog()
+    outcome = ensure_workspace_ontology(conn, CONFIG.space)
+    stages.record("workspace", "success", {**outcome, "sourceDir": CONFIG.source_dir})
+    execute(
+        conn,
+        """
+        INSERT INTO platform.generation_run
+            (status, finished_at, stage_log, views_scanned, object_types, link_types,
+             kpis, lineage_nodes)
+        VALUES ('success', now(), %s, 0, 0, 0, 0, 0)
+        """,
+        (stages.as_json(),),
+    )
+    if dry_run:
+        conn.rollback()
+        log.warning("--dry-run: everything above was rolled back.")
+    else:
+        conn.commit()
+    return 0
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -137,6 +179,20 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = connect()
     _assert_schema_ready(conn)
+
+    if not args.skip_ingest and not snapshot_available(CONFIG.source_dir):
+        if CONFIG.require_snapshot:
+            log.error(
+                "Source directory %s does not exist and PIPELINE_REQUIRE_SNAPSHOT is set. "
+                "docker-compose mounts TMS_MCP/api_responses there; check the volume.",
+                CONFIG.source_dir,
+            )
+            conn.close()
+            return 1
+        try:
+            return run_workspace_mode(conn, args.dry_run)
+        finally:
+            conn.close()
 
     run_row = query_one(
         conn,
