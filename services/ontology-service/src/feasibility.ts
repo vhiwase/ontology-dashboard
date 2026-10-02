@@ -32,6 +32,7 @@ import {
 	type PropertyMeta,
 } from "./registry";
 import { query } from "./db";
+import { kpiColumns } from "./kpi";
 import { quoteIdentifier, quoteQualified } from "./registry";
 
 export type Intent = "chart" | "dashboard" | "report" | "link" | "combination" | "metric" | "capabilities";
@@ -63,6 +64,8 @@ export interface FeasibilityItem {
 	explanation: string;
 	kpi?: string;
 	dimension?: string | null;
+	/** Values the question named, as filters on the metric's view: {column: value | values}. */
+	filters?: Record<string, string | string[]>;
 	widget?: Widget;
 	proposals?: DraftProposal[];
 	missing?: string[];
@@ -1726,6 +1729,320 @@ async function capabilities(): Promise<FeasibilityItem[]> {
 }
 
 /** Answer a feasibility question, from free text or structured requests. */
+// ── values named in a question ──────────────────────────────────────────────
+//  "Revenue in Germany", "late orders shipped to France": a value the data
+//  holds narrows the figure. Without this the value was read as noise and
+//  the answer was the figure for everything - a wrong number, stated as
+//  right. Values are read from the data, never guessed: a word counts only
+//  when a category column of the workspace holds it exactly.
+
+/** Category columns with more distinct values than this are not scanned. */
+const VALUE_SCAN_LIMIT = 300;
+const CONNECTORS = /(?:^|\s)(?:in|from|to|for|at|of|with|on|via|by|among|within|inside|based in|located in)\s*$/;
+
+export interface ValueMention {
+	/** As stored in the data. */
+	value: string;
+	/** Where it sits in the question (lower-cased). */
+	start: number;
+	end: number;
+	/** The words just before it: "shipped to", "customers in". */
+	lead: string[];
+	/** A type named just before it ("customers in Brazil"), when one is. */
+	qualifier: ObjectTypeMeta | null;
+	/** Where the data holds it. */
+	holders: Array<{ type: ObjectTypeMeta; property: PropertyMeta }>;
+}
+
+const valueCache = new WeakMap<object, Map<string, string[]>>();
+
+async function categoryValues(type: ObjectTypeMeta, property: PropertyMeta): Promise<string[]> {
+	const registry = getRegistry();
+	let cache = valueCache.get(registry);
+	if (!cache) {
+		cache = new Map();
+		valueCache.set(registry, cache);
+	}
+	const key = `${type.sourceView}\u0000${property.sqlColumn}`;
+	const cached = cache.get(key);
+	if (cached) return cached;
+	let values: string[] = [];
+	try {
+		const column = quoteIdentifier(property.sqlColumn);
+		const rows = await query<{ v: string }>(
+			`SELECT DISTINCT ${column}::text AS v FROM ${quoteQualified(type.sourceView)}
+			  WHERE ${column} IS NOT NULL LIMIT ${VALUE_SCAN_LIMIT + 1}`,
+		);
+		values = rows.length > VALUE_SCAN_LIMIT ? [] : rows.map((row) => row.v);
+	} catch {
+		values = [];
+	}
+	cache.set(key, values);
+	return values;
+}
+
+/** Words that already mean something to the ontology, so are not read as values. */
+function vocabulary(): Set<string> {
+	const known = new Set<string>([...STOPWORDS, ...COUNT_WORDS, ...TIME_WORDS, ...GROUP_OF.keys(), ...GROUP_OF.values()]);
+	for (const [, grain] of GRAIN_WORDS) known.add(grain);
+	const registry = getRegistry();
+	for (const type of registry.objectTypes) {
+		for (const t of typeTokens(type)) known.add(t);
+		for (const property of type.properties) for (const t of propertyTokens(property)) known.add(t);
+	}
+	for (const kpi of registry.kpis) for (const t of tokens(kpi.label)) known.add(t);
+	return known;
+}
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Category values of the workspace that the question names, longest first. */
+export async function valueMentions(text: string): Promise<ValueMention[]> {
+	const lowered = text.toLowerCase();
+	const known = vocabulary();
+	const found = new Map<string, ValueMention>();
+	for (const type of getRegistry().objectTypes) {
+		const categories = type.properties.filter(
+			(p) => (p.semanticRole === "dimension" || p.semanticRole === "title") && !p.isIdentity && p.datatype === "string",
+		);
+		for (const property of categories) {
+			for (const value of await categoryValues(type, property)) {
+				const needle = value.trim().toLowerCase();
+				if (!/\p{L}/u.test(needle)) continue;
+				// Short codes ("UK", "WA") only when written exactly as stored.
+				if (needle.length < 3 && !(value.length >= 2 && value === value.toUpperCase() && text.includes(value))) continue;
+				// A value that is only words the ontology already uses ("Order",
+				// "Total") would hijack ordinary questions.
+				if (words(needle).every((w) => known.has(singular(w)) || known.has(w))) continue;
+				const match = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(needle)}(?![\\p{L}\\p{N}])`, "u").exec(lowered);
+				if (!match) continue;
+				const id = `${match.index}:${needle}`;
+				const mention = found.get(id) ?? {
+					value,
+					start: match.index,
+					end: match.index + needle.length,
+					lead: [],
+					qualifier: null,
+					holders: [],
+				};
+				mention.holders.push({ type, property });
+				found.set(id, mention);
+			}
+		}
+	}
+	// Longest first; a shorter value inside a longer one ("York" in "New York") is dropped.
+	const chosen: ValueMention[] = [];
+	for (const mention of [...found.values()].sort((a, b) => b.end - b.start - (a.end - a.start))) {
+		if (chosen.some((c) => mention.start < c.end && c.start < mention.end)) continue;
+		const before = lowered.slice(0, mention.start);
+		mention.lead = words(before).slice(-3);
+		// "customers in Brazil": the type named just before the connector.
+		const qualified = /(\p{L}+)\s+(?:in|from|at|based in|located in|within)\s*$/u.exec(before);
+		if (qualified) {
+			const named = getRegistry().objectTypes.find((type) => namesTypeExactly(qualified[1]!, type));
+			if (named && mention.holders.some((h) => h.type.rid === named.rid)) mention.qualifier = named;
+		}
+		chosen.push(mention);
+	}
+	return chosen.sort((a, b) => a.start - b.start);
+}
+
+/**
+ * The question without the values it names, so the measure is read from
+ * what is left: "orders from customers in Brazil by employee" becomes
+ * "orders by employee".
+ */
+export function withoutMentions(text: string, mentions: ValueMention[]): string {
+	let lowered = text.toLowerCase();
+	for (const mention of [...mentions].sort((a, b) => b.start - a.start)) {
+		let start = mention.start;
+		let head = lowered.slice(0, start);
+		const connector = CONNECTORS.exec(head);
+		if (connector) {
+			start = connector.index;
+			head = lowered.slice(0, start);
+			if (mention.qualifier) {
+				// ...and "from customers" before "in Brazil".
+				// Only as a qualifying phrase: "how many customers in Mexico" keeps
+				// its subject.
+				const named = new RegExp(`\\s(?:from|of|for|by|with|among|to)\\s+(?:the\\s+)?\\p{L}+\\s*$`, "u").exec(head);
+				if (named && namesTypeExactly(named[0].trim().split(/\s+/).at(-1)!, mention.qualifier)) start = named.index;
+			}
+		}
+		lowered = `${lowered.slice(0, start)} ${lowered.slice(mention.end)}`;
+	}
+	return lowered.replace(/\s+/g, " ").trim();
+}
+
+/** Text columns of a view, and which of them hold one value. */
+async function columnsHolding(view: string, value: string): Promise<string[]> {
+	const [schema, name] = view.split(".");
+	const columns = await query<{ column_name: string }>(
+		`SELECT column_name FROM information_schema.columns
+		  WHERE table_schema = $1 AND table_name = $2
+		    AND data_type IN ('text', 'character varying', 'character')
+		  ORDER BY ordinal_position`,
+		[schema, name],
+	);
+	if (columns.length === 0) return [];
+	const checks = columns.map((c, i) => `bool_or(${quoteIdentifier(c.column_name)} = $1) AS c${i}`).join(", ");
+	try {
+		const [row] = await query<Record<string, boolean | null>>(`SELECT ${checks} FROM ${quoteQualified(view)}`, [value]);
+		return columns.filter((_c, i) => row?.[`c${i}`] === true).map((c) => c.column_name);
+	} catch {
+		return [];
+	}
+}
+
+function prefixMatch(a: string, b: string): boolean {
+	return a.length >= 3 && b.length >= 3 && (a.startsWith(b) || b.startsWith(a));
+}
+
+/**
+ * The same figure on a combined dataset that keeps one row per record of the
+ * metric's type - "Order Timing" for orders - which carries more to filter by.
+ */
+function twinKpis(kpi: KpiMeta): KpiMeta[] {
+	const registry = getRegistry();
+	const base = kpi.objectTypeRid ? registry.objectTypeByRid.get(kpi.objectTypeRid) : undefined;
+	if (!base || Object.keys(kpi.conditions ?? {}).length) return [];
+	const twins = registry.objectTypes.filter(
+		(t) =>
+			t.rid !== base.rid &&
+			t.origin === "combination" &&
+			t.primaryKeyColumn === base.primaryKeyColumn &&
+			t.rowCount === base.rowCount,
+	);
+	return registry.kpis.filter(
+		(k) =>
+			twins.some((t) => t.rid === k.objectTypeRid) &&
+			k.aggregation === kpi.aggregation &&
+			(k.measureColumn ?? null) === (kpi.measureColumn ?? null) &&
+			Object.keys(k.conditions ?? {}).length === 0,
+	);
+}
+
+interface Narrowed {
+	filters: Record<string, string[]>;
+	described: string[];
+}
+
+interface NotNarrowed {
+	mention: ValueMention;
+	holding: string[];
+}
+
+/** Each value on the column of the metric's view that holds it as asked, or the first that cannot be placed. */
+async function placeMentions(kpi: KpiMeta, mentions: ValueMention[]): Promise<Narrowed | NotNarrowed> {
+	const registry = getRegistry();
+	const base = kpi.objectTypeRid ? registry.objectTypeByRid.get(kpi.objectTypeRid) ?? null : null;
+	const filters: Record<string, string[]> = {};
+	const described: string[] = [];
+	for (const mention of mentions) {
+		const holding = await columnsHolding(kpi.sourceView, mention.value);
+		const lead = mention.lead.filter((w) => !STOPWORDS.has(w));
+		const qualifierTokens = mention.qualifier ? words(mention.qualifier.apiName).map((w) => singular(w)) : [];
+		const scored = holding
+			.map((column) => {
+				const parts = words(column);
+				let score = 0;
+				if (lead.some((w) => parts.some((p) => prefixMatch(w, p)))) score += 2;
+				if (qualifierTokens.length && qualifierTokens.every((q) => parts.includes(q))) score += 3;
+				if (mention.holders.some((h) => h.property.sqlColumn === column || column.endsWith(`_${h.property.sqlColumn}`))) score += 1;
+				return { column, score };
+			})
+			.sort((a, b) => b.score - a.score);
+		// "Customers in Brazil" asks about the customer's country; a ship
+		// country that happens to hold Brazil answers something else.
+		const qualifierWanted = mention.qualifier !== null && mention.qualifier.rid !== base?.rid;
+		const best = scored[0];
+		if (!best || (qualifierWanted && !qualifierTokens.every((q) => words(best.column).includes(q)))) {
+			return { mention, holding };
+		}
+		(filters[best.column] ??= []).push(mention.value);
+		described.push(`${humanize(best.column).toLowerCase()} ${mention.value}`);
+	}
+	return { filters, described };
+}
+
+/**
+ * Narrow a ready item to the values its question named, or say why it cannot
+ * be narrowed. Never returns the unfiltered figure as the answer.
+ */
+export async function narrowToMentions(item: FeasibilityItem, mentions: ValueMention[]): Promise<FeasibilityItem> {
+	if (mentions.length === 0 || item.status !== "ready" || !item.kpi) return item;
+	const registry = getRegistry();
+	const kpi = registry.kpiByApiName.get(item.kpi);
+	if (!kpi) return item;
+
+	let placed = await placeMentions(kpi, mentions);
+	let used = kpi;
+	if (!("filters" in placed)) {
+		// The figure as asked, from a dataset that carries the column: only
+		// when it can still be sliced the same way.
+		const sliceColumn = item.dimension ? item.dimension.split(":")[0]! : null;
+		for (const twin of twinKpis(kpi)) {
+			if (sliceColumn && !(await kpiColumns(twin.apiName)).has(sliceColumn)) continue;
+			const attempt = await placeMentions(twin, mentions);
+			if ("filters" in attempt) {
+				placed = attempt;
+				used = twin;
+				break;
+			}
+		}
+	}
+
+	if (!("filters" in placed)) {
+		const { mention, holding } = placed;
+		const base = kpi.objectTypeRid ? registry.objectTypeByRid.get(kpi.objectTypeRid) ?? null : null;
+		const subject = base ? plural(base.label).toLowerCase() : kpi.label;
+		const where = mention.holders
+			.filter((h) => h.type.origin !== "combination")
+			.map((h) => `${h.type.label} ${humanize(h.property.sqlColumn).toLowerCase()}`)
+			.filter((v, i, all) => all.indexOf(v) === i)
+			.slice(0, 3)
+			.join(", ");
+		const asked = mention.qualifier ? `${plural(mention.qualifier.label).toLowerCase()} in ${mention.value}` : mention.value;
+		const holderType = mention.qualifier ?? mention.holders.find((h) => h.type.origin !== "combination")?.type ?? null;
+		const combine = base && holderType && holderType.rid !== base.rid ? `Combine ${subject} with their ${plural(holderType.label).toLowerCase()}` : null;
+		return {
+			request: item.request,
+			status: "not_possible",
+			explanation:
+				`${kpi.label} cannot be limited to ${asked}: ` +
+				(holding.length
+					? `what it is measured from holds "${mention.value}" only as ${holding.map((c) => humanize(c).toLowerCase()).join(", ")}, which is not what was asked. `
+					: `nothing it is measured from holds "${mention.value}". `) +
+				`"${mention.value}" is ${where ? `a ${where}` : "in the data"}.` +
+				(combine ? ` ${combine} and it can be filtered by it.` : ""),
+			kpi: kpi.apiName,
+			missing: [`${asked} on ${base?.label ?? kpi.label}`],
+			alternatives: [
+				...(combine ? [combine] : []),
+				...holding.map((c) => `${kpi.label} for ${humanize(c).toLowerCase()} ${mention.value}`),
+			].slice(0, 4),
+		};
+	}
+
+	const { filters, described } = placed;
+	const flat: Record<string, string | string[]> = Object.fromEntries(
+		Object.entries(filters).map(([column, values]) => [column, values.length === 1 ? values[0]! : values]),
+	);
+	const values = Object.values(filters).flat();
+	const ready = used === kpi ? item : readyItem(item.request, used, item.dimension ?? null);
+	const widget = ready.widget
+		? { ...ready.widget, filters: flat, title: `${ready.widget.title ?? used.label} - ${values.join(", ")}` }
+		: undefined;
+	return {
+		...ready,
+		filters: flat,
+		widget,
+		explanation: `${ready.explanation} Limited to ${described.join(" and ")}.`,
+	};
+}
+
 export async function assess(input: { text?: string; requests?: FeasibilityRequest[]; intent?: Intent; objectType?: string }): Promise<FeasibilityReport> {
 	const text = String(input.text ?? "").trim();
 	const intent: Intent = input.intent ?? (text ? detectIntent(text) : "chart");
@@ -1830,16 +2147,28 @@ export async function assess(input: { text?: string; requests?: FeasibilityReque
 						})
 				: [];
 		for (const request of requests) {
+			// Values the question names are filters, read from what is left.
+			const mentions = !input.requests?.length && request.text ? await valueMentions(request.text) : [];
+			const reparsed = mentions.length ? parseQuestion(withoutMentions(request.text!, mentions)) : null;
 			const parsed = request.text && !request.measure ? parseQuestion(request.text) : null;
-			items.push(
-				await decide({
-					...request,
-					measure: request.measure ?? parsed?.measure,
-					dimension: request.dimension ?? parsed?.dimension ?? undefined,
-					grain: request.grain ?? parsed?.grain ?? undefined,
-					aggregation: request.aggregation ?? parsed?.aggregation ?? undefined,
-				}),
+			const decided = await decide(
+				reparsed
+					? {
+							...request,
+							measure: reparsed.measure,
+							dimension: reparsed.dimension ?? undefined,
+							grain: reparsed.grain ?? undefined,
+							aggregation: reparsed.aggregation ?? undefined,
+						}
+					: {
+							...request,
+							measure: request.measure ?? parsed?.measure,
+							dimension: request.dimension ?? parsed?.dimension ?? undefined,
+							grain: request.grain ?? parsed?.grain ?? undefined,
+							aggregation: request.aggregation ?? parsed?.aggregation ?? undefined,
+						},
 			);
+			items.push(await narrowToMentions(decided, mentions));
 		}
 		if (intent === "dashboard" || intent === "report") {
 			layout = items.filter((i) => i.widget).map((i) => i.widget!);

@@ -263,6 +263,8 @@ async def execute_kpi(arguments: dict[str, Any]) -> dict[str, Any]:
         # The metric's own conditions ("completed orders only"), so the
         # figure is described with them.
         "conditions": result.get("conditions") or {},
+        # The caller's filters, as applied: a narrowed figure is described as one.
+        "filters": result.get("appliedFilters") or {},
         "target": result["target"],
         "higherIsBetter": result["higherIsBetter"],
     }

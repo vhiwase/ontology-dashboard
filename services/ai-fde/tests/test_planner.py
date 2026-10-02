@@ -99,6 +99,42 @@ def test_ready_charts_are_executed_then_answered_from_their_numbers():
     assert answer.endswith(PLANNER_NOTE)
 
 
+def test_a_narrowed_figure_is_run_with_its_filters_and_says_so():
+    narrowed = {
+        "intent": "chart",
+        "items": [
+            {
+                "status": "ready",
+                "kpi": "revenue_sum",
+                "dimension": None,
+                "filters": {"ship_country": "Germany"},
+                "explanation": "Total Revenue is ready. Limited to ship country Germany.",
+                "request": {"text": "revenue in Germany"},
+                "widget": {"type": "stat", "title": "Total Revenue - Germany"},
+            }
+        ],
+    }
+    first = transcript("revenue in Germany", ([("check_feasibility", {})], [narrowed]))
+    calls = next_calls(current_turn(first))
+    assert calls[0].arguments["filters"] == {"ship_country": "Germany"}
+
+    result = {**SERIES, "dimension": None, "dimensionLabel": None, "series": [], "total": 400.0, "filters": {"ship_country": "Germany"}}
+    done = transcript(
+        "revenue in Germany",
+        ([("check_feasibility", {})], [narrowed]),
+        ([("execute_kpi", calls[0].arguments)], [result]),
+    )
+    assert next_calls(current_turn(done)) == []
+    assert "**Total Revenue (Germany)**: 400" in compose_answer(current_turn(done))
+    # The unfiltered run of the same metric is a different run, not this answer.
+    unfiltered = transcript(
+        "revenue in Germany",
+        ([("check_feasibility", {})], [narrowed]),
+        ([("execute_kpi", {"kpi": "revenue_sum", "dimension": None})], [{**result, "filters": {}, "total": 1000.0}]),
+    )
+    assert next_calls(current_turn(unfiltered))[0].arguments["filters"] == {"ship_country": "Germany"}
+
+
 def test_a_timeline_is_not_cut_to_twelve_periods():
     report = {**READY_CHART, "items": [{**READY_CHART["items"][0], "dimension": "order_date:month"}]}
     calls = next_calls(current_turn(transcript("revenue per month", ([("check_feasibility", {})], [report]))))

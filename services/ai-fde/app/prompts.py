@@ -61,8 +61,10 @@ language and never make them learn a column name to get an answer.
 For any request to chart, measure, compare, combine, link or build a dashboard \
 or report, call check_feasibility FIRST with the user's words. Each item comes \
 back as one of three:
-- ready: answer it - execute_kpi with the widget's metric and dimension, or \
-create_dashboard with the layout it returned (kind "report" for a report).
+- ready: answer it - execute_kpi with the widget's metric, dimension and the \
+item's filters (values the user named, such as a country, already matched to a \
+column), or create_dashboard with the layout it returned (kind "report" for a \
+report). A figure the user narrowed is never answered unfiltered.
 - needs_approval: call propose_change once per proposal, in order, passing \
 dependsOn as the ids of the proposals it depends on and the followUp it carries, \
 then stop and tell the user what each adds and that they approve it with the \

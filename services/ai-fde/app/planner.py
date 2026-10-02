@@ -139,6 +139,13 @@ def format_period(label: str, grain: str | None) -> str:
 def describe_series(result: dict[str, Any]) -> str:
     """A sentence or two about one executed metric, from its numbers only."""
     label = result.get("label") or result.get("kpi")
+    # "Total Revenue (Germany)": a narrowed figure says what it is narrowed to.
+    limited = [
+        ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        for value in (result.get("filters") or {}).values()
+    ]
+    if limited:
+        label = f"{label} ({'; '.join(limited)})"
     by = result.get("dimensionLabel")
     title = f"{label} by {by.lower()}" if by and not result.get("dimensionGrain") else label
     fmt, unit = result.get("format"), result.get("unit")
@@ -245,20 +252,24 @@ def next_calls(turn: Turn) -> list[ToolCall]:
 
     # Charts that are ready: run them so the answer quotes real numbers.
     if intent not in ("dashboard", "report", "capabilities"):
-        done = {(s.arguments.get("kpi"), s.arguments.get("dimension")) for s in turn.results("execute_kpi")}
+        done = {_run_key(s.arguments) for s in turn.results("execute_kpi")}
         ready = [
             item for item in items
-            if item.get("status") == "ready" and item.get("kpi") and (item.get("kpi"), item.get("dimension")) not in done
+            if item.get("status") == "ready" and item.get("kpi") and _run_key(item) not in done
         ][: max(0, MAX_EXECUTIONS - len(done))]
         if ready:
             return [
                 _call(
                     "execute_kpi",
                     # A ranking shows its top twelve; a timeline shows every
-                    # period the tool returns (its latest thirty).
-                    {"kpi": item["kpi"], "dimension": item.get("dimension")}
-                    if ":" in str(item.get("dimension") or "")
-                    else {"kpi": item["kpi"], "dimension": item.get("dimension"), "limit": 12},
+                    # period the tool returns (its latest thirty). The values
+                    # the question named ("in Germany") go along as filters.
+                    {
+                        "kpi": item["kpi"],
+                        "dimension": item.get("dimension"),
+                        **({"filters": item["filters"]} if item.get("filters") else {}),
+                        **({} if ":" in str(item.get("dimension") or "") else {"limit": 12}),
+                    },
                 )
                 for item in ready
             ]
@@ -301,6 +312,11 @@ def next_calls(turn: Turn) -> list[ToolCall]:
                 )
             )
     return calls
+
+
+def _run_key(source: dict[str, Any]) -> str:
+    """One metric run: the metric, its slice and the values it is limited to."""
+    return _key("run", {"kpi": source.get("kpi"), "dimension": source.get("dimension"), "filters": source.get("filters") or {}})
 
 
 def compose_answer(turn: Turn) -> str:
@@ -405,7 +421,7 @@ def _item_sentence(item: dict[str, Any], turn: Turn) -> str:
     )
     if status == "ready":
         for step in turn.results("execute_kpi"):
-            if step.arguments.get("kpi") == item.get("kpi") and step.arguments.get("dimension") == item.get("dimension"):
+            if _run_key(step.arguments) == _run_key(item):
                 if "error" in (step.result or {}):
                     return f"{item.get('explanation')} Running it failed: {step.result['error']}"
                 return describe_series(step.result or {})
