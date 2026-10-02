@@ -431,9 +431,10 @@ function LineChart({
 	const partialPath = partialLast
 		? `M${scaleX(points.length - 2)},${scaleY(points[points.length - 2]!.value as number)} L${scaleX(points.length - 1)},${scaleY(points[points.length - 1]!.value as number)}`
 		: null;
+	// The fill ends with the solid line: the incomplete period is only dashed.
 	const areaPath =
 		kind === "area"
-			? `${path} L${scaleX(points.length - 1)},${scaleY(min)} L${scaleX(0)},${scaleY(min)} Z`
+			? `${path} L${scaleX(solid.length - 1)},${scaleY(min)} L${scaleX(0)},${scaleY(min)} Z`
 			: null;
 
 	const ticks = niceTicks(min, max, 4);
