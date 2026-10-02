@@ -468,7 +468,8 @@ table.data tbody tr.clickable { cursor: pointer; }
   gap: 8px; margin-top: 8px;
   padding-top: 8px; border-top: 1px solid var(--border);
 }
-.rail-user .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-user .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.rail-user .btn { white-space: nowrap; flex-shrink: 0; }
 
 /* ── model picker, in the chat composer ─────────────────────────────────── */
 .model-picker { display: inline-flex; align-items: center; gap: 6px; }

@@ -1031,9 +1031,10 @@ export function formatCell(value: unknown): string {
 			: round(value, 2).toLocaleString("en-US");
 	}
 	const text = String(value);
-	// Collapse an ISO timestamp to a readable date-time; leave everything else.
+	// Collapse an ISO timestamp to a readable date-time - a plain date when it
+	// is midnight, as dates stored as timestamps are - and leave anything else.
 	const iso = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/.exec(text);
-	if (iso) return `${iso[1]} ${iso[2]}`;
+	if (iso) return iso[2] === "00:00" ? iso[1]! : `${iso[1]} ${iso[2]}`;
 	if (/^\d+\.\d+$/.test(text)) return round(Number(text), 2).toLocaleString("en-US");
 	return text;
 }
