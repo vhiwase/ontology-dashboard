@@ -37,9 +37,12 @@
  */
 
 import type { Pool } from "pg";
+import { vetHost } from "./connectionPolicy";
 import { pool, query, queryOne } from "./db";
 import { columnsOfRows, normaliseColumnName } from "./inferTypes";
-import { BadRequest, NotFound, quoteIdentifier } from "./registry";
+import { BadRequest, currentSpace, NotFound, quoteIdentifier } from "./registry";
+import { isVaultRef, readCredential } from "./vault";
+import { spaceBySlug } from "./workspaces";
 
 /** Where synced tables land. Never tms_raw: that is the captured snapshot. */
 export const LANDING_SCHEMA = "connection_raw";
@@ -87,9 +90,16 @@ export interface ConnectionSpec {
 
 	/**
 	 * The NAME of an environment variable or the path of a Docker secret file
-	 * holding the password or token — never the credential itself.
+	 * holding the password or token — never the credential itself. In a
+	 * personal workspace, a `vault:<id>` reference to the encrypted vault.
 	 */
 	secretRef?: string | null;
+	/**
+	 * A password typed into the form, used for this one request only - to
+	 * test a connection before it is saved. Never stored: a saved connection
+	 * keeps a vault reference instead (see vault.ts).
+	 */
+	password?: string;
 }
 
 export interface ConnectionTest {
@@ -100,9 +110,33 @@ export interface ConnectionTest {
 	testedAt: string;
 }
 
-/** Read a password from the referenced env var or secret file, never storage. */
-function resolveSecret(secretRef: string | null | undefined): string | null {
+/** Whether the request in progress is scoped to a personal workspace. */
+async function inPersonalSpace(): Promise<boolean> {
+	return (await spaceBySlug(currentSpace()))?.kind === "personal";
+}
+
+/** The refusal for anything that would read the platform's own database. */
+const PLATFORM_DATABASE_REFUSED =
+	"This connection points at the platform's own database, which a personal workspace cannot read: " +
+	"every workspace's synced tables are stored there. Connect to your own database server instead.";
+
+/**
+ * Read a credential: from the encrypted vault (`vault:<id>`), or from the
+ * referenced env var or secret file.
+ *
+ * A personal workspace may only use the vault. A reference to a server-side
+ * secret from there would let anyone who can register have this service send
+ * the platform's own passwords to a host of their choosing.
+ */
+async function resolveSecret(secretRef: string | null | undefined): Promise<string | null> {
 	if (!secretRef) return null;
+	if (isVaultRef(secretRef)) return readCredential(secretRef, currentSpace());
+	if (await inPersonalSpace()) {
+		throw new BadRequest(
+			"A personal workspace keeps connection passwords in its encrypted vault and cannot read the " +
+				"server's environment variables or secret files. Enter the password in the connection form.",
+		);
+	}
 	// A path is treated as a Docker secret; anything else as an env var.
 	if (secretRef.startsWith("/")) {
 		try {
@@ -119,7 +153,9 @@ function buildDsn(spec: ConnectionSpec, password: string | null): string {
 	const user = encodeURIComponent(spec.username ?? "");
 	const auth = password ? `${user}:${encodeURIComponent(password)}` : user;
 	const ssl = spec.sslMode && spec.sslMode !== "prefer" ? `?sslmode=${spec.sslMode}` : "";
-	return `postgresql://${auth}@${spec.host}:${spec.port}/${spec.database}${ssl}`;
+	// An IPv6 address has to be bracketed to sit in a URL beside a port.
+	const host = spec.host?.includes(":") ? `[${spec.host}]` : spec.host;
+	return `postgresql://${auth}@${host}:${spec.port}/${spec.database}${ssl}`;
 }
 
 /** How a connection is safe to display and store: never with its credential. */
@@ -196,12 +232,12 @@ export function joinUrl(baseUrl: string, path: string): string {
  * the NAME of the variable or the PATH of the secret, exactly as a PostgreSQL
  * connection holds its password reference.
  */
-function restHeaders(spec: ConnectionSpec): Record<string, string> {
+async function restHeaders(spec: ConnectionSpec): Promise<Record<string, string>> {
 	const headers: Record<string, string> = { accept: "application/json" };
 	const scheme = spec.authScheme ?? "none";
 	if (scheme === "none") return headers;
 
-	const credential = resolveSecret(spec.secretRef);
+	const credential = spec.password || (await resolveSecret(spec.secretRef));
 	if (credential === null) {
 		throw new BadRequest(
 			spec.secretRef
@@ -228,14 +264,23 @@ async function restFetch(
 	path: string,
 	timeoutMs: number,
 ): Promise<{ status: number; body: string; contentType: string }> {
+	const url = joinUrl(spec.baseUrl ?? "", path);
+	const personal = await inPersonalSpace();
+	if (personal) {
+		const parsed = new URL(url);
+		await vetHost(parsed.hostname, Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80), "rest");
+	}
+	const headers = await restHeaders(spec);
 	const controller = new AbortController();
 	const timer = setTimeout(() => controller.abort(), timeoutMs);
 	try {
-		const response = await fetch(joinUrl(spec.baseUrl ?? "", path), {
+		const response = await fetch(url, {
 			method: "GET",
-			headers: restHeaders(spec),
+			headers,
 			signal: controller.signal,
-			redirect: "follow",
+			// A redirect would take the request to a host that was never
+			// checked, so a personal workspace does not follow them.
+			redirect: personal ? "error" : "follow",
 		});
 		const body = await response.text();
 		if (body.length > REST_MAX_BYTES) {
@@ -476,6 +521,24 @@ function openRemote(spec: ConnectionSpec, password: string | null, statementTime
 	});
 }
 
+/**
+ * Open a probe to a stored or requested PostgreSQL source.
+ *
+ * The one way this module dials a remote database: the credential is
+ * resolved (from the vault where it is one), and in a personal workspace the
+ * host is vetted and its checked ADDRESS is what the driver connects to.
+ */
+async function openRemoteFor(spec: ConnectionSpec, statementTimeoutMs: number): Promise<Pool> {
+	const password = spec.password || (await resolveSecret(spec.secretRef));
+	if (!spec.password && spec.secretRef && password === null) throw new BadRequest(unreadableSecret(spec.secretRef));
+	let dial = spec;
+	if (await inPersonalSpace()) {
+		const address = await vetHost(String(spec.host ?? ""), Number(spec.port) || 5432, "postgresql");
+		dial = { ...spec, host: address };
+	}
+	return openRemote(dial, password, statementTimeoutMs);
+}
+
 /** The message for a credential the service was told about but cannot read. */
 function unreadableSecret(secretRef: string): string {
 	return (
@@ -496,18 +559,19 @@ export async function testConnection(spec: ConnectionSpec): Promise<ConnectionTe
 	if (spec.engine === "rest") return testRestConnection(spec);
 
 	const started = Date.now();
-	const password = resolveSecret(spec.secretRef);
-
-	if (spec.secretRef && password === null) {
+	let probe: Pool;
+	try {
+		probe = await openRemoteFor(spec, 5000);
+	} catch (error) {
+		// An unreadable secret or a refused host is a failed test, said plainly,
+		// not a server error.
 		return {
 			ok: false,
 			latencyMs: 0,
-			detail: unreadableSecret(spec.secretRef),
+			detail: (error as Error).message,
 			testedAt: new Date().toISOString(),
 		};
 	}
-
-	const probe = openRemote(spec, password, 5000);
 	try {
 		const result = await probe.query<{ version: string }>("SELECT version()");
 		return {
@@ -602,13 +666,11 @@ function toRemoteRelation(row: CatalogRow): RemoteRelation {
  */
 export async function remoteCatalog(spec: ConnectionSpec | null): Promise<RemoteRelation[]> {
 	if (!spec) {
+		if (await inPersonalSpace()) throw new BadRequest(PLATFORM_DATABASE_REFUSED);
 		const rows = await query<CatalogRow>(CATALOG_SQL);
 		return rows.map(toRemoteRelation);
 	}
-	const password = resolveSecret(spec.secretRef);
-	if (spec.secretRef && password === null) throw new BadRequest(unreadableSecret(spec.secretRef));
-
-	const probe = openRemote(spec, password, 15_000);
+	const probe = await openRemoteFor(spec, 15_000);
 	try {
 		const result = await probe.query<CatalogRow>(CATALOG_SQL);
 		return result.rows.map(toRemoteRelation);
@@ -664,12 +726,88 @@ export async function connectionCatalog(resourceId: number): Promise<{
 	};
 }
 
+/** A key read from the source's own catalogue. */
+export interface RemoteKey {
+	kind: "primary" | "unique" | "foreign";
+	schema: string;
+	table: string;
+	columns: string[];
+	/** For a foreign key: what it references. */
+	refSchema: string | null;
+	refTable: string | null;
+	refColumns: string[];
+}
+
+const KEYS_SQL = `
+	SELECT CASE con.contype WHEN 'p' THEN 'primary' WHEN 'u' THEN 'unique' ELSE 'foreign' END AS kind,
+	       n.nspname AS schema, c.relname AS table,
+	       -- text[], not name[]: the driver only parses arrays of types it knows.
+	       array_agg(a.attname::text ORDER BY k.ord) AS columns,
+	       fn.nspname AS ref_schema, fc.relname AS ref_table,
+	       array_remove(array_agg(fa.attname::text ORDER BY k.ord), NULL) AS ref_columns
+	  FROM pg_constraint con
+	  JOIN pg_class c ON c.oid = con.conrelid
+	  JOIN pg_namespace n ON n.oid = c.relnamespace
+	 CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+	  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+	  LEFT JOIN pg_class fc ON fc.oid = con.confrelid
+	  LEFT JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+	  LEFT JOIN pg_attribute fa ON fa.attrelid = con.confrelid AND fa.attnum = con.confkey[k.ord]
+	 WHERE con.contype IN ('p','u','f')
+	   AND (n.nspname || '.' || c.relname) = ANY($1)
+	 GROUP BY con.oid, con.contype, n.nspname, c.relname, fn.nspname, fc.relname`;
+
+/**
+ * The primary, unique and foreign keys of some tables on the far side.
+ *
+ * A foreign key the source database declares is the best evidence a link can
+ * have: it is not inferred from names or measured from overlap, it is what
+ * the schema's own author wrote down. Read when tables are imported, so the
+ * ontology modelled from them starts with real keys and real links.
+ */
+export async function remoteKeys(
+	spec: ConnectionSpec | null,
+	tables: Array<{ schema: string; table: string }>,
+): Promise<RemoteKey[]> {
+	if (tables.length === 0) return [];
+	const names = tables.map((t) => `${t.schema}.${t.table}`);
+	type Row = {
+		kind: RemoteKey["kind"];
+		schema: string;
+		table: string;
+		columns: string[];
+		ref_schema: string | null;
+		ref_table: string | null;
+		ref_columns: string[] | null;
+	};
+	let rows: Row[];
+	if (!spec) {
+		if (await inPersonalSpace()) throw new BadRequest(PLATFORM_DATABASE_REFUSED);
+		rows = await query<Row>(KEYS_SQL, [names]);
+	} else {
+		const probe = await openRemoteFor(spec, 15_000);
+		try {
+			rows = (await probe.query<Row>(KEYS_SQL, [names])).rows;
+		} catch (error) {
+			throw new BadRequest(`Could not read keys on ${spec.host}: ${(error as Error).message}`);
+		} finally {
+			await probe.end().catch(() => {});
+		}
+	}
+	return rows.map((row) => ({
+		kind: row.kind,
+		schema: row.schema,
+		table: row.table,
+		columns: row.columns ?? [],
+		refSchema: row.ref_schema,
+		refTable: row.ref_table,
+		refColumns: row.ref_columns ?? [],
+	}));
+}
+
 /** Size, version and schema breakdown of the database a connection points at. */
 export async function remoteDatabaseInfo(spec: ConnectionSpec): Promise<RemoteDatabaseInfo> {
-	const password = resolveSecret(spec.secretRef);
-	if (spec.secretRef && password === null) throw new BadRequest(unreadableSecret(spec.secretRef));
-
-	const probe = openRemote(spec, password, 15_000);
+	const probe = await openRemoteFor(spec, 15_000);
 	try {
 		const meta = await probe.query<{ version: string; database: string; size: string }>(
 			`SELECT version() AS version,
@@ -1215,7 +1353,12 @@ export async function createSync(
 		}
 	}
 
-	const targetTable = syncTargetTableName(connection.name, valid.sourceSchema, valid.sourceTable);
+	// Landing tables of every space share one schema, so a personal
+	// workspace's are prefixed with its id: two people who both call their
+	// connection "Production" must not land each other's tables.
+	const space = await spaceBySlug(currentSpace());
+	const owner = space?.kind === "personal" ? `w${space.id} ` : "";
+	const targetTable = syncTargetTableName(`${owner}${connection.name}`, valid.sourceSchema, valid.sourceTable);
 
 	// One sync owns one landing table, and the table's name is derived from the
 	// connection and the source — so a second sync of the same source, under a
@@ -1314,13 +1457,10 @@ async function sourceColumns(
 		 ORDER BY ordinal_position`;
 	type Row = { column_name: string; udt_name: string; data_type: string };
 
+	if (!spec && (await inPersonalSpace())) throw new BadRequest(PLATFORM_DATABASE_REFUSED);
 	const rows: Row[] = spec
 		? await (async () => {
-				const password = resolveSecret(spec.secretRef);
-				if (spec.secretRef && password === null) {
-					throw new BadRequest(unreadableSecret(spec.secretRef));
-				}
-				const probe = openRemote(spec, password, 15_000);
+				const probe = await openRemoteFor(spec, 15_000);
 				try {
 					return (await probe.query<Row>(sql, [schema, table])).rows;
 				} catch (error) {
@@ -1442,9 +1582,12 @@ export async function runSync(syncId: number, triggeredBy: string): Promise<Sync
 
 		let rows: Array<Record<string, unknown>>;
 		if (spec) {
-			const password = resolveSecret(spec.secretRef);
-			if (spec.secretRef && password === null) return await fail(unreadableSecret(spec.secretRef));
-			const probe = openRemote(spec, password, 120_000);
+			let probe: Pool;
+			try {
+				probe = await openRemoteFor(spec, 120_000);
+			} catch (error) {
+				return await fail((error as Error).message);
+			}
 			try {
 				rows = (await probe.query(readSql, params)).rows;
 			} catch (error) {
@@ -1453,6 +1596,7 @@ export async function runSync(syncId: number, triggeredBy: string): Promise<Sync
 				await probe.end().catch(() => {});
 			}
 		} else {
+			if (await inPersonalSpace()) return await fail(PLATFORM_DATABASE_REFUSED);
 			rows = await query(readSql, params);
 		}
 

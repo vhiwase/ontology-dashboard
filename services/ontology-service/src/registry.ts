@@ -45,6 +45,10 @@ export interface ObjectTypeMeta {
 	group: string | null;
 	rowCount: number;
 	displayOrder: number;
+	/** pipeline (generated), modelled (from a connected table) or combination (a join). */
+	origin: string;
+	/** False when the key column is not unique on every row. */
+	keyIsUnique: boolean;
 	properties: PropertyMeta[];
 	propertyByApiName: Map<string, PropertyMeta>;
 	propertyBySqlColumn: Map<string, PropertyMeta>;
@@ -109,6 +113,12 @@ export interface KpiMeta {
 	dependsOnSimulation: boolean;
 	coverageNote: string | null;
 	displayOrder: number;
+	/** Equality filters that are part of the metric's meaning. */
+	baseFilters: Record<string, unknown>;
+	/** catalogue (pipeline), modelled (from a connected table) or proposal (approved). */
+	origin: string;
+	/** The object type a workspace metric measures. */
+	objectTypeRid: string | null;
 }
 
 export interface Registry {
@@ -238,6 +248,27 @@ export async function loadRegistry(): Promise<Registry> {
 	return first;
 }
 
+/**
+ * Reload one space's registry, leaving every other space's untouched.
+ *
+ * Modelling a table into a personal workspace changes that workspace's
+ * ontology and nobody else's; reloading every space for it would make each
+ * user's edit cost as much as the whole platform's.
+ */
+export async function reloadSpace(spaceSlug: string): Promise<Registry | null> {
+	try {
+		const registry = await loadRegistryForSpace(spaceSlug);
+		registries.set(spaceSlug, registry);
+		return registry;
+	} catch (error) {
+		if (error instanceof NoOntologyInSpace) {
+			registries.delete(spaceSlug);
+			return null;
+		}
+		throw error;
+	}
+}
+
 async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 	const versionRow = await queryOne<{
 		ontology_version_id: number;
@@ -276,6 +307,8 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		group_name: string | null;
 		row_count: string;
 		display_order: number;
+		origin: string | null;
+		key_is_unique: boolean | null;
 	}>(
 		`SELECT * FROM platform.object_type
 		  WHERE ontology_version_id = $1
@@ -354,6 +387,8 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 			group: row.group_name,
 			rowCount: Number(row.row_count),
 			displayOrder: row.display_order,
+			origin: row.origin ?? "pipeline",
+			keyIsUnique: row.key_is_unique ?? true,
 			properties,
 			propertyByApiName: new Map(properties.map((p) => [p.apiName, p])),
 			propertyBySqlColumn: new Map(properties.map((p) => [p.sqlColumn, p])),
@@ -473,6 +508,9 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		dependsOnSimulation: row.depends_on_simulation,
 		coverageNote: row.coverage_note,
 		displayOrder: row.display_order,
+		baseFilters: row.base_filters ?? {},
+		origin: row.origin ?? "catalogue",
+		objectTypeRid: row.object_type_rid ?? null,
 	}));
 
 	const linksBySourceRid = new Map<string, LinkTypeMeta[]>();

@@ -11,9 +11,39 @@ import {
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { executeAction, listAudit, resolveAction, validateParameters } from "./actions";
-import { apiAuthorization, login, me, requestId } from "./auth";
+import {
+	authenticate,
+	authorizeRoute,
+	createSelfRegisteredUser,
+	login,
+	recordRegistration,
+	REGISTRATION_ROLE,
+	requestId,
+	SELF_REGISTRATION,
+	signToken,
+	tooManyRegistrations,
+	validateRegistration,
+} from "./auth";
+import { importTables, remodelConnection } from "./importer";
+import { removeModelledType } from "./modeling";
+import { assess, pickSubject, planBoard } from "./feasibility";
+import { approveProposal, createProposal, getProposal, listProposals, rejectProposal } from "./proposals";
+import { deleteCredential, storeCredential } from "./vault";
+import {
+	accessibleSpaces,
+	addMember,
+	assertFolderInSpace,
+	assertResourceInSpace,
+	assertSyncInSpace,
+	ensurePersonalSpace,
+	listMembers,
+	removeMember,
+	spaceBySlug,
+	spaceScope,
+} from "./workspaces";
 import { describePolicy } from "./dataPolicy";
 import {
+	dashboardFilterOptions,
 	dashboardHistory,
 	deleteDashboard,
 	exportDashboards,
@@ -234,7 +264,56 @@ app.get("/health", (_req, res) => {
 
 app.post("/api/auth/login", handle(login));
 
-app.use("/api", apiAuthorization());
+// Whether the sign-in page should offer "Create account". Public, like login.
+app.get("/api/auth/config", (_req, res) => {
+	res.json({ selfRegistration: SELF_REGISTRATION, registrationRole: REGISTRATION_ROLE });
+});
+
+// Self-registration: a new account and its own private workspace, signed in.
+app.post(
+	"/api/auth/register",
+	handle(async (req, res) => {
+		if (!SELF_REGISTRATION) {
+			res.status(403).json({ error: "Registration is closed on this server. Ask an administrator for an account." });
+			return;
+		}
+		if (await tooManyRegistrations(req.ip)) {
+			res.status(429).json({ error: "Too many accounts were registered from this address recently. Try again later." });
+			return;
+		}
+		const { input, errors } = validateRegistration(req.body);
+		if (!input) {
+			res.status(400).json({ error: errors.join(" "), errors });
+			return;
+		}
+		const user = await createSelfRegisteredUser(input);
+		if (!user) {
+			res.status(409).json({ error: "That username or email is already registered." });
+			return;
+		}
+		await recordRegistration(req.ip);
+		const space = await ensurePersonalSpace({ username: user.username });
+		const { token, expiresAt } = signToken(user);
+		res.status(201).json({
+			token,
+			expiresAt,
+			user: {
+				username: user.username,
+				role: user.role,
+				ontologyRole: user.ontology_role,
+				signupSource: "self",
+				personalSpace: space.slug,
+			},
+		});
+	}),
+);
+
+// Who the caller is, then which space the request is about, then whether
+// their role in THAT space allows the route. The role check has to come last:
+// owning a personal workspace changes what a person may do inside it.
+app.use("/api", authenticate());
+app.use("/api", spaceScope());
+app.use("/api", authorizeRoute());
 
 // ── the space in scope for this request ─────────────────────────────────────
 //  The ontology belongs to a space (0012): its object types, links, actions,
@@ -246,12 +325,14 @@ app.use("/api", apiAuthorization());
 //
 //  Entering the context here rather than per route means a route added later
 //  is space-scoped by default, the same reasoning as the auth guard above.
-app.use("/api", (req, _res, next) => {
-	const requested = typeof req.query.space === "string" ? req.query.space.trim() : "";
-	withSpace(requested || "sandbox", next);
-});
-
-app.get("/api/auth/me", me);
+app.get(
+	"/api/auth/me",
+	handle(async (req, res) => {
+		const principal = req.principal!;
+		const personal = await ensurePersonalSpace(principal);
+		res.json({ ...principal, personalSpace: personal.slug });
+	}),
+);
 
 app.post(
 	"/api/registry/reload",
@@ -708,7 +789,26 @@ app.get(
 		const resolved = String(req.query.resolve ?? "true") !== "false";
 		const slug = String(req.params.slug);
 		const space = req.query.space ? String(req.query.space) : undefined;
-		res.json(resolved ? await resolveDashboard(slug, space) : await getDashboard(slug, space));
+		// Filters chosen on the board, as JSON: {"region": "West",
+		// "order_date": {"gte": "1997-01-01"}}. Applied, never saved.
+		let filters: Record<string, unknown> = {};
+		if (typeof req.query.filters === "string" && req.query.filters.trim()) {
+			try {
+				const parsed = JSON.parse(req.query.filters) as unknown;
+				if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) filters = parsed as Record<string, unknown>;
+				else throw new Error("not an object");
+			} catch {
+				throw new BadRequest("filters must be a JSON object of column -> value.");
+			}
+		}
+		res.json(resolved ? await resolveDashboard(slug, space, { filters }) : await getDashboard(slug, space));
+	}),
+);
+
+app.get(
+	"/api/dashboards/:slug/filters",
+	handle(async (req, res) => {
+		res.json(await dashboardFilterOptions(String(req.params.slug), currentSpace()));
 	}),
 );
 
@@ -719,11 +819,99 @@ app.post(
 		res.status(201).json(
 			await saveDashboard({
 				...body,
-				// The active space wins unless the body names one explicitly, so a
-				// board saved while viewing Staging lands in Staging.
-				spaceSlug: body.spaceSlug ?? (req.query.space ? String(req.query.space) : undefined),
+				// Always the space the request was authorised for. A space named
+				// in the body used to win, which let a caller write a board into
+				// a space they had no access to.
+				spaceSlug: currentSpace(),
+				createdBy: req.principal?.username ?? "unknown",
 			}),
 		);
+	}),
+);
+
+// Lay out a dashboard (or report) from the metrics a type already has, and
+// save it. Deterministic: only metrics that exist, only slices they allow.
+app.post(
+	"/api/workspace/auto-dashboard",
+	handle(async (req, res) => {
+		const body = req.body ?? {};
+		const subject = pickSubject(String(body.objectType ?? body.topic ?? ""));
+		if (!subject) throw new BadRequest("There is nothing in this workspace to build a dashboard from yet. Import a table first.");
+		const { layout } = await planBoard(subject);
+		if (layout.length === 0) throw new BadRequest(`${subject.label} has no metrics to put on a dashboard.`);
+		const kind = body.kind === "report" ? "report" : "dashboard";
+		const label = subject.pluralLabel ?? subject.label;
+		const title = String(body.title ?? "").trim() || `${label} ${kind === "report" ? "report" : "overview"}`;
+		const saved = await saveDashboard({
+			title,
+			description:
+				kind === "report"
+					? `A report on ${label.toLowerCase()}, built from the metrics modelled on ${subject.apiName}.`
+					: `Headline numbers, the timeline and the main slices of ${label.toLowerCase()}.`,
+			layout,
+			kind,
+			isAiGenerated: false,
+			sourcePrompt: body.topic ? String(body.topic) : null,
+			createdBy: req.principal?.username ?? "unknown",
+			spaceSlug: currentSpace(),
+		});
+		res.status(201).json(saved);
+	}),
+);
+
+// ── feasibility and proposals ──────────────────────────────────────────────
+//
+//  What can be built from this workspace's data, what needs approval first,
+//  and what the data cannot answer - and the proposals that wait for that
+//  approval. See feasibility.ts and proposals.ts.
+
+app.post(
+	"/api/feasibility",
+	handle(async (req, res) => {
+		const body = req.body ?? {};
+		res.json(
+			await assess({
+				text: typeof body.text === "string" ? body.text : undefined,
+				requests: Array.isArray(body.requests) ? body.requests : undefined,
+				intent: typeof body.intent === "string" ? body.intent : undefined,
+				objectType: typeof body.objectType === "string" ? body.objectType : undefined,
+			}),
+		);
+	}),
+);
+
+app.get(
+	"/api/proposals",
+	handle(async (req, res) => {
+		res.json(await listProposals(req.query.status ? String(req.query.status) : undefined));
+	}),
+);
+
+app.get(
+	"/api/proposals/:id",
+	handle(async (req, res) => res.json(await getProposal(Number(req.params.id)))),
+);
+
+app.post(
+	"/api/proposals",
+	handle(async (req, res) => {
+		res.status(201).json(await createProposal(req.body ?? {}, req.principal?.username ?? "unknown"));
+	}),
+);
+
+app.post(
+	"/api/proposals/:id/approve",
+	handle(async (req, res) => {
+		const note = typeof req.body?.note === "string" ? req.body.note : null;
+		res.json(await approveProposal(Number(req.params.id), req.principal?.username ?? "unknown", note));
+	}),
+);
+
+app.post(
+	"/api/proposals/:id/reject",
+	handle(async (req, res) => {
+		const note = typeof req.body?.note === "string" ? req.body.note : null;
+		res.json(await rejectProposal(Number(req.params.id), req.principal?.username ?? "unknown", note));
 	}),
 );
 
@@ -1207,7 +1395,99 @@ app.post(
 
 // ── spaces, projects, folders, resources ────────────────────────────────────
 
-app.get("/api/spaces", handle(async (_req, res) => res.json(await listSpaces())));
+app.get(
+	"/api/spaces",
+	handle(async (req, res) => {
+		// Only the spaces this caller may open, their own workspace first.
+		const visible = await accessibleSpaces(req.principal!);
+		const order = new Map(visible.map((space, index) => [space.slug, index]));
+		const all = await listSpaces();
+		res.json(
+			all
+				.filter((space) => order.has(space.slug))
+				.sort((a, b) => order.get(a.slug)! - order.get(b.slug)!)
+				.map((space) => {
+					const info = visible[order.get(space.slug)!]!;
+					return { ...space, kind: info.kind, ownerUsername: info.ownerUsername };
+				}),
+		);
+	}),
+);
+
+// Membership of the shared environment spaces. Administrators only (see
+// PLATFORM_ADMIN_ONLY in auth.ts): a personal workspace is never shared.
+app.get(
+	"/api/spaces/:space/members",
+	handle(async (req, res) => res.json(await listMembers(String(req.params.space)))),
+);
+app.post(
+	"/api/spaces/:space/members",
+	handle(async (req, res) => {
+		const body = req.body ?? {};
+		await addMember(String(req.params.space), String(body.username ?? ""), String(body.role ?? "viewer"), req.principal!.username);
+		res.json(await listMembers(String(req.params.space)));
+	}),
+);
+app.delete(
+	"/api/spaces/:space/members/:username",
+	handle(async (req, res) => {
+		await removeMember(String(req.params.space), String(req.params.username));
+		res.status(204).end();
+	}),
+);
+
+// What the home page shows: everything in the caller's current space, counted.
+app.get(
+	"/api/workspace/summary",
+	handle(async (_req, res) => {
+		const slug = currentSpace();
+		const space = await spaceBySlug(slug);
+		const registry = hasOntology(slug) ? getRegistry() : null;
+		const [counts] = await query<Record<string, string>>(
+			`SELECT
+			   (SELECT count(*) FROM platform.resource r JOIN platform.project p ON p.project_id = r.project_id
+			     WHERE p.space_id = s.space_id AND r.kind = 'connection')::text AS connections,
+			   (SELECT count(*) FROM platform.resource r JOIN platform.project p ON p.project_id = r.project_id
+			     WHERE p.space_id = s.space_id AND r.kind = 'dataset')::text AS datasets,
+			   (SELECT count(*) FROM platform.dashboard d WHERE d.space_id = s.space_id AND d.kind = 'dashboard')::text AS dashboards,
+			   (SELECT count(*) FROM platform.dashboard d WHERE d.space_id = s.space_id AND d.kind = 'report')::text AS reports,
+			   (SELECT count(*) FROM platform.proposal x WHERE x.space_id = s.space_id AND x.status = 'pending')::text AS pending_proposals
+			  FROM platform.space s WHERE s.slug = $1`,
+			[slug],
+		);
+		res.json({
+			space: space
+				? { slug: space.slug, name: space.name, kind: space.kind, ownerUsername: space.ownerUsername }
+				: null,
+			counts: {
+				connections: Number(counts?.connections ?? 0),
+				datasets: Number(counts?.datasets ?? 0),
+				objectTypes: registry?.objectTypes.length ?? 0,
+				linkTypes: registry?.linkTypes.length ?? 0,
+				metrics: registry?.kpis.length ?? 0,
+				actionTypes: registry?.actionTypes.length ?? 0,
+				dashboards: Number(counts?.dashboards ?? 0),
+				reports: Number(counts?.reports ?? 0),
+				pendingProposals: Number(counts?.pending_proposals ?? 0),
+			},
+			objectTypes: (registry?.objectTypes ?? []).map((type) => ({
+				apiName: type.apiName,
+				label: type.label,
+				pluralLabel: type.pluralLabel,
+				rowCount: type.rowCount,
+				origin: type.origin,
+				color: type.color,
+				group: type.group,
+				properties: type.properties.length,
+				measures: type.properties.filter((p) => p.semanticRole === "measure").length,
+				dimensions: type.properties.filter((p) => ["dimension", "temporal", "flag"].includes(p.semanticRole)).length,
+				links:
+					(registry?.linksBySourceRid.get(type.rid)?.length ?? 0) +
+					(registry?.linksByTargetRid.get(type.rid)?.length ?? 0),
+			})),
+		});
+	}),
+);
 
 // The database this platform is actually running against, read live.
 app.get("/api/spaces/database", handle(async (_req, res) => res.json(await databaseInfo())));
@@ -1221,6 +1501,20 @@ app.post(
 	"/api/spaces/sandbox/seed",
 	handle(async (req, res) => res.json(await seedSandbox(req.principal?.username ?? "unknown"))),
 );
+
+// Resources, syncs and folders are addressed by a global id, which on its own
+// would let a caller reach into a space that is not theirs. Each is checked
+// against the space the request is scoped to before any route below runs.
+function inScope(check: (id: number, space: string) => Promise<void>) {
+	return (req: Request, _res: Response, next: NextFunction): void => {
+		const id = String(req.params.id ?? "");
+		if (!/^\d+$/.test(id)) return next();
+		check(Number(id), currentSpace()).then(() => next(), next);
+	};
+}
+app.use("/api/resources/:id", inScope(assertResourceInSpace));
+app.use("/api/syncs/:id", inScope(assertSyncInSpace));
+app.use("/api/folders/:id", inScope(assertFolderInSpace));
 
 app.get(
 	"/api/spaces/:space/projects",
@@ -1313,14 +1607,52 @@ app.post(
 app.post(
 	"/api/spaces/:space/projects/:project/connections",
 	handle(async (req, res) => {
-		res.json(
-			await createConnection(
-				String(req.params.space),
-				String(req.params.project),
-				req.body ?? {},
-				req.principal?.username ?? "unknown",
-			),
-		);
+		const body = { ...(req.body ?? {}) };
+		const spaceSlug = String(req.params.space);
+		const username = req.principal?.username ?? "unknown";
+		// A password typed into the form goes into this space's encrypted
+		// vault, and the connection keeps only the reference to it.
+		let stored: string | null = null;
+		if (typeof body.password === "string" && body.password) {
+			const space = await spaceBySlug(spaceSlug);
+			if (!space) throw new NotFound(`No space '${spaceSlug}'.`);
+			stored = await storeCredential(space.id, `${String(body.name ?? "connection")} password`, body.password, username);
+			body.secretRef = stored;
+		}
+		try {
+			res.json(await createConnection(spaceSlug, String(req.params.project), body, username));
+		} catch (error) {
+			if (stored) await deleteCredential(stored, spaceSlug).catch(() => {});
+			throw error;
+		}
+	}),
+);
+
+// Import tables from a PostgreSQL connection: sync each one, read the
+// source's keys, and model them into the ontology as object types, links and
+// metrics. The whole path from a table to something a dashboard can chart.
+app.post(
+	"/api/resources/:id/import",
+	handle(async (req, res) => {
+		res.json(await importTables(Number(req.params.id), req.body ?? {}, req.principal?.username ?? "unknown"));
+	}),
+);
+
+// Model again everything already imported through a connection.
+app.post(
+	"/api/resources/:id/model",
+	handle(async (req, res) => {
+		res.json(await remodelConnection(Number(req.params.id), req.principal?.username ?? "unknown"));
+	}),
+);
+
+// Remove an object type that was modelled from a table or combined from
+// others. Pipeline-generated types are refused: the next run would restore them.
+app.delete(
+	"/api/object-types/:apiName",
+	handle(async (req, res) => {
+		await removeModelledType(String(req.params.apiName));
+		res.status(204).end();
 	}),
 );
 
