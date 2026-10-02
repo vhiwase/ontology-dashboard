@@ -35,6 +35,14 @@ secrets:
     file: ./secrets/database_url
   azure_openai_key:
     file: ./secrets/azure_openai_key
+  # Encrypts connection passwords typed into the connect form.
+  credential_key:
+    file: ./secrets/credential_key
+  # Optional hosted models for the assistant; an empty file means "not set".
+  anthropic_api_key:
+    file: ./secrets/anthropic_api_key
+  openai_api_key:
+    file: ./secrets/openai_api_key
 
 services:
   # ─── Postgres: raw tables, semantic views, ontology registry ──────────────
@@ -200,10 +208,21 @@ services:
       # false refuses every KPI, widget and action derived from tms_sim, so a
       # simulated figure cannot be served as though it were measured.
       ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-false}
+      # Self-registration: anyone who can reach the UI may create an account
+      # with its own private workspace. false = accounts by administrators only.
+      ALLOW_SELF_REGISTRATION: ${ALLOW_SELF_REGISTRATION:-true}
+      REGISTRATION_DEFAULT_ROLE: ${REGISTRATION_DEFAULT_ROLE:-analyst}
+      REGISTRATION_MAX_PER_HOUR: ${REGISTRATION_MAX_PER_HOUR:-5}
+      # true limits personal workspaces to databases on public addresses
+      # (cloud-hosted deployments); link-local metadata endpoints and the
+      # platform's own database are refused either way.
+      BLOCK_PRIVATE_CONNECTION_HOSTS: ${BLOCK_PRIVATE_CONNECTION_HOSTS:-false}
+      CREDENTIAL_KEY_FILE: /run/secrets/credential_key
       NODE_ENV: production
     secrets:
       - database_url
       - jwt_secret
+      - credential_key
       # So a connection resource can name /run/secrets/postgres_password as its
       # credential and actually be testable. This grants nothing new: the
       # database_url secret above already contains the same password.
@@ -263,10 +282,23 @@ services:
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4.1}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
       AZURE_OPENAI_TIMEOUT: ${AZURE_OPENAI_TIMEOUT:-120}
+      # Claude (Anthropic). Read only from these names - never from an ambient
+      # ANTHROPIC_API_KEY - so the bill goes where it was configured to.
+      AI_FDE_ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_api_key
+      AI_FDE_ANTHROPIC_MODEL: ${AI_FDE_ANTHROPIC_MODEL:-claude-opus-5-5}
+      AI_FDE_ANTHROPIC_EFFORT: ${AI_FDE_ANTHROPIC_EFFORT:-medium}
+      AI_FDE_ANTHROPIC_FALLBACKS: ${AI_FDE_ANTHROPIC_FALLBACKS:-default}
+      AI_FDE_ANTHROPIC_BASE_URL: ${AI_FDE_ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      # Any OpenAI-compatible endpoint (OpenAI, a gateway, vLLM, LM Studio).
+      AI_FDE_OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+      AI_FDE_OPENAI_BASE_URL: ${AI_FDE_OPENAI_BASE_URL:-https://api.openai.com/v1}
+      AI_FDE_OPENAI_MODEL: ${AI_FDE_OPENAI_MODEL:-gpt-4.1}
     secrets:
       - database_url
       - jwt_secret
       - azure_openai_key
+      - anthropic_api_key
+      - openai_api_key
     ports:
       - "127.0.0.1:${AI_FDE_PORT:-4100}:${AI_FDE_PORT:-4100}"
     healthcheck:

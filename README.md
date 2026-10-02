@@ -1,13 +1,21 @@
-# TMS Ontology Workbench
+# Ontology Dashboard
 
-A Palantir-Foundry-shaped ontology platform over a real 3PL transport management
-system, with an AI-FDE assistant that answers business questions and builds
-dashboards from it.
+Reports, KPIs and dashboards on your own data, built by asking. Connect a
+PostgreSQL database; its tables become an **ontology** - business objects,
+the links between them, metrics and actions - and an AI assistant answers
+questions and builds boards from it. What the data can answer is built; what
+needs one more building block (a link, a combined dataset, a metric) is
+proposed for your approval; what the data cannot answer is said plainly, with
+what is missing. Nothing is estimated and nothing is simulated.
 
-Built on [`openshuyi/ontograph-core`](https://github.com/openshuyi/ontograph-core)
-(vendored in `vendor/`, compiled from source), Postgres, and an LLM that is either
-a local open-source model via Ollama or the Azure AI Foundry deployment already in
-use elsewhere in this repo.
+It grew out of a Palantir-Foundry-shaped ontology platform over a real 3PL
+transport management system, which still ships here as the shared demo space
+(the TMS workbench, pipelines, code repositories, lineage). Built on
+[`openshuyi/ontograph-core`](https://github.com/openshuyi/ontograph-core)
+(vendored in `vendor/`, compiled from source), Postgres, and the language model
+of your choice - Claude, any OpenAI-compatible endpoint, Azure OpenAI, a local
+model via Ollama - or none at all: a built-in planner answers from the ontology
+when no model is configured.
 
 ```
 docker compose up -d --build        # or ./scripts/bootstrap.sh
@@ -76,13 +84,111 @@ exception count.
 
 ---
 
+## Your data, your workspace
+
+Every account has a **private workspace**: its own connections, model,
+dashboards, reports, approvals and conversations. Nobody else can open it.
+With `ALLOW_SELF_REGISTRATION=true` (the default) anyone who can reach the UI
+can create an account from the sign-in page and is taken straight to theirs.
+
+### From a table to a dashboard
+
+1. **Connect** a PostgreSQL database (Home -> *Connect your database*). The
+   connection is tested before it is saved; the password goes to the
+   workspace's encrypted vault (AES-256-GCM, key in `./secrets/credential_key`)
+   and the connection keeps only a reference to it. Read-only access is enough:
+   nothing is ever written back.
+2. **Choose tables.** Each is copied into the workspace (a snapshot you can
+   refresh from *Data sources*), and the source's primary, unique and foreign
+   keys are read.
+3. **A model, not a dump.** Each table becomes an object type whose columns are
+   profiled into measures, dimensions, dates and identifiers; foreign keys (and
+   columns named for another table's key, verified against the data) become
+   links with their measured match ratio; every type gets its metrics - counts,
+   sums and averages of its measures, distinct counts of its references, each
+   sliceable by its dimensions and by day, week, month, quarter and year.
+4. **Ask.** "Revenue by country per month", "build me a sales dashboard",
+   "write a report on orders I can share", "what can I build?",
+   "link employees to us states on region = state_abbr",
+   "combine order details with their products and categories".
+
+### Ready, one approval away, or not possible
+
+Every request goes through a **feasibility check** against the workspace's
+ontology first:
+
+| Answer | What happens |
+|---|---|
+| **Ready** | An existing metric answers it. The chart, KPI, dashboard or report is built. |
+| **Needs approval** | One more building block is needed - a **link** (found by column name or by values, or named by you), a **combined dataset** (rows of one type with fields from the types they point at, plus derived columns such as `revenue = unit_price * quantity * (1 - discount)`), a **metric**, or an **action type**. It is drafted and measured - match ratio, preview value, sample rows - and waits in *Approvals*. Nothing changes until you approve. |
+| **Not possible** | The data does not hold what is needed. You are told what is missing and offered the nearest questions it can answer. |
+
+A dashboard asked for on data that cannot support a good one (no timeline,
+little to slice, or not the figure asked for) becomes a proposal for one wide,
+analysis-ready dataset - and the board is **built the moment you approve it**.
+
+### Dashboards and reports
+
+- **Dashboards** are live grids: filters read from the data (with date presets
+  measured from where the data ends), click a bar, slice or row to filter the
+  whole board by it, download any widget (or the whole board) as CSV, see the
+  SQL behind any tile. Stat tiles show the change over the last *complete*
+  period; a period the data stops part-way through is drawn dashed and never
+  compared.
+- **Reports** are the same widgets laid out as a document - key figures,
+  highlights written from the numbers on the page, captioned sections - with
+  *Print / save PDF*.
+
+### The assistant's models
+
+`LLM_PROVIDER=auto` picks, in order: Claude when `./secrets/anthropic_api_key`
+holds a key; an OpenAI-compatible endpoint when `./secrets/openai_api_key`
+does; then Azure or Ollama as before; and with none of them, the **built-in
+planner** - a provider that needs no model, runs the same feasibility check and
+tools, and says on every answer that it came from the planner. The planner is
+also the last fallback behind every model.
+
+The Claude provider uses the official SDK with adaptive thinking, prompt
+caching, streaming, and server-side refusal fallback
+(`AI_FDE_ANTHROPIC_FALLBACKS=default`; set `off` to surface refusals instead).
+Its key is read only from `AI_FDE_ANTHROPIC_API_KEY(_FILE)`, never from an
+ambient `ANTHROPIC_API_KEY`. Per-turn cost is shown under each answer and in
+*AI usage & cost*, priced per model including cache reads and writes.
+
+### Settings
+
+| Variable | Default | |
+|---|---|---|
+| `ALLOW_SELF_REGISTRATION` | `true` | `false` = accounts by administrators only |
+| `REGISTRATION_DEFAULT_ROLE` | `analyst` | or `viewer` |
+| `BLOCK_PRIVATE_CONNECTION_HOSTS` | `false` | `true` = personal workspaces may connect to public addresses only (cloud deployments). Link-local metadata addresses and the platform's own database are always refused. |
+| `LLM_PROVIDER` | `auto` | `anthropic`, `openai`, `azure_openai`, `ollama`, `builtin` |
+| `AI_FDE_ANTHROPIC_MODEL` / `_EFFORT` | `claude-opus-5-5` / `medium` | |
+| `AI_FDE_OPENAI_BASE_URL` / `_MODEL` | OpenAI / `gpt-4.1` | any OpenAI-compatible endpoint |
+
+**Upgrading an existing install:** re-run `./scripts/init-secrets.sh` - it adds
+`credential_key`, `anthropic_api_key` and `openai_api_key` without touching the
+existing secrets - then `docker compose up -d --build`. The pipeline applies
+migrations 0027-0029 at start.
+
+### What a personal workspace does not offer
+
+Pipelines, code repositories and SQL functions run code over tables that every
+workspace shares a database with, so they are offered only in shared spaces.
+Everything a workspace needs - links, combined datasets, derived columns,
+metrics, action types - is compiled from its own ontology instead.
+
+---
+
 ## Getting started
 
 ### Requirements
 
 - Docker with Compose v2 (tested on Docker Desktop 29.1.3 / Compose 2.40.3)
 - ~8 GB free disk (4.7 GB of that is the Ollama model, only if you use it)
-- The sibling `../api_responses` directory, mounted read-only by the pipeline
+- Optional: the sibling `../api_responses` directory, mounted read-only by the
+  pipeline - the TMS demo snapshot. Without it the stack starts with an empty
+  sandbox and every user works from the databases they connect.
 
 ### The quick path
 
@@ -98,7 +204,8 @@ docker compose up -d --build
 docker compose logs -f pipeline      # migrations -> ingest -> ontology -> users
 ```
 
-Then open **https://127.0.0.1:3000** and sign in as `admin` with that password.
+Then open **https://127.0.0.1:3000** and sign in as `admin` with that password -
+or choose *Create account* to get a private workspace of your own.
 
 The certificate is self-signed on first run, so the browser will warn once.
 Mount a real one over `/etc/nginx/certs` for anything public.

@@ -83,6 +83,33 @@ else
     fi
 fi
 
+# ── credential vault ───────────────────────────────────────────────────────
+# Encrypts the database passwords people type into the connect form. Kept
+# apart from jwt_secret so rotating the signing key does not make every stored
+# connection password unreadable. 64 hex characters = 32 bytes.
+write_secret credential_key "$(openssl rand -hex 32)" "AES-256 key for stored connection passwords"
+
+# ── hosted models for the assistant (optional) ─────────────────────────────
+# Each is carried over from .env when set there, and otherwise written empty:
+# an empty file means "not configured", and with no model at all the assistant
+# still answers through its built-in planner.
+carry_key() {
+    local name=$1 variable=$2
+    local value=""
+    if [ -f .env ]; then
+        value=$(grep -E "^${variable}=" .env | head -1 | cut -d= -f2- || true)
+    fi
+    if [ -s "$SECRETS_DIR/$name" ] && [ "$FORCE" -eq 0 ]; then
+        echo "  = $name already exists, left alone"
+        return
+    fi
+    printf '%s' "$value" > "$SECRETS_DIR/$name"
+    chmod 600 "$SECRETS_DIR/$name"
+    if [ -n "$value" ]; then echo "  + $name taken from .env"; else echo "  + $name written empty (optional)"; fi
+}
+carry_key anthropic_api_key AI_FDE_ANTHROPIC_API_KEY
+carry_key openai_api_key AI_FDE_OPENAI_API_KEY
+
 echo
 echo "Done. Next:"
 echo "  1. Set BOOTSTRAP_ADMIN_PASSWORD in .env (at least 12 characters)."
