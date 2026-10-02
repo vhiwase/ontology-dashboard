@@ -569,6 +569,12 @@ app.get(
 			color: type.color,
 			rowCount: type.rowCount,
 			sourceView: type.sourceView,
+			// The detail page shows these; they were only ever on the list.
+			primaryKeyProperty:
+				type.propertyBySqlColumn.get(type.primaryKeyColumn)?.apiName ??
+				type.properties.find((p) => p.isIdentity)?.apiName ??
+				null,
+			titleProperty: type.properties.find((p) => p.isTitle)?.apiName ?? null,
 			properties: type.properties,
 			links: [
 				...forward.map((link) => ({

@@ -194,3 +194,55 @@ describe("clampLimit", () => {
 		}
 	});
 });
+
+// ── periods and ranges ──────────────────────────────────────────────────────
+
+describe("time grains and date ranges", () => {
+	const { dimensionSql, parseDimension, boundCast } = __testing;
+	const dated = new Map<string, ColumnMeta>([
+		["order_date", { name: "order_date", sqlType: "date" }],
+		["created_at", { name: "created_at", sqlType: "timestamp with time zone" }],
+		["country", { name: "country", sqlType: "text" }],
+		["amount", { name: "amount", sqlType: "numeric" }],
+	]);
+
+	it("reads column:grain and refuses an unknown grain", () => {
+		expect(parseDimension("order_date:month")).toEqual({ column: "order_date", grain: "month" });
+		expect(parseDimension("country")).toEqual({ column: "country", grain: null });
+		expect(() => parseDimension("order_date:fortnight")).toThrow(/time grain/);
+		expect(() => parseDimension("a:b:c")).toThrow();
+	});
+
+	it("buckets a date by its grain, and refuses a grain on a non-date", () => {
+		expect(dimensionSql(kpi(), parseDimension("order_date:month"), dated)).toBe(`date_trunc('month', "order_date")::date`);
+		expect(dimensionSql(kpi(), parseDimension("order_date:day"), dated)).toBe(`("order_date")::date`);
+		expect(() => dimensionSql(kpi(), parseDimension("country:month"), dated)).toThrow(/not a date/);
+	});
+
+	it("compares range bounds as the column's own type", () => {
+		expect(boundCast("date", null)).toBe("date");
+		expect(boundCast("timestamp with time zone", null)).toBe("timestamptz");
+		expect(boundCast("numeric", null)).toBe("numeric");
+		expect(boundCast("text", null)).toBe("text");
+		expect(boundCast("timestamp", "month")).toBe("date");
+	});
+
+	it("turns gte/lte into bound predicates and refuses anything else in an object", () => {
+		const { sql, values, applied } = buildFilters(kpi(), dated, {
+			order_date: { gte: "1997-01-01", lte: "1997-12-31" },
+			amount: { gt: 100 },
+		});
+		expect(sql).toContain(`"order_date" >= $1::date`);
+		expect(sql).toContain(`"order_date" <= $2::date`);
+		expect(sql).toContain(`"amount" > $3::numeric`);
+		expect(values).toEqual(["1997-01-01", "1997-12-31", "100"]);
+		expect(applied).toHaveProperty("order_date");
+		expect(() => buildFilters(kpi(), dated, { order_date: { between: "x" } })).toThrow(/range with gte/);
+	});
+
+	it("ignores an empty bound rather than comparing with nothing", () => {
+		const { sql, values } = buildFilters(kpi(), dated, { order_date: { gte: "1997-01-01", lte: "" } });
+		expect(values).toEqual(["1997-01-01"]);
+		expect(sql).not.toContain("<=");
+	});
+});
