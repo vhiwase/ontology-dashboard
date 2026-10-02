@@ -304,6 +304,7 @@ app.post(
 				ontologyRole: user.ontology_role,
 				signupSource: "self",
 				personalSpace: space.slug,
+				displayName: input.displayName,
 			},
 		});
 	}),

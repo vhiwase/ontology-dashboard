@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { FunctionReview } from "../components/functions/FunctionReview";
 import { useSpace } from "../SpaceContext";
@@ -23,10 +23,15 @@ import {
 	type ChatArtifact,
 	type ChatResponse,
 	type ChatToolCall,
+	type FeasibilityItem,
+	type ProposalRecord,
 	api,
+	formatPeriod,
 	formatValue,
+	grainOf,
 } from "../api";
 import { Chart, type ChartKind } from "../components/Chart";
+import { ProposalCard } from "../components/ProposalCard";
 import { DataTable, ErrorBanner, Markdown, Spinner, useScrollToBottom } from "../components/common";
 
 interface Turn {
@@ -82,7 +87,11 @@ export function Assistant() {
 	// Pinned per conversation rather than per turn, so a thread does not
 	// silently change model half way through.
 	const [provider, setProvider] = useState<string | null>(null);
-	const { spaceSlug } = useSpace();
+	const { spaceSlug, isPersonal, reload } = useSpace();
+	// A question handed over from elsewhere (the home page's ask box, a
+	// suggestion) arrives as ?q= and is asked once, then cleared from the URL.
+	const [params, setParams] = useSearchParams();
+	const handedOver = useRef<string | null>(params.get("q"));
 	// The resource a chip in a reply opened. An answer that names an object
 	// type should be able to show it, not just spell it.
 	const [previewId, setPreviewId] = useState<number | null>(null);
@@ -107,10 +116,6 @@ export function Assistant() {
 			.then(setHealth)
 			.catch(() => setHealth(null));
 		api
-			.get<{ starters: Starter[] }>("/api/assistant/starters")
-			.then((body) => setStarters(body.starters))
-			.catch(() => setStarters([]));
-		api
 			.get<ProviderCatalogue>("/api/assistant/providers")
 			.then((body) => {
 				setCatalogue(body);
@@ -120,6 +125,14 @@ export function Assistant() {
 			})
 			.catch(() => setCatalogue(null));
 	}, []);
+
+	// Suggestions are written from this space's own metrics, so they follow it.
+	useEffect(() => {
+		api
+			.get<{ starters: Starter[] }>(`/api/assistant/starters?space=${spaceSlug}`)
+			.then((body) => setStarters(body.starters))
+			.catch(() => setStarters([]));
+	}, [spaceSlug]);
 
 	const selected = catalogue?.providers.find((p) => p.id === provider) ?? null;
 
@@ -205,6 +218,26 @@ export function Assistant() {
 		}
 	};
 
+	// Ask the handed-over question once the model catalogue has settled, so it
+	// goes to the same provider the picker shows.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: fire once
+	useEffect(() => {
+		const question = handedOver.current;
+		if (!question || !catalogue) return;
+		handedOver.current = null;
+		params.delete("q");
+		setParams(params, { replace: true });
+		const trimmed = question.trim();
+		// A prompt that ends mid-sentence ("Build me a dashboard about ") is a
+		// starting point to finish, not a question to send.
+		if (/\s$/.test(question) || trimmed.endsWith(" about")) {
+			setInput(question);
+			textareaRef.current?.focus();
+		} else {
+			void send(trimmed);
+		}
+	}, [catalogue]);
+
 	const llmDown = health && !health.llm.reachable;
 	const modelMissing = health?.llm.reachable && health.llm.modelPresent === false;
 	// The primary can be in cooldown while the fallback answers fine. That is a
@@ -260,14 +293,22 @@ export function Assistant() {
 								{health.providerReason}
 							</p>
 						)}
-						<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
-							I know this TMS ontology: {" "}
-							<Link to="/ontology">object types</Link>, their links, the{" "}
-							<Link to="/dashboards">KPI catalogue</Link> and the action layer. Ask me a
-							question about the freight book, or tell me what dashboard you need and I
-							will build it. Every figure I show is measured from your TMS snapshot; where
-							the snapshot does not carry something, I will say so rather than estimate it.
-						</p>
+						{isPersonal ? (
+							<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
+								I work from your <Link to="/ontology">data model</Link>: the tables you imported, the links
+								between them and the <Link to="/dashboards#metrics">metrics</Link> defined on them. Ask for a
+								chart, a KPI, a dashboard or a report. If your data can answer it, you get it; if it needs a
+								new link, a combined dataset or a metric, I draft that for you to approve; if the data cannot
+								answer it, I say what is missing. I never estimate a number.
+							</p>
+						) : (
+							<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
+								I know this space's ontology: <Link to="/ontology">object types</Link>, their links, the{" "}
+								<Link to="/dashboards">metric catalogue</Link> and the action layer. Ask me a question, or tell
+								me what dashboard you need and I will build it. Every figure I show is measured from the data;
+								where it does not carry something, I will say so rather than estimate it.
+							</p>
+						)}
 						<div className="starters">
 							{starters.map((starter) => (
 								<button key={starter.label} className="starter" onClick={() => void send(starter.prompt)}>
@@ -286,6 +327,25 @@ export function Assistant() {
 						onCitation={openCitation}
 						onAnswer={(answer) => void send(answer)}
 						onReviewFunction={setReviewFunction}
+						onApproved={(settled) => {
+							reload();
+							// Say what changed, in the conversation where it was asked for.
+							const built = settled
+								.map((entry) => entry.result?.built)
+								.find((entry): entry is { kind: "dashboard" | "report"; slug: string; title: string; widgets: number } =>
+									Boolean(entry && "slug" in entry),
+								);
+							if (built) {
+								setTurns((current) => [
+									...current,
+									{
+										role: "assistant",
+										content: `Approved and built: **${built.title}**, a ${built.kind} with ${built.widgets} widgets.`,
+										artifacts: [{ kind: "dashboard", slug: built.slug, title: built.title, widgets: built.widgets, boardKind: built.kind }],
+									},
+								]);
+							}
+						}}
 					/>
 				))}
 
@@ -315,7 +375,11 @@ export function Assistant() {
 					<textarea
 						ref={textareaRef}
 						value={input}
-						placeholder="Ask about orders, carriers, lanes, margin — or ask for a dashboard."
+						placeholder={
+							isPersonal
+								? "Ask for a chart, a KPI, a dashboard or a report — “revenue by country per month”."
+								: "Ask about the data — or ask for a dashboard."
+						}
 						onChange={(event) => setInput(event.target.value)}
 						onKeyDown={(event) => {
 							// Enter sends; Shift+Enter is a newline. Standard for a chat box, and
@@ -445,6 +509,7 @@ function TurnView({
 	onCitation,
 	onAnswer,
 	onReviewFunction,
+	onApproved,
 }: {
 	turn: Turn;
 	/** Opens the workspace resource a :resource[...] chip names. */
@@ -455,6 +520,8 @@ function TurnView({
 	onAnswer: (answer: string) => void;
 	/** Opens the review dialog for a metric the assistant drafted. */
 	onReviewFunction?: (apiName: string) => void;
+	/** A proposal in this turn was approved (with whatever it settled). */
+	onApproved?: (settled: ProposalRecord[]) => void;
 }) {
 	// A clarification arrives as an artifact rather than prose, so the options
 	// stay structured instead of being parsed back out of a sentence.
@@ -517,6 +584,8 @@ function TurnView({
 								key={index}
 								artifact={artifact}
 								onReviewFunction={onReviewFunction}
+								onApproved={onApproved}
+								onAsk={onAnswer}
 							/>
 						))}
 					</div>
@@ -702,13 +771,128 @@ function PipelineProposalCard({
 	);
 }
 
+/** A proposal from the conversation, read in full so the evidence shows. */
+function ProposalArtifact({
+	id,
+	onApproved,
+}: {
+	id: number;
+	onApproved?: (settled: ProposalRecord[]) => void;
+}) {
+	const [proposal, setProposal] = useState<ProposalRecord | null>(null);
+	const [missing, setMissing] = useState(false);
+	useEffect(() => {
+		api
+			.get<ProposalRecord>(`/api/proposals/${id}`)
+			.then(setProposal)
+			.catch(() => setMissing(true));
+	}, [id]);
+	if (missing) return null;
+	if (!proposal) return <Spinner label="Loading the proposal" />;
+	return (
+		<ProposalCard
+			proposal={proposal}
+			compact
+			onSettled={(settled) => {
+				if (settled.some((entry) => entry.status === "applied")) onApproved?.(settled);
+			}}
+		/>
+	);
+}
+
+const STATUS_MARK: Record<string, { mark: string; tone: string; label: string }> = {
+	ready: { mark: "✓", tone: "good", label: "Ready" },
+	needs_approval: { mark: "◐", tone: "warning", label: "Needs approval" },
+	not_possible: { mark: "✕", tone: "critical", label: "Not possible" },
+};
+
+/** What the data can answer, one approval away, or not at all. */
+function FeasibilityArtifact({
+	items,
+	onAsk,
+}: {
+	items: FeasibilityItem[];
+	onAsk?: (text: string) => void;
+}) {
+	const [open, setOpen] = useState(false);
+	if (items.length === 0) return null;
+	const counts = items.reduce<Record<string, number>>((acc, item) => {
+		acc[item.status] = (acc[item.status] ?? 0) + 1;
+		return acc;
+	}, {});
+	return (
+		<div className="feasibility">
+			<button className="feasibility-head" onClick={() => setOpen((value) => !value)}>
+				<span className="muted">Checked against your data:</span>
+				{(["ready", "needs_approval", "not_possible"] as const).map((status) =>
+					counts[status] ? (
+						<span key={status} className={`chip ${STATUS_MARK[status]!.tone}`}>
+							{STATUS_MARK[status]!.mark} {counts[status]} {STATUS_MARK[status]!.label.toLowerCase()}
+						</span>
+					) : null,
+				)}
+				<span className="muted" style={{ marginLeft: "auto" }}>
+					{open ? "hide" : "details"}
+				</span>
+			</button>
+			{open && (
+				<ul className="feasibility-list">
+					{items.map((item, index) => {
+						const status = STATUS_MARK[item.status] ?? STATUS_MARK.ready!;
+						return (
+							<li key={index} className={`feasibility-item ${item.status}`}>
+								<span className={`feasibility-mark ${status.tone}`} aria-label={status.label}>
+									{status.mark}
+								</span>
+								<div>
+									<div>{item.explanation}</div>
+									{item.missing && item.missing.length > 0 && (
+										<div className="muted" style={{ fontSize: 12 }}>
+											Missing: {item.missing.join("; ")}
+										</div>
+									)}
+									{item.alternatives && item.alternatives.length > 0 && (
+										<div className="row" style={{ gap: 5, marginTop: 4 }}>
+											<span className="muted" style={{ fontSize: 12 }}>
+												Try instead:
+											</span>
+											{item.alternatives.slice(0, 4).map((alternative) => (
+												<button key={alternative} className="starter sm" onClick={() => onAsk?.(alternative)}>
+													{alternative}
+												</button>
+											))}
+										</div>
+									)}
+								</div>
+							</li>
+						);
+					})}
+				</ul>
+			)}
+		</div>
+	);
+}
+
 function ArtifactView({
 	artifact,
 	onReviewFunction,
+	onApproved,
+	onAsk,
 }: {
 	artifact: ChatArtifact;
 	onReviewFunction?: (apiName: string) => void;
+	onApproved?: (settled: ProposalRecord[]) => void;
+	onAsk?: (text: string) => void;
 }) {
+	if (artifact.kind === "feasibility") {
+		return <FeasibilityArtifact items={(artifact.items as FeasibilityItem[]) ?? []} onAsk={onAsk} />;
+	}
+
+	if (artifact.kind === "proposal") {
+		const proposal = artifact.proposal as { id: number } | undefined;
+		return proposal?.id ? <ProposalArtifact id={proposal.id} onApproved={onApproved} /> : null;
+	}
+
 	// A drafted pipeline. Accept / Edit / Reject, as §18 asks - and the graph
 	// is summarised inline so the decision can be made without leaving the
 	// conversation for a canvas.
@@ -769,21 +953,27 @@ function ArtifactView({
 	}
 
 	if (artifact.kind === "dashboard") {
+		const report = artifact.boardKind === "report";
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
-				<div className="row" style={{ gap: 8 }}>
+			<Link className="board-artifact" to={`/dashboards/${String(artifact.slug)}`}>
+				<span className={`board-kind ${report ? "report" : ""}`} aria-hidden>
+					{report ? "▤" : "▦"}
+				</span>
+				<span className="board-artifact-text">
 					<strong>{String(artifact.title)}</strong>
-					<span className="chip">{String(artifact.widgets)} widgets</span>
-					<Link className="btn sm primary" to={`/dashboards/${String(artifact.slug)}`} style={{ marginLeft: "auto" }}>
-						Open dashboard
-					</Link>
-				</div>
-			</div>
+					<span className="muted">
+						{report ? "Report" : "Dashboard"} · {String(artifact.widgets)} widgets
+					</span>
+				</span>
+				<span className="btn sm primary">Open {report ? "report" : "dashboard"}</span>
+			</Link>
 		);
 	}
 
 	if (artifact.kind === "chart") {
 		const series = (artifact.series as Array<{ label: string; value: number | null }>) ?? [];
+		const grain = (artifact.dimensionGrain as string | null) ?? grainOf(artifact.dimension as string | null);
+		const formatLabel = grain ? (label: string) => formatPeriod(label, grain) : undefined;
 		return (
 			<div className="card" style={{ background: "var(--surface-2)" }}>
 				<div className="card-head">
@@ -804,7 +994,15 @@ function ArtifactView({
 					points={series}
 					format={String(artifact.format ?? "number")}
 					unit={artifact.unit as string | null}
+					formatLabel={formatLabel}
+					partialLabel={(artifact.partialPeriod as string | null) ?? null}
 				/>
+				{Boolean(artifact.partialPeriod) && (
+					<p className="muted" style={{ fontSize: 11, marginTop: 6, marginBottom: 0 }}>
+						{formatLabel ? formatLabel(String(artifact.partialPeriod)) : String(artifact.partialPeriod)} is
+						incomplete: the data runs to {String(artifact.dataThrough)}.
+					</p>
+				)}
 				{Boolean(artifact.caveat) && (
 					<p className="muted" style={{ fontSize: 11, marginTop: 8, marginBottom: 0 }}>
 						{String(artifact.caveat)}

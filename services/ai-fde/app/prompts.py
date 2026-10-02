@@ -335,13 +335,35 @@ def _article(word: str) -> str:
     return "an" if word[:1].lower() in "aeiou" else "a"
 
 
-def _metric_rank(kpi: dict[str, Any]) -> int:
-    """Money first, then other sums and averages, then plain counts."""
-    if kpi.get("format") == "currency":
+def _metric_rank(kpi: dict[str, Any]) -> tuple[int, int]:
+    """Money first (revenue before other money, totals before averages), then
+    other sums and averages, then counts."""
+    money = kpi.get("format") == "currency"
+    aggregation = kpi.get("aggregation")
+    headline = 0 if re.search(r"revenue|sales|amount|income|turnover", str(kpi.get("label", "")).lower()) else 1
+    if money and aggregation == "sum":
+        return (0, headline)
+    if money:
+        return (1, headline)
+    if aggregation in ("sum", "avg", "ratio"):
+        return (2, headline)
+    return (3, headline)
+
+
+def _dimension_rank(dimension: str) -> int:
+    """Where and what before who; a contact's title or a numeric level last."""
+    name = dimension.lower()
+    if re.search(r"contact|courtesy|level|code|address|phone|postal", name):
+        return 5
+    if re.search(r"country|nation", name):
         return 0
-    if kpi.get("aggregation") in ("sum", "avg", "ratio"):
+    if re.search(r"category|segment|type|class|channel|status|tier|group|product", name):
         return 1
-    return 2
+    if re.search(r"region|state|territory|province|market", name):
+        return 2
+    if re.search(r"city", name):
+        return 3
+    return 4
 
 
 def starter_prompts(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -368,7 +390,7 @@ def starter_prompts(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
         return str(type_.get("pluralLabel") or f"{type_.get('label') or type_.get('apiName')}s").lower()
 
     # Over time: the best-ranked metric with a monthly grain, else any grain.
-    temporal = None
+    temporal: tuple[dict[str, Any], str] | None = None
     for grains in ((":month",), (":week", ":quarter", ":year", ":day")):
         temporal = next(
             ((k, d) for k in kpis for d in k.get("dimensions") or [] if d.endswith(grains)), None
@@ -380,27 +402,45 @@ def starter_prompts(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
         grain = dim.split(":", 1)[1]
         out.append({"label": f"{label_of(kpi)} per {grain}", "prompt": f"Show {label_of(kpi).lower()} per {grain}"})
 
-    # A breakdown: a different metric from the one over time where possible.
-    used = temporal[0] if temporal else None
-    categorical = next(
-        ((k, d) for k in kpis for d in k.get("dimensions") or [] if ":" not in d and k is not used), None
-    ) or next(((k, d) for k in kpis for d in k.get("dimensions") or [] if ":" not in d), None)
+    # A breakdown by the most telling dimension of the best metric that has
+    # one: revenue by country before average price by reorder level.
+    pairs = [
+        (_metric_rank(k), _dimension_rank(d), index, k, d)
+        for index, k in enumerate(kpis)
+        for d in k.get("dimensions") or []
+        if ":" not in d
+    ]
+    pairs.sort(key=lambda pair: (pair[0], pair[1], pair[2]))
+    categorical = (pairs[0][3], pairs[0][4]) if pairs else None
     if categorical:
         kpi, dim = categorical
         out.append({"label": f"{label_of(kpi)} by {humanize(dim)}", "prompt": f"Show {label_of(kpi).lower()} by {humanize(dim)}"})
 
-    # A board about whatever the best metric measures, else the biggest type.
+    # A board about the type with the most to show: a timeline and ways to
+    # slice it, money on it, rows in it.
     by_name = {t.get("apiName"): t for t in types}
-    subject = by_name.get((kpis[0].get("objectType") if kpis else None) or "") or types[0]
+
+    def richness(type_: dict[str, Any]) -> tuple[int, int]:
+        own = [k for k in kpis if k.get("objectType") == type_.get("apiName")]
+        timeline = any(":" in d for k in own for d in k.get("dimensions") or [])
+        slices = len({d for k in own for d in k.get("dimensions") or [] if ":" not in d})
+        money = any(k.get("format") == "currency" for k in own)
+        return (3 * timeline + min(slices, 6) + 2 * money, int(type_.get("rowCount") or 0))
+
+    subject = max(types, key=richness)
     plural = plural_of(subject)
     out.append({"label": f"Build {_article(plural)} {plural} dashboard", "prompt": f"Build me a dashboard about {plural}"})
     out.append({"label": f"Write {_article(plural)} {plural} report", "prompt": f"Write a report on {plural} I can share"})
 
     # A combination along a link that exists: rows of one type with the
     # details of the type they point at.
-    for link in snapshot.get("links") or []:
+    links = sorted(
+        snapshot.get("links") or [],
+        key=lambda link: -int((by_name.get(link.get("source")) or {}).get("rowCount") or 0),
+    )
+    for link in links:
         source, target = by_name.get(link.get("source")), by_name.get(link.get("target"))
-        if source and target and source is not target:
+        if source and target and source is not target and source.get("rowCount") and target.get("rowCount"):
             out.append(
                 {
                     "label": f"Combine {plural_of(source)} with {str(target.get('label')).lower()} details",

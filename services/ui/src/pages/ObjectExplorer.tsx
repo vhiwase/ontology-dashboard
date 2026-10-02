@@ -8,6 +8,7 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
 	type LinkSummary,
 	type ObjectTypeDetail,
@@ -65,7 +66,9 @@ const OP_LABELS: Record<string, string> = {
 
 export function ObjectExplorer() {
 	const [types, setTypes] = useState<ObjectTypeSummary[] | null>(null);
-	const [typeName, setTypeName] = useState<string>("Order");
+	// A link from elsewhere (the home page's model list) can name the type.
+	const [params] = useSearchParams();
+	const [typeName, setTypeName] = useState<string>(() => params.get("type") ?? "Order");
 	const [detail, setDetail] = useState<ObjectTypeDetail | null>(null);
 	const [filters, setFilters] = useState<FilterRow[]>([]);
 	const [search, setSearch] = useState("");

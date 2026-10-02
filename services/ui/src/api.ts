@@ -46,6 +46,23 @@ export interface SessionUser {
 	username: string;
 	role: "viewer" | "analyst" | "admin";
 	ontologyRole: string;
+	/** "self" for an account created through the registration form. */
+	signupSource?: string;
+	/** The caller's own workspace, where new work lands by default. */
+	personalSpace?: string;
+	displayName?: string | null;
+}
+
+export interface AuthConfig {
+	selfRegistration: boolean;
+	registrationRole: string;
+}
+
+export interface RegistrationForm {
+	username: string;
+	password: string;
+	email?: string;
+	displayName?: string;
 }
 
 const TOKEN_KEY = "tms.auth.token";
@@ -115,10 +132,10 @@ export const session = {
  *
  * SpaceProvider owns the value; this is only where the client reads it.
  */
-let activeSpace = "sandbox";
+let activeSpace = "";
 
 export function setActiveSpace(slug: string): void {
-	activeSpace = slug || "sandbox";
+	activeSpace = slug;
 }
 
 /**
@@ -131,8 +148,11 @@ function withSpace(path: string): string {
 	if (path.startsWith("/api/auth/")) return path;
 	const [base, query = ""] = path.split("?");
 	const params = new URLSearchParams(query);
-	if (!params.has("space")) params.set("space", activeSpace);
-	return `${base}?${params.toString()}`;
+	// Before a space is known, no parameter at all: the server then uses the
+	// caller's own workspace, which is the right place for a stray request.
+	if (!params.has("space") && activeSpace) params.set("space", activeSpace);
+	const encoded = params.toString();
+	return encoded ? `${base}?${encoded}` : base!;
 }
 
 /** Notified when the server rejects our token, so the app can show the login. */
@@ -206,6 +226,20 @@ export const api = {
 		}>("/api/auth/login", {
 			method: "POST",
 			body: JSON.stringify({ username, password }),
+		});
+		session.set(result.token, result.user, result.expiresAt);
+		return result.user;
+	},
+
+	/** Create an account (and its private workspace) and sign in with it. */
+	async register(form: RegistrationForm): Promise<SessionUser> {
+		const result = await request<{
+			token: string;
+			expiresAt: string;
+			user: SessionUser;
+		}>("/api/auth/register", {
+			method: "POST",
+			body: JSON.stringify(form),
 		});
 		session.set(result.token, result.user, result.expiresAt);
 		return result.user;
@@ -371,6 +405,28 @@ export interface KpiResult {
 	coverageNote: string | null;
 	sql: string;
 	appliedFilters: Record<string, unknown>;
+	/** The grain when the dimension is a date grouped by period. */
+	dimensionGrain?: string | null;
+	/** count, sum, avg...: whether the parts of a breakdown add up to the total. */
+	aggregation?: string;
+	/** The newest period, when the data stops part-way through it. */
+	partialPeriod?: string | null;
+	dataThrough?: string | null;
+	/** A headline figure's recent history, on stat tiles. */
+	trend?: KpiTrend | null;
+}
+
+export interface KpiTrend {
+	grain: string;
+	timeColumn: string;
+	points: Array<{ label: string; value: number | null }>;
+	/** Change between the last two COMPLETE periods. */
+	delta: number | null;
+	deltaPct: number | null;
+	lastPeriod: string | null;
+	previousPeriod: string | null;
+	dataThrough: string | null;
+	lastPointPartial: boolean;
 }
 
 export interface Widget {
@@ -400,12 +456,129 @@ export interface DashboardSummary {
 	createdAt: string;
 	updatedAt: string;
 	isPinned: boolean;
+	/** A live grid, or the same widgets laid out as a printable document. */
+	kind?: "dashboard" | "report";
+	chatSessionId?: number | null;
 }
 
 export interface ResolvedDashboard extends DashboardSummary {
-	widgets: Array<Widget & { index: number; data: KpiResult | null; error: string | null }>;
+	widgets: Array<
+		Widget & { index: number; data: KpiResult | null; error: string | null; ignoredFilters?: string[] }
+	>;
 	coverageNotes: string[];
 	dependsOnSimulation: boolean;
+}
+
+/** What a board can be filtered by, read from the data. */
+export interface DashboardFilterOptions {
+	dimensions: Array<{ key: string; label: string; values: Array<{ value: string; count: number }> }>;
+	time: Array<{ column: string; label: string; min: string | null; max: string | null }>;
+}
+
+// ── workspaces, feasibility, proposals ──────────────────────────────────────
+
+export interface WorkspaceSummary {
+	space: { slug: string; name: string; kind: string; ownerUsername: string | null } | null;
+	counts: {
+		connections: number;
+		datasets: number;
+		objectTypes: number;
+		linkTypes: number;
+		metrics: number;
+		actionTypes: number;
+		dashboards: number;
+		reports: number;
+		pendingProposals: number;
+	};
+	objectTypes: Array<{
+		apiName: string;
+		label: string;
+		pluralLabel: string | null;
+		rowCount: number;
+		origin: string;
+		color: string | null;
+		group: string | null;
+		properties: number;
+		measures: number;
+		dimensions: number;
+		links: number;
+	}>;
+}
+
+export type FeasibilityStatus = "ready" | "needs_approval" | "not_possible";
+
+export interface FollowUp {
+	build: "dashboard" | "report";
+	title: string;
+	measure: string | null;
+	sourcePrompt: string | null;
+}
+
+export interface DraftProposal {
+	kind: ProposalKind;
+	title: string;
+	summary: string;
+	payload: Record<string, unknown>;
+	dependsOn: number[];
+	followUp?: FollowUp;
+}
+
+export interface FeasibilityItem {
+	request: { text?: string; measure?: string; dimension?: string; objectType?: string };
+	status: FeasibilityStatus;
+	explanation: string;
+	kpi?: string | null;
+	dimension?: string | null;
+	widget?: Widget | null;
+	proposals?: DraftProposal[];
+	missing?: string[];
+	alternatives?: string[];
+}
+
+export interface FeasibilityReport {
+	intent: string;
+	subject: string | null;
+	items: FeasibilityItem[];
+	summary: { ready: number; needsApproval: number; notPossible: number };
+	layout?: Widget[];
+	title?: string;
+}
+
+export type ProposalKind = "link_type" | "metric" | "combination" | "action_type";
+export type ProposalStatus = "pending" | "applied" | "rejected" | "failed";
+
+export interface ProposalRecord {
+	id: number;
+	kind: ProposalKind;
+	title: string;
+	summary: string | null;
+	payload: Record<string, unknown>;
+	preview: Record<string, unknown>;
+	status: ProposalStatus;
+	dependsOn: number[];
+	result: (Record<string, unknown> & { built?: BuiltBoard | { error: string } }) | null;
+	error: string | null;
+	createdBy: string;
+	createdVia: "user" | "assistant" | "planner";
+	chatSessionId: number | null;
+	decidedBy: string | null;
+	decidedAt: string | null;
+	decisionNote: string | null;
+	createdAt: string;
+	followUp: FollowUp | null;
+}
+
+export interface BuiltBoard {
+	kind: "dashboard" | "report";
+	slug: string;
+	title: string;
+	widgets: number;
+}
+
+/** The board a settled proposal built, if it built one. */
+export function builtBoard(proposal: ProposalRecord): BuiltBoard | null {
+	const built = proposal.result?.built;
+	return built && "slug" in built ? built : null;
 }
 
 export interface PlatformStats {
@@ -675,7 +848,11 @@ export interface ChatArtifact {
 		/** A metric the assistant drafted, awaiting a person's approval. */
 		| "functionProposal"
 		/** A pipeline graph the assistant drafted, awaiting acceptance (§18). */
-		| "pipelineProposal";
+		| "pipelineProposal"
+		/** What the data can answer, one approval away, or not at all. */
+		| "feasibility"
+		/** A link, dataset, metric or action waiting for the user's approval. */
+		| "proposal";
 	[key: string]: unknown;
 }
 
@@ -767,6 +944,60 @@ export function formatValue(
 			return `${round(value, Math.abs(value) < 10 ? 2 : 1).toLocaleString("en-US")}${suffix}`;
 		}
 	}
+}
+
+// ── periods and exports ─────────────────────────────────────────────────────
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "1997-04-01" at a month grain reads "Apr 1997"; anything else is left alone. */
+export function formatPeriod(label: string, grain: string | null | undefined): string {
+	const match = /^(\d{4})-(\d{2})-(\d{2})/.exec(label ?? "");
+	if (!match || !grain) return label;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	switch (grain) {
+		case "year":
+			return String(year);
+		case "quarter":
+			return `Q${Math.floor((month - 1) / 3) + 1} ${year}`;
+		case "month":
+			return `${MONTHS[month - 1]} ${year}`;
+		case "week":
+			return `${day} ${MONTHS[month - 1]} ${String(year).slice(2)}`;
+		default:
+			return `${day} ${MONTHS[month - 1]} ${year}`;
+	}
+}
+
+/** The grain of a dimension key such as "order_date:month", if it has one. */
+export function grainOf(dimension: string | null | undefined): string | null {
+	const grain = (dimension ?? "").split(":")[1];
+	return grain || null;
+}
+
+/** Rows as CSV text, quoted where needed, for a download. */
+export function toCsv(columns: string[], rows: Array<Array<unknown>>): string {
+	const cell = (value: unknown): string => {
+		if (value === null || value === undefined) return "";
+		const text = String(value);
+		return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+	};
+	return [columns.map(cell).join(","), ...rows.map((row) => row.map(cell).join(","))].join("\r\n");
+}
+
+/** Offer text as a file download, without a server round trip. */
+export function downloadText(filename: string, text: string, type = "text/csv;charset=utf-8"): void {
+	const blob = new Blob([text], { type });
+	const url = URL.createObjectURL(blob);
+	const anchor = document.createElement("a");
+	anchor.href = url;
+	anchor.download = filename;
+	document.body.appendChild(anchor);
+	anchor.click();
+	anchor.remove();
+	setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function formatCurrency(value: number): string {

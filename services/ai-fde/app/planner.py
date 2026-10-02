@@ -367,6 +367,13 @@ def compose_answer(turn: Turn) -> str:
         extra = [i for i in items if i.get("status") != "ready"]
         for item in extra:
             parts.append(_item_sentence(item, turn))
+    elif intent in ("link", "combination"):
+        # A request to change the model: the explanation is the whole answer.
+        for item in items:
+            if item.get("status") == "not_possible":
+                parts.append(_item_sentence(item, turn))
+            else:
+                parts.append(item.get("explanation", ""))
     else:
         for item in items:
             parts.append(_item_sentence(item, turn))

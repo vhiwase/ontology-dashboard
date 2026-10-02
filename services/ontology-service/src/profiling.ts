@@ -227,6 +227,9 @@ export function inferRoles(
 
 		// Text.
 		if (CODE_LIKE_NAME.test(name)) return { ...base, role: "attribute", reason: "A contact detail or code, not a category to group by." };
+		if (/(photo|picture|image|avatar|_path$|url|uri$|homepage|website|_file$|address)/.test(name)) {
+			return { ...base, role: "attribute", reason: "A link, file or address: it describes a row rather than grouping rows." };
+		}
 		const ratio = distinct / filled;
 		// A column with a different value on every row cannot group anything,
 		// however few rows there are: it names rows rather than sorting them.

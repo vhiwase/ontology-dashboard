@@ -76,6 +76,8 @@ describe("inferRoles", () => {
 			column("country", "text", { distinct: 21 }),
 			column("company_name", "text", { distinct: 100, nonNull: 100 }),
 			column("postal_code", "text", { distinct: 20 }),
+			column("photo_path", "text", { distinct: 9 }),
+			column("ship_address", "text", { distinct: 40 }),
 			column("order_date", "date"),
 		]);
 		expect(r.country!.role).toBe("dimension");
@@ -83,6 +85,8 @@ describe("inferRoles", () => {
 		expect(r.company_name!.role).toBe("title");
 		expect(r.company_name!.isTitle).toBe(true);
 		expect(r.postal_code!.role).toBe("attribute");
+		expect(r.photo_path!.role).toBe("attribute");
+		expect(r.ship_address!.role).toBe("attribute");
 		expect(r.order_date!.role).toBe("temporal");
 	});
 });
@@ -102,6 +106,8 @@ describe("names", () => {
 describe("detectIntent", () => {
 	it.each([
 		["what can I build?", "capabilities"],
+		["What charts, KPIs and dashboards can I build from my data?", "capabilities"],
+		["which customers can you show by revenue", "chart"],
 		["build me a sales dashboard", "dashboard"],
 		["write a report on orders I can share", "report"],
 		["link orders to customers", "link"],

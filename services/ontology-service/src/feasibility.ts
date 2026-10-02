@@ -141,9 +141,16 @@ const GRAIN_WORDS: Array<[RegExp, string]> = [
 
 export function detectIntent(text: string): Intent {
 	const t = ` ${text.toLowerCase()} `;
-	if (/\b(what|which) (can|could) (i|we|you) (build|chart|make|create|answer|see)|\bwhat('s| is) possible\b|\bcapabilit/.test(t)) return "capabilities";
+	// "What can I build?", "what charts, KPIs and dashboards can I build from my
+	// data?", "what's possible?" - a question about the data, not a chart.
+	if (
+		/\b(what|which)\b[^?.!]{0,80}?\b(can|could)\s+(i|we|you)\s+(build|chart|make|create|answer|see|do)\b|\bwhat('s| is) possible\b|\bcapabilit|\bwhat (can|could) (my|our|this) data\b/.test(
+			t,
+		)
+	)
+		return "capabilities";
 	if (/\b(link|connect|relate|relationship between)\b/.test(t) && !/\bdashboard\b/.test(t)) return "link";
-	if (/\b(combine|enrich|merge)\b/.test(t)) return "combination";
+	if (/\b(combine|enrich|merge|join)\b/.test(t)) return "combination";
 	if (/\breport\b/.test(t)) return "report";
 	if (/\b(dashboard|board|overview|control tower|cockpit|scorecard)\b/.test(t)) return "dashboard";
 	if (/\b(define|create|add|new) (a |an )?(metric|kpi|measure)\b/.test(t)) return "metric";
@@ -208,8 +215,19 @@ function propertyTokens(property: PropertyMeta): string[] {
 	return [...new Set([...tokens(property.label), ...tokens(property.sqlColumn)])];
 }
 
+/** A phrase that IS a type's name ("territories", "us states"), synonyms aside. */
+function namesTypeExactly(phrase: string, type: ObjectTypeMeta): boolean {
+	const plain = (text: string) => words(text).map((w) => singular(w)).join(" ");
+	const wanted = plain(phrase);
+	return wanted !== "" && [type.label, type.pluralLabel ?? "", type.apiName].some((name) => plain(name) === wanted);
+}
+
 /** The type a phrase is mostly about, if it names one. */
 export function matchType(phrase: string): ObjectTypeMeta | null {
+	// An exact name wins before synonyms are consulted: "territories" is the
+	// Territory type even though territory is also a word for region.
+	const exact = getRegistry().objectTypes.find((type) => namesTypeExactly(phrase, type));
+	if (exact) return exact;
 	const want = tokens(phrase);
 	let best: { type: ObjectTypeMeta; score: number } | null = null;
 	for (const type of getRegistry().objectTypes) {
@@ -922,6 +940,299 @@ function analysisDataset(
 	};
 }
 
+// ── links and combinations asked for by name ────────────────────────────────
+//
+//  "Link orders to shippers", "connect invoices and customers on cust_ref",
+//  "combine order details with their products and categories". The types are
+//  read from the words, the key is found in the data (or taken from the
+//  request), and the result is a proposal - never an applied change.
+
+const FILLER =
+	/\b(please|can|could|would|you|i|we|want|wanna|like|need|create|add|make|build|set|up|a|an|the|new|my|our|their|its|of|for|me|us)\b/g;
+
+/**
+ * Split a request into the phrases between connectives, each cleaned of
+ * `noise`. Each phrase comes in two forms: as written (so "us states" can
+ * name the US State type) and without filler words ("my orders" -> "orders").
+ */
+function phrasesOf(text: string, separators: RegExp, noise: RegExp): Array<{ raw: string; clean: string }> {
+	return text
+		.toLowerCase()
+		.split(separators)
+		.map((part) => {
+			const raw = part.replace(noise, " ").replace(/\s+/g, " ").trim();
+			return { raw, clean: raw.replace(FILLER, " ").replace(/\s+/g, " ").trim() };
+		})
+		.filter((phrase) => phrase.clean || phrase.raw);
+}
+
+/** Distinct object types named in a phrase list, in the order named. */
+function namedTypes(phrases: Array<{ raw: string; clean: string }>): ObjectTypeMeta[] {
+	const registry = getRegistry();
+	const out: ObjectTypeMeta[] = [];
+	for (const phrase of phrases) {
+		// The trailing words as written first ("i want to see us states" ends in
+		// a type name), then the cleaned phrase through the usual matching.
+		const rawWords = phrase.raw.split(" ");
+		let type: ObjectTypeMeta | null = null;
+		for (let start = 0; start < rawWords.length && !type; start += 1) {
+			const tail = rawWords.slice(start).join(" ");
+			type = registry.objectTypes.find((candidate) => namesTypeExactly(tail, candidate)) ?? null;
+		}
+		type = type ?? (phrase.clean ? matchType(phrase.clean) : null);
+		if (type && !out.some((t) => t.rid === type!.rid)) out.push(type);
+	}
+	return out;
+}
+
+/**
+ * A key that joins `source` to `target` found by its values: an identifier
+ * column of the source whose values are (almost) all keys of the target.
+ * Only identifier columns are tried - a quantity of 1 to 3 would "match"
+ * three shipper ids perfectly and mean nothing.
+ */
+async function joinKeyByValues(source: ObjectTypeMeta, target: ObjectTypeMeta): Promise<DraftProposal | null> {
+	const key = target.properties.find((p) => p.sqlColumn === target.primaryKeyColumn);
+	if (!key || !target.keyIsUnique) return null;
+	const registry = getRegistry();
+	const linked = new Set((registry.linksBySourceRid.get(source.rid) ?? []).map((link) => link.sourceColumn));
+	const candidates = source.properties
+		.filter(
+			(p) =>
+				p.semanticRole === "identity" &&
+				p.sqlColumn !== source.primaryKeyColumn &&
+				// Already a reference to something else.
+				!linked.has(p.sqlColumn) &&
+				// Named for another type (category_id is a category, whatever
+				// employee ids its values happen to fall within).
+				!registry.objectTypes.some((other) => {
+					if (other.rid === target.rid) return false;
+					const stem = p.sqlColumn.replace(/_(id|key|code|no|number|ref)$/i, "");
+					return stem !== p.sqlColumn && namesTypeExactly(stem.replace(/_/g, " "), other);
+				}),
+		)
+		.slice(0, 8);
+	let best: { property: PropertyMeta; ratio: number; matched: number } | null = null;
+	for (const property of candidates) {
+		const measured = await measureLinkNow(source.sourceView, property.sqlColumn, target.sourceView, key.sqlColumn).catch(() => null);
+		if (measured && measured.ratio >= 0.9 && (!best || measured.ratio > best.ratio)) {
+			best = { property, ratio: measured.ratio, matched: measured.matched };
+		}
+	}
+	if (!best) return null;
+	const role = best.property.sqlColumn.replace(/_(id|key|code|no|number|ref)$/i, "").split("_").filter(Boolean)
+		.map((w) => w[0]!.toUpperCase() + w.slice(1)).join("") || target.apiName;
+	return {
+		kind: "link_type",
+		title: `Link ${source.label} to ${target.label}`,
+		summary: `${source.apiName}.${best.property.sqlColumn} holds ${target.apiName} keys: ${(best.ratio * 100).toFixed(1)}% of its values resolve.`,
+		payload: {
+			source: source.apiName,
+			sourceProperty: best.property.sqlColumn,
+			target: target.apiName,
+			targetProperty: key.sqlColumn,
+			apiName: `${source.apiName[0]!.toLowerCase()}${source.apiName.slice(1)}${role}`,
+		},
+		dependsOn: [],
+	};
+}
+
+/** Any way to draft a link from `source` to `target`: by name, then by values. */
+async function draftJoin(source: ObjectTypeMeta, target: ObjectTypeMeta): Promise<DraftProposal | null> {
+	return (await proposeJoinKey(source, target)) ?? (await joinKeyByValues(source, target));
+}
+
+function existingLink(a: ObjectTypeMeta, b: ObjectTypeMeta): LinkTypeMeta | undefined {
+	return getRegistry().linkTypes.find(
+		(link) =>
+			(link.sourceObjectType === a.rid && link.targetObjectType === b.rid) ||
+			(link.sourceObjectType === b.rid && link.targetObjectType === a.rid),
+	);
+}
+
+export async function linkRequest(text: string): Promise<FeasibilityItem> {
+	const request: FeasibilityRequest = { text };
+	const lowered = ` ${text.toLowerCase()} `;
+	// "... on ship_via", "... using cust_ref = customer_id"
+	const on = /\b(?:on|using|via|where)\s+([a-z_][a-z0-9_]*)(?:\.([a-z_][a-z0-9_]*))?(?:\s*=\s*([a-z_][a-z0-9_]*)(?:\.([a-z_][a-z0-9_]*))?)?/.exec(lowered);
+	const types = namedTypes(
+		phrasesOf(
+			on ? lowered.replace(on[0], " ") : lowered,
+			/\bto\b|\bwith\b|\band\b|,|&/,
+			/\b(link|links|linked|connect|connected|relate|related|relationship|relationships|associate|map|between|from)\b/g,
+		),
+	);
+	const registry = getRegistry();
+	if (types.length < 2) {
+		return {
+			request,
+			status: "not_possible",
+			explanation:
+				types.length === 1
+					? `I found ${types[0]!.label} in that, but not what to link it to. Name the other type - for example "link ${types[0]!.pluralLabel?.toLowerCase() ?? types[0]!.label.toLowerCase()} to ${registry.objectTypes.find((t) => t.rid !== types[0]!.rid)?.pluralLabel?.toLowerCase() ?? "customers"}".`
+					: "Name the two object types to link - for example \"link orders to customers\".",
+			missing: ["two object types to link"],
+			alternatives: registry.objectTypes.slice(0, 6).map((t) => t.pluralLabel ?? t.label),
+		};
+	}
+	const [source, target] = types as [ObjectTypeMeta, ObjectTypeMeta];
+	const existing = existingLink(source, target);
+	if (existing) {
+		return {
+			request,
+			status: "ready",
+			explanation:
+				`${source.label} and ${target.label} are already linked by ${existing.apiName} ` +
+				`(${(existing.matchRatio * 100).toFixed(1)}% of rows resolve). You can slice by it, follow it in the explorer, or combine the two into one dataset.`,
+		};
+	}
+
+	let draft: DraftProposal | null = null;
+	if (on) {
+		// The person named the column: use it, on whichever side holds it.
+		const sourceColumn = on[2] ?? on[1]!;
+		const targetColumn = on[4] ?? on[3] ?? null;
+		const sides: Array<[ObjectTypeMeta, ObjectTypeMeta]> = [[source, target], [target, source]];
+		for (const [from, to] of sides) {
+			const property = from.propertyBySqlColumn.get(sourceColumn) ?? from.properties.find((p) => p.apiName.toLowerCase() === sourceColumn);
+			if (!property) continue;
+			const toKey = targetColumn
+				? (to.propertyBySqlColumn.get(targetColumn) ?? null)
+				: (to.properties.find((p) => p.sqlColumn === to.primaryKeyColumn) ?? null);
+			if (!toKey) continue;
+			const measured = await measureLinkNow(from.sourceView, property.sqlColumn, to.sourceView, toKey.sqlColumn).catch(() => null);
+			if (!measured || measured.matched === 0) {
+				return {
+					request,
+					status: "not_possible",
+					explanation: `None of the values in ${from.apiName}.${property.sqlColumn} match ${to.apiName}.${toKey.sqlColumn}, so a link on that column would connect nothing.`,
+					missing: [`a column of ${from.label} whose values are ${to.label} keys`],
+				};
+			}
+			draft = {
+				kind: "link_type",
+				title: `Link ${from.label} to ${to.label}`,
+				summary: `${from.apiName}.${property.sqlColumn} = ${to.apiName}.${toKey.sqlColumn}: ${(measured.ratio * 100).toFixed(1)}% of rows resolve.`,
+				payload: { source: from.apiName, sourceProperty: property.sqlColumn, target: to.apiName, targetProperty: toKey.sqlColumn },
+				dependsOn: [],
+			};
+			break;
+		}
+		if (!draft) {
+			return {
+				request,
+				status: "not_possible",
+				explanation: `Neither ${source.label} nor ${target.label} has a column called ${sourceColumn}.`,
+				missing: [`the column ${sourceColumn}`],
+				alternatives: [...source.properties, ...target.properties].filter((p) => p.semanticRole === "identity").slice(0, 6).map((p) => p.sqlColumn),
+			};
+		}
+	} else {
+		draft = (await draftJoin(source, target)) ?? (await draftJoin(target, source));
+	}
+	if (!draft) {
+		const key = target.properties.find((p) => p.sqlColumn === target.primaryKeyColumn);
+		return {
+			request,
+			status: "not_possible",
+			explanation:
+				`No column of ${source.label} holds ${target.label} keys${key ? ` (${key.sqlColumn})` : ""}, by name or by value. ` +
+				`If one does under another name, say which: "link ${source.pluralLabel?.toLowerCase() ?? source.label.toLowerCase()} to ${target.pluralLabel?.toLowerCase() ?? target.label.toLowerCase()} on <column>".`,
+			missing: [`a column of ${source.label} that refers to ${target.label}`],
+		};
+	}
+	return {
+		request,
+		status: "needs_approval",
+		explanation: `${draft.summary} Approve the link and ${source.pluralLabel?.toLowerCase() ?? source.label.toLowerCase()} can be sliced by anything about their ${target.label.toLowerCase()}.`,
+		proposals: [draft],
+	};
+}
+
+export async function combinationRequest(text: string): Promise<FeasibilityItem> {
+	const request: FeasibilityRequest = { text };
+	const named = namedTypes(
+		phrasesOf(
+			text,
+			/\bwith\b|\band\b|\bplus\b|\bto\b|,|&/,
+			/\b(combine|combined|enrich|enriched|merge|merged|join|joined|into|one|single|dataset|data|set|table|view|info|information|fields|columns|attributes|everything|all|bring|in)\b/g,
+		),
+	);
+	if (named.length === 0) {
+		return {
+			request,
+			status: "not_possible",
+			explanation: "Name the type to start from and what to bring in - for example \"combine orders with their customers\".",
+			missing: ["an object type to combine"],
+			alternatives: getRegistry().objectTypes.slice(0, 6).map((t) => t.pluralLabel ?? t.label),
+		};
+	}
+	let base = named[0]!;
+	let targets = named.slice(1);
+	const notes: string[] = [];
+	// "Combine customers with their orders": one customer has many orders, so
+	// the rows to keep are the orders. Turned around rather than refused.
+	if (targets.length === 1 && !linkPath(base, targets[0]!) && linkPath(targets[0]!, base)) {
+		notes.push(`Each ${base.label.toLowerCase()} has many ${targets[0]!.pluralLabel?.toLowerCase() ?? targets[0]!.label.toLowerCase()}, so the dataset keeps one row per ${targets[0]!.label.toLowerCase()} and brings the ${base.label.toLowerCase()} in.`);
+		[base, targets] = [targets[0]!, [base]];
+	}
+	const proposals: DraftProposal[] = [];
+	const joins: Array<{ path: string[]; fields: string[]; target: ObjectTypeMeta }> = [];
+	if (targets.length === 0) {
+		joins.push(...analysisJoins(base));
+	}
+	for (const target of targets) {
+		const path = linkPath(base, target);
+		const fields = carriedFields(target);
+		if (fields.length === 0) {
+			notes.push(`${target.label} has no dates, names or categories to bring in.`);
+			continue;
+		}
+		if (path && path.length > 0) {
+			joins.push({ path: path.map((l) => l.apiName), fields, target });
+			continue;
+		}
+		const link = await draftJoin(base, target);
+		if (!link) {
+			notes.push(`${base.label} has no column that refers to ${target.label}, so it cannot be brought in yet.`);
+			continue;
+		}
+		const apiName = String(link.payload.apiName ?? `${base.apiName[0]!.toLowerCase()}${base.apiName.slice(1)}${target.apiName}`);
+		link.payload.apiName = apiName;
+		proposals.push(link);
+		joins.push({ path: [apiName], fields, target });
+	}
+	if (joins.length === 0) {
+		return {
+			request,
+			status: "not_possible",
+			explanation: notes.join(" ") || `${base.label} links to nothing that could be brought in.`,
+			missing: ["a link to bring the other type in"],
+		};
+	}
+	const registry = getRegistry();
+	let name = `Enriched ${base.label}`.slice(0, 60);
+	for (let n = 2; registry.objectTypeByApiName.has(name.replace(/[^A-Za-z0-9]+/g, " ").split(" ").filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("")); n += 1) {
+		name = `Enriched ${base.label} ${n}`.slice(0, 60);
+	}
+	const carried = joins.map((j) => `${j.target.label.toLowerCase()} (${j.fields.map((f) => humanize(f).toLowerCase()).join(", ")})`);
+	proposals.push({
+		kind: "combination",
+		title: `New dataset: ${name}`,
+		summary: `${base.pluralLabel ?? plural(base.label)}, one row each, with ${carried.join("; ")}.`,
+		payload: { name, base: base.apiName, joins: joins.map((j) => ({ path: j.path, fields: j.fields })), derived: [] },
+		dependsOn: proposals.map((_, index) => index),
+	});
+	return {
+		request,
+		status: "needs_approval",
+		explanation:
+			`${notes.length ? `${notes.join(" ")} ` : ""}One new dataset: ${base.pluralLabel?.toLowerCase() ?? plural(base.label.toLowerCase())} with ${carried.join("; ")}. ` +
+			"It is a view over your synced tables (nothing in your database changes), modelled with its own metrics once approved.",
+		proposals,
+	};
+}
+
 // ── dashboards and capabilities ─────────────────────────────────────────────
 
 async function cardinality(type: ObjectTypeMeta, column: string): Promise<number> {
@@ -1092,13 +1403,17 @@ function boardSubject(topic: string, measure: string | null): ObjectTypeMeta | n
 async function capabilities(): Promise<FeasibilityItem[]> {
 	const registry = getRegistry();
 	const items: FeasibilityItem[] = [];
-	for (const type of registry.objectTypes) {
+	// Biggest first: the main facts lead. An empty table has nothing to chart.
+	const types = [...registry.objectTypes].filter((type) => type.rowCount > 0).sort((a, b) => b.rowCount - a.rowCount);
+	for (const type of types) {
 		const metrics = registry.kpis.filter((k) => k.objectTypeRid === type.rid);
 		for (const kpi of metrics.slice(0, 3)) {
 			items.push(readyItem({ measure: kpi.label, objectType: type.apiName }, kpi, kpi.defaultDimension));
 		}
-		// Slices one link away that need a combined dataset first.
+		// Slices one link away that need a combined dataset first. A link from
+		// a type to itself (an employee's manager) is left to a specific ask.
 		for (const link of registry.linksBySourceRid.get(type.rid) ?? []) {
+			if (link.targetObjectType === type.rid) continue;
 			const target = registry.objectTypeByRid.get(link.targetObjectType);
 			const dimension = target?.properties.find((p) => p.semanticRole === "dimension");
 			const count = metrics.find((k) => k.aggregation === "count");
@@ -1132,6 +1447,10 @@ export async function assess(input: { text?: string; requests?: FeasibilityReque
 
 	if (intent === "capabilities") {
 		items.push(...(await capabilities()));
+	} else if (intent === "link" && !(input.requests?.length)) {
+		items.push(await linkRequest(text));
+	} else if (intent === "combination" && !(input.requests?.length)) {
+		items.push(await combinationRequest(text));
 	} else if ((intent === "dashboard" || intent === "report") && !(input.requests?.length) && !/\s(by|per)\s/.test(` ${text.toLowerCase()} `)) {
 		const topic = text
 			.replace(

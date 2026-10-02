@@ -178,7 +178,10 @@ export function chooseTimeColumn(profiles: ColumnProfile[]): string | null {
 	const preferred = temporal.find((p) =>
 		/(order|created|placed|invoice|transaction|sale|event|occurred|booked|purchase|payment|signup|start)/.test(p.name.toLowerCase()),
 	);
-	return (preferred ?? temporal[0]!).name;
+	// A person's birth date places nothing in business time; when there is any
+	// other date (a hire date, say) that one is the timeline.
+	const ordinary = temporal.find((p) => !/(birth|dob|born|death|deceased|expir)/.test(p.name.toLowerCase()));
+	return (preferred ?? ordinary ?? temporal[0]!).name;
 }
 
 /** The dimensions every metric on a type may be sliced by. */

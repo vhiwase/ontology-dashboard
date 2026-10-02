@@ -421,9 +421,10 @@ export async function login(req: Request, res: Response): Promise<void> {
 		password_hash: string;
 		is_active: boolean;
 		signup_source: SignupSource | null;
+		display_name: string | null;
 	}>(
 		`SELECT app_user_id, username, role, ontology_role, token_version,
-		        password_hash, is_active, signup_source
+		        password_hash, is_active, signup_source, display_name
 		   FROM platform.app_user WHERE username = $1`,
 		[username],
 	);
@@ -456,6 +457,7 @@ export async function login(req: Request, res: Response): Promise<void> {
 			role: user.role,
 			ontologyRole: user.ontology_role,
 			signupSource: user.signup_source ?? "admin",
+			displayName: user.display_name,
 		},
 	});
 }

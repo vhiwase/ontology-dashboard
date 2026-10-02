@@ -27,6 +27,9 @@ import { Spaces } from "./pages/Spaces";
 import { SpaceProvider, envTone, useSpace } from "./SpaceContext";
 import { OntologyManager } from "./pages/OntologyManager";
 import { Overview } from "./pages/Overview";
+import { Home } from "./pages/Home";
+import { DataSources } from "./pages/DataSources";
+import { Proposals } from "./pages/Proposals";
 
 interface HealthPayload {
 	status: string;
@@ -36,7 +39,39 @@ interface HealthPayload {
 	kpis: number;
 }
 
-const NAV = [
+type NavEntry =
+	| { section: string }
+	| { panel: "browse" }
+	| {
+			to: string;
+			label: string;
+			glyph: string;
+			exact?: boolean;
+			badge?: "approvals" | "objectTypes" | "linkTypes";
+	  };
+
+/**
+ * A personal workspace is somebody's own data, so its navigation is the
+ * business path - ask, look, approve - with the model underneath it. The
+ * engineering surfaces (pipelines, repositories, SQL functions, lineage) run
+ * code over shared tables and are not offered there at all.
+ */
+const PERSONAL_NAV: NavEntry[] = [
+	{ to: "/", label: "Home", glyph: "⌂", exact: true },
+	{ to: "/assistant", label: "Ask AI", glyph: "✦", exact: true },
+	{ to: "/dashboards", label: "Dashboards & reports", glyph: "▦" },
+	{ to: "/approvals", label: "Approvals", glyph: "✓", badge: "approvals" },
+	{ section: "Your data" },
+	{ to: "/data", label: "Data sources", glyph: "⛁" },
+	{ to: "/ontology", label: "Business objects", glyph: "◇", badge: "objectTypes" },
+	{ to: "/graph", label: "Relationships", glyph: "◉", badge: "linkTypes" },
+	{ to: "/explorer", label: "Explore records", glyph: "▤" },
+	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ section: "Account" },
+	{ to: "/assistant/cost", label: "AI usage & cost", glyph: "$" },
+];
+
+const NAV: NavEntry[] = [
 	{ section: "Workspace" },
 	{ to: "/spaces", label: "Spaces", glyph: "▣" },
 	{ section: "Ontology" },
@@ -56,6 +91,7 @@ const NAV = [
 	{ section: "Work" },
 	{ to: "/explorer", label: "Object explorer", glyph: "▤" },
 	{ to: "/dashboards", label: "Dashboards", glyph: "▦" },
+	{ to: "/approvals", label: "Approvals", glyph: "✓", badge: "approvals" },
 	{ to: "/actions", label: "Actions", glyph: "▶" },
 	{ to: "/functions", label: "Functions", glyph: "ƒ" },
 	{ section: "Assistant" },
@@ -65,6 +101,9 @@ const NAV = [
 
 const TITLES: Record<string, string> = {
 	"/": "Overview",
+	"/home": "Home",
+	"/data": "Data sources",
+	"/approvals": "Approvals",
 	"/spaces": "Spaces",
 	"/ontology": "Object types",
 	"/graph": "Ontology graph",
@@ -92,7 +131,8 @@ export function App() {
  */
 function SpaceSwitcher() {
 	const { spaces, space, spaceSlug, setSpaceSlug, loading } = useSpace();
-	if (loading || spaces.length === 0) return null;
+	// One space (a new account's own workspace) needs no switcher.
+	if (loading || spaces.length <= 1) return null;
 	return (
 		<label className={`space-switcher ${envTone(space?.environment)}`}>
 			<span className="muted">Space</span>
@@ -120,19 +160,46 @@ function SpaceSwitcher() {
  * ontology pages had. Both now come from the space itself.
  */
 function RailBrand({ connected }: { connected: boolean }) {
-	const { space, loading } = useSpace();
+	const { space, loading, isPersonal } = useSpace();
 	const ontology = space?.ontology ?? null;
 	return (
 		<div className="rail-brand">
-			<h1>TMS Ontology Workbench</h1>
+			<h1>
+				<span className="brand-mark" aria-hidden>
+					◈
+				</span>
+				Ontology Dashboard
+			</h1>
 			<p>
 				{!connected || loading
 					? "connecting…"
-					: ontology
-						? `v${ontology.version} · ${ontology.objectTypes} object types`
-						: `${space?.name ?? "This space"} · nothing published`}
+					: isPersonal
+						? ontology && ontology.objectTypes > 0
+							? `${space?.name ?? "Your workspace"} · ${ontology.objectTypes} objects`
+							: `${space?.name ?? "Your workspace"} · no data yet`
+						: ontology
+							? `${space?.name ?? ""} · v${ontology.version} · ${ontology.objectTypes} object types`
+							: `${space?.name ?? "This space"} · nothing published`}
 			</p>
 		</div>
+	);
+}
+
+/** Pending approvals in this space, re-read whenever the space data reloads. */
+function RailApprovals() {
+	const { spaceSlug, spaces } = useSpace();
+	const [count, setCount] = useState<number | null>(null);
+	useEffect(() => {
+		api
+			.get<unknown[]>("/api/proposals?status=pending")
+			.then((rows) => setCount(rows.length))
+			.catch(() => setCount(null));
+	}, [spaceSlug, spaces]);
+	if (!count) return null;
+	return (
+		<span className="count attention" title={`${count} waiting for approval`}>
+			{count}
+		</span>
 	);
 }
 
@@ -188,15 +255,19 @@ function RailBrowse() {
 }
 
 function AppShell() {
-	const location = useLocation();
 	const [user, setUser] = useState<SessionUser | null>(() =>
 		session.token() ? session.user() : null,
 	);
 	const [health, setHealth] = useState<HealthPayload | null>(null);
 	const [assistantHealth, setAssistantHealth] = useState<AssistantHealth | null>(null);
-	const [theme, setTheme] = useState<"dark" | "light">(
-		() => (localStorage.getItem("tms-theme") as "dark" | "light") ?? "dark",
-	);
+	const [theme, setTheme] = useState<"dark" | "light">(() => {
+		try {
+			// Light for a first visit: reports are read on paper and in meetings.
+			return (localStorage.getItem("tms-theme") as "dark" | "light") ?? "light";
+		} catch {
+			return "light";
+		}
+	});
 
 	useEffect(() => {
 		document.documentElement.setAttribute("data-theme", theme);
@@ -231,25 +302,57 @@ function AppShell() {
 	}, [user]);
 
 	if (!user) return <Login onSignedIn={setUser} />;
+	return (
+		<SpaceProvider>
+			<ResourceProvider>
+				<Shell
+					user={user}
+					health={health}
+					assistantHealth={assistantHealth}
+					theme={theme}
+					setTheme={setTheme}
+					signOut={signOut}
+				/>
+			</ResourceProvider>
+		</SpaceProvider>
+	);
+}
+
+function Shell({
+	user,
+	health,
+	assistantHealth,
+	theme,
+	setTheme,
+	signOut,
+}: {
+	user: SessionUser;
+	health: HealthPayload | null;
+	assistantHealth: AssistantHealth | null;
+	theme: "dark" | "light";
+	setTheme: (update: (current: "dark" | "light") => "dark" | "light") => void;
+	signOut: () => void;
+}) {
+	const location = useLocation();
+	const { isPersonal } = useSpace();
+	const nav = isPersonal ? PERSONAL_NAV : NAV;
 	// From here on there is a token, so the space provider can load.
 
 	const browseKind = location.pathname.startsWith("/browse/")
 		? BROWSE_KINDS.find((item) => item.slug === location.pathname.slice("/browse/".length))
 		: undefined;
 	const title =
-		TITLES[location.pathname] ??
+		(location.pathname === "/" && isPersonal ? "Home" : TITLES[location.pathname]) ??
 		browseKind?.label ??
-		(location.pathname.startsWith("/dashboards/") ? "Dashboard" : "TMS Ontology");
+		(location.pathname.startsWith("/dashboards/") ? "Dashboard" : "Ontology Dashboard");
 
 	return (
-		<SpaceProvider>
-		<ResourceProvider>
 		<div className="shell">
 			<nav className="rail">
 				<RailBrand connected={health !== null} />
 
 				<div className="rail-nav">
-					{NAV.map((entry, index) =>
+					{nav.map((entry, index) =>
 						"panel" in entry ? (
 							<RailBrowse key={`panel-${index}`} />
 						) : "section" in entry ? (
@@ -259,7 +362,7 @@ function AppShell() {
 						) : (
 							<NavLink
 								key={entry.to}
-								to={entry.to!}
+								to={entry.to}
 								end={entry.exact}
 								className={({ isActive }) => `rail-link ${isActive ? "active" : ""}`}
 							>
@@ -272,6 +375,7 @@ function AppShell() {
 								    "31 dashboards" when 31 was the number of metrics. */}
 								{entry.to === "/ontology" && <RailCount of="objectTypes" title="Object types" />}
 								{entry.to === "/graph" && <RailCount of="linkTypes" title="Link types" />}
+								{entry.badge === "approvals" && <RailApprovals />}
 							</NavLink>
 						),
 					)}
@@ -297,7 +401,9 @@ function AppShell() {
 								? assistantHealth.llm.reachable
 									? assistantHealth.llm.modelPresent === false
 										? "model not pulled"
-										: "model ready"
+										: assistantHealth.provider === "builtin"
+											? "AI: built-in planner"
+											: "AI model ready"
 									: "model offline"
 								: "checking…"}
 						</span>
@@ -341,7 +447,10 @@ function AppShell() {
 						}}
 					>
 						<Routes>
-							<Route path="/" element={<Overview />} />
+							<Route path="/" element={isPersonal ? <Home /> : <Overview />} />
+							<Route path="/home" element={<Home />} />
+							<Route path="/data" element={<DataSources />} />
+							<Route path="/approvals" element={<Proposals />} />
 							<Route path="/ontology" element={<OntologyManager />} />
 							<Route path="/graph" element={<GraphView />} />
 							<Route path="/lineage" element={<LineagePage />} />
@@ -367,8 +476,6 @@ function AppShell() {
 				</div>
 			</div>
 		</div>
-		</ResourceProvider>
-		</SpaceProvider>
 	);
 }
 
@@ -406,7 +513,7 @@ function GlobalSearch() {
 	return (
 		<div style={{ position: "relative" }}>
 			<input
-				placeholder="Find an order, shipment, carrier…"
+				placeholder="Search your records…"
 				value={term}
 				onChange={(event) => setTerm(event.target.value)}
 				onFocus={() => setOpen(true)}

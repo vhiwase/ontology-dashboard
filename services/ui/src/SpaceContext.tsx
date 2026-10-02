@@ -33,6 +33,9 @@ export interface Space {
 	projectCount: number;
 	/** False where no pipeline has published an ontology into this space. */
 	hasOntology: boolean;
+	/** "personal" for someone's own workspace, "environment" for a shared one. */
+	kind?: "personal" | "environment";
+	ownerUsername?: string | null;
 	/** The space's own ontology counts, or null where it has none. */
 	ontology: {
 		version: string;
@@ -49,6 +52,10 @@ interface SpaceContextValue {
 	spaceSlug: string;
 	setSpaceSlug: (slug: string) => void;
 	loading: boolean;
+	/** True in the caller's own workspace: the business-first layout. */
+	isPersonal: boolean;
+	/** Re-read the spaces, e.g. after an import changed the ontology counts. */
+	reload: () => void;
 }
 
 const STORAGE_KEY = "tms.active.space";
@@ -60,34 +67,55 @@ const SpaceContext = createContext<SpaceContextValue>({
 	spaceSlug: DEFAULT_SPACE,
 	setSpaceSlug: () => {},
 	loading: true,
+	isPersonal: false,
+	reload: () => {},
 });
+
+/**
+ * Where to land when nothing valid is remembered: the caller's own workspace
+ * (the server lists it first), then the sandbox, then whatever is visible.
+ * A self-registered account cannot open the sandbox at all, so defaulting to
+ * it used to strand new users on an error.
+ */
+function landingSpace(list: Space[]): string {
+	return (
+		list.find((item) => item.kind === "personal")?.slug ??
+		list.find((item) => item.slug === DEFAULT_SPACE)?.slug ??
+		list[0]?.slug ??
+		DEFAULT_SPACE
+	);
+}
 
 export function SpaceProvider({ children }: { children: ReactNode }) {
 	const [spaces, setSpaces] = useState<Space[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [spaceSlug, setSpaceSlugState] = useState<string>(() => {
 		try {
-			return window.localStorage.getItem(STORAGE_KEY) ?? DEFAULT_SPACE;
+			return window.localStorage.getItem(STORAGE_KEY) ?? "";
 		} catch {
-			// Private windows refuse storage; the sandbox is the right default.
-			return DEFAULT_SPACE;
+			// Private windows refuse storage; the landing space is chosen below.
+			return "";
 		}
 	});
+	const [generation, setGeneration] = useState(0);
 
 	useEffect(() => {
 		api
 			.get<Space[]>("/api/spaces")
 			.then((list) => {
 				setSpaces(list);
-				// A remembered space that no longer exists would leave every page
-				// querying a slug the server rejects, so fall back rather than trust it.
+				// A remembered space that no longer exists (or that this account
+				// cannot open) would leave every page querying a slug the server
+				// rejects, so fall back rather than trust it.
 				setSpaceSlugState((current) =>
-					list.some((item) => item.slug === current) ? current : DEFAULT_SPACE,
+					list.some((item) => item.slug === current) ? current : landingSpace(list),
 				);
 			})
 			.catch(() => setSpaces([]))
 			.finally(() => setLoading(false));
-	}, []);
+	}, [generation]);
+
+	const reload = useCallback(() => setGeneration((value) => value + 1), []);
 
 	// Assigned during render, before any child can fire a request: the API
 	// client stamps ?space= on every call from this value, so setting it in an
@@ -104,17 +132,30 @@ export function SpaceProvider({ children }: { children: ReactNode }) {
 		}
 	}, []);
 
-	const value = useMemo<SpaceContextValue>(
-		() => ({
+	const value = useMemo<SpaceContextValue>(() => {
+		const space = spaces.find((item) => item.slug === spaceSlug) ?? null;
+		return {
 			spaces,
-			space: spaces.find((item) => item.slug === spaceSlug) ?? null,
+			space,
 			spaceSlug,
 			setSpaceSlug,
 			loading,
-		}),
-		[spaces, spaceSlug, setSpaceSlug, loading],
-	);
+			isPersonal: space?.kind === "personal",
+			reload,
+		};
+	}, [spaces, spaceSlug, setSpaceSlug, loading, reload]);
 
+	// Pages fire their first requests as they mount, so they wait until the
+	// space is settled: a request made before then would be answered for the
+	// wrong space (or refused, for an account that cannot open the sandbox).
+	if (loading && spaces.length === 0) {
+		return (
+			<div className="boot-screen">
+				<span className="spinner" aria-hidden />
+				<span>Opening your workspace…</span>
+			</div>
+		);
+	}
 	return <SpaceContext.Provider value={value}>{children}</SpaceContext.Provider>;
 }
 

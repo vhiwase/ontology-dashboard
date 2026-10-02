@@ -1,7 +1,7 @@
 /** Small shared pieces: stat tiles, tables, markdown, loading and error states. */
 
 import { useEffect, useRef, useState } from "react";
-import { type KpiResult, formatCell, formatValue, statusFor } from "../api";
+import { type KpiResult, formatCell, formatPeriod, formatValue, statusFor } from "../api";
 
 export function Spinner({ label }: { label?: string }) {
 	return (
@@ -41,11 +41,34 @@ export function Empty({ children }: { children: React.ReactNode }) {
  */
 export function StatTile({ result, title }: { result: KpiResult; title?: string }) {
 	const status = statusFor(result.total, result);
+	const trend = result.trend ?? null;
+	const points = (trend?.points ?? []).filter((point) => point.value !== null) as Array<{ label: string; value: number }>;
+	// Compared over the last two COMPLETE periods: a month with six days of
+	// data in it is not a fall.
+	const change = trend?.deltaPct ?? null;
+	const better =
+		change === null || result.higherIsBetter === null ? null : (change >= 0) === result.higherIsBetter;
 	return (
 		<div className="card stat">
 			<div className="label">{title ?? result.label}</div>
-			<div className="value">{formatValue(result.total, result.valueFormat, result.unit)}</div>
+			<div className="stat-main">
+				<div className="value">{formatValue(result.total, result.valueFormat, result.unit)}</div>
+				{points.length >= 3 && <Sparkline points={points} partial={trend?.lastPointPartial ?? false} />}
+			</div>
 			<div className="foot row" style={{ gap: 6 }}>
+				{change !== null && Number.isFinite(change) && (
+					<span
+						className={`delta ${better === null ? "" : better ? "up-good" : "down-bad"}`}
+						title={
+							trend?.lastPeriod && trend.previousPeriod
+								? `${formatPeriod(trend.lastPeriod, trend.grain)} vs ${formatPeriod(trend.previousPeriod, trend.grain)}`
+								: undefined
+						}
+					>
+						{change >= 0 ? "▲" : "▼"} {Math.abs(change).toFixed(1)}%
+						<span className="muted"> {trend?.lastPeriod ? `in ${formatPeriod(trend.lastPeriod, trend.grain)}` : ""}</span>
+					</span>
+				)}
 				{status && (
 					<span className={`chip ${status}`}>
 						<span className="dot" aria-hidden />
@@ -64,6 +87,45 @@ export function StatTile({ result, title }: { result: KpiResult; title?: string 
 				)}
 			</div>
 		</div>
+	);
+}
+
+/** A headline's recent history: shape only, no axes. */
+export function Sparkline({
+	points,
+	partial = false,
+	width = 96,
+	height = 30,
+}: {
+	points: Array<{ label: string; value: number }>;
+	partial?: boolean;
+	width?: number;
+	height?: number;
+}) {
+	const values = points.map((point) => point.value);
+	const min = Math.min(...values);
+	const max = Math.max(...values);
+	const span = max - min || 1;
+	const x = (index: number) => (index / Math.max(points.length - 1, 1)) * (width - 4) + 2;
+	const y = (value: number) => height - 3 - ((value - min) / span) * (height - 6);
+	const solid = partial ? points.slice(0, -1) : points;
+	const line = solid.map((point, index) => `${index === 0 ? "M" : "L"}${x(index)},${y(point.value)}`).join(" ");
+	const last = points.length - 1;
+	return (
+		<svg className="sparkline" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden>
+			<path d={line} fill="none" stroke="var(--series-1)" strokeWidth={1.6} strokeLinejoin="round" />
+			{partial && last > 0 && (
+				<path
+					d={`M${x(last - 1)},${y(points[last - 1]!.value)} L${x(last)},${y(points[last]!.value)}`}
+					fill="none"
+					stroke="var(--series-1)"
+					strokeWidth={1.6}
+					strokeDasharray="2 2"
+					opacity={0.6}
+				/>
+			)}
+			<circle cx={x(partial ? last - 1 : last)} cy={y(points[partial ? last - 1 : last]!.value)} r={2.4} fill="var(--series-1)" />
+		</svg>
 	);
 }
 
