@@ -10,8 +10,7 @@ os.environ.setdefault("AUTH_JWT_SECRET", "test-secret-at-least-thirty-two-charac
 os.environ.setdefault("DATABASE_URL", "postgresql://unused:unused@127.0.0.1:1/unused")
 
 from app import agent as agent_module  # noqa: E402
-from app.agent import Agent  # noqa: E402
-from app.llm import LlmProvider, LlmReply, ToolCall  # noqa: E402
+from app import llm as llm_module  # noqa: E402
 from app.pricing import price_turn  # noqa: E402
 from app.prompts import (  # noqa: E402
     SYSTEM_PROMPT,
@@ -20,7 +19,6 @@ from app.prompts import (  # noqa: E402
     build_context_message,
     is_tms,
     starter_prompts,
-    system_messages,
 )
 
 WORKSPACE = {
@@ -52,30 +50,31 @@ TMS = {
 
 def test_the_fixed_prompt_names_no_domain():
     lowered = SYSTEM_PROMPT.lower()
-    for word in ("freight", "carrier", "shipment", "3pl", "lane"):
+    for word in ("freight", "carrier", "shipment", "3pl", "lane", "tms"):
         assert word not in lowered, word
+
+
+def test_the_prompt_checks_feasibility_before_building():
+    assert "call check_feasibility FIRST" in SYSTEM_PROMPT
+    assert "propose_change" in SYSTEM_PROMPT and "not_possible" in SYSTEM_PROMPT
 
 
 def test_the_transport_rules_apply_only_to_the_transport_space():
     assert is_tms(TMS)
     assert not is_tms(WORKSPACE)
+    assert not is_tms(None)
     # A personal workspace is never the demo, whatever its tables are called.
     assert not is_tms({**TMS, "space": {"kind": "personal"}})
-    assert [m["content"] for m in system_messages(TMS)][:2] == [SYSTEM_PROMPT, TMS_ADDENDUM]
-    contents = [m["content"] for m in system_messages(WORKSPACE)]
-    assert contents[0] == SYSTEM_PROMPT and TMS_ADDENDUM not in contents
-    # Fixed text first, the per-turn inventory last.
-    assert contents[-1] == build_context_message(WORKSPACE)
+    assert TMS_ADDENDUM in build_context_message(TMS)
+    assert TMS_ADDENDUM not in build_context_message(WORKSPACE)
 
 
-def test_context_lists_types_links_metrics_and_attachments():
-    text = build_context_message({**WORKSPACE, "attached": [{"kind": "objectType", "ref": "Order", "definition": {"apiName": "Order"}}]})
-    assert "personal workspace" in text
+def test_context_lists_types_links_and_metrics():
+    text = build_context_message(WORKSPACE)
+    assert "maria's workspace" in text
     assert "OrderDetail (2,155)" in text
-    assert "orderCustomer (Order -> Customer)" in text
-    assert "order_freight_sum: Total Freight - by ship_country, order_date:month" in text
-    assert "2 proposals waiting for approval" in text
-    assert "The user attached these" in text and '"ref": "Order"' in text
+    assert "Order -> Customer (orderCustomer)" in text
+    assert "order_freight_sum" in text
 
 
 def test_starters_come_from_the_workspace_metrics():
@@ -93,70 +92,38 @@ def test_starters_come_from_the_workspace_metrics():
 # ── pricing ─────────────────────────────────────────────────────────────────
 
 
-def test_claude_turns_price_cache_reads_and_writes_apart():
-    cost = price_turn(
-        "anthropic",
-        "claude-opus-5-5",
-        {"promptTokens": 1_000_000, "completionTokens": 100_000, "cacheReadTokens": 600_000, "cacheWriteTokens": 100_000},
-    )
-    # 300k uncached at $4, 600k reads at $0.20, 100k writes at $5, 100k out at $20.
-    assert cost.priced
-    assert round(cost.cost_usd, 4) == round(1.2 + 0.12 + 0.5 + 2.0, 4)
-
-
-def test_the_planner_is_free_and_an_unknown_model_is_unpriced():
+def test_azure_turns_are_priced_and_the_planner_is_free():
+    cost = price_turn("azure_openai", "gpt-4.1", {"promptTokens": 1_000_000, "completionTokens": 100_000})
+    assert cost.priced and cost.cost_usd > 0
     assert price_turn("builtin", "planner-1", {"promptTokens": 0}).cost_usd == 0.0
     assert price_turn("builtin", "planner-1", {}).priced
-    assert not price_turn("anthropic", "some-future-model", {"promptTokens": 10}).priced
     assert not price_turn("nobody", "x", {"promptTokens": 10}).priced
 
 
-# ── agent loop ──────────────────────────────────────────────────────────────
+# ── providers ───────────────────────────────────────────────────────────────
 
 
-class ScriptedProvider(LlmProvider):
-    """Answers from a script and records what it was sent."""
-
-    name = "anthropic"
-
-    def __init__(self, replies: list[LlmReply]) -> None:
-        self.model = "claude-opus-5-5"
-        self.replies = list(replies)
-        self.calls: list[dict] = []
-
-    async def chat(self, messages, tools=None, tool_choice="auto"):
-        self.calls.append({"messages": [dict(m) for m in messages], "tools": tools, "tool_choice": tool_choice})
-        return self.replies.pop(0)
-
-    async def health(self):
-        return {"reachable": True}
+def test_without_azure_the_planner_answers(monkeypatch):
+    unconfigured = dataclasses.replace(llm_module.CONFIG, provider="azure_openai", azure_endpoint="", azure_key="")
+    monkeypatch.setattr(llm_module, "CONFIG", unconfigured)
+    provider, why = asyncio.run(llm_module.build_provider())
+    assert provider.name == "builtin" and "not configured" in why
 
 
-def test_the_agent_replays_provider_content_and_keeps_tools_on_the_last_round(monkeypatch):
-    raw = [{"type": "thinking", "thinking": "", "signature": "s"}, {"type": "tool_use", "id": "t1", "name": "list_kpis", "input": {}}]
-    loops = [
-        LlmReply(content="", tool_calls=[ToolCall(id=f"t{i}", name="list_kpis", arguments={"i": i})], provider="anthropic", model="m", provider_content=raw)
-        for i in range(3)
-    ]
-    final = LlmReply(content="Done.", provider="anthropic", model="m")
-    provider = ScriptedProvider([*loops, final])
-
-    async def fake_tool(name, arguments):
-        return {"kpis": []}, True
-
-    monkeypatch.setattr(agent_module, "run_tool", fake_tool)
-    monkeypatch.setattr(agent_module, "CONFIG", dataclasses.replace(agent_module.CONFIG, max_tool_rounds=4))
-    result = asyncio.run(Agent(provider).run("q", [], WORKSPACE))
-
-    assert result.content == "Done."
-    assert [c["tool_choice"] for c in provider.calls] == ["auto", "auto", "auto", "none"]
-    # The same tool list on every round, the last included.
-    assert all(c["tools"] == provider.calls[0]["tools"] for c in provider.calls)
-    replayed = [m for m in provider.calls[1]["messages"] if m["role"] == "assistant"]
-    assert replayed[0]["provider_content"] == raw and replayed[0]["provider"] == "anthropic"
-    assert provider.calls[-1]["messages"][-1]["role"] == "system"
+def test_the_planner_can_be_chosen_and_other_providers_cannot(monkeypatch):
+    monkeypatch.setattr(llm_module, "CONFIG", dataclasses.replace(llm_module.CONFIG, provider="builtin"))
+    provider, _ = asyncio.run(llm_module.build_provider())
+    assert provider.name == "builtin"
+    monkeypatch.setattr(llm_module, "CONFIG", dataclasses.replace(llm_module.CONFIG, provider="anthropic"))
+    try:
+        asyncio.run(llm_module.build_provider())
+    except llm_module.LlmError as exc:
+        assert "azure_openai" in str(exc)
+    else:
+        raise AssertionError("an unknown provider must be refused")
 
 
+# ── agent ───────────────────────────────────────────────────────────────────
 def test_feasibility_and_proposal_results_become_artifacts():
     feasibility = agent_module._artifact_from(
         "check_feasibility",

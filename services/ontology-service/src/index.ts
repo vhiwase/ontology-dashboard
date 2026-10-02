@@ -16,6 +16,7 @@ import {
 	authorizeRoute,
 	createSelfRegisteredUser,
 	login,
+	me,
 	recordRegistration,
 	REGISTRATION_ROLE,
 	requestId,
@@ -42,6 +43,23 @@ import {
 	spaceBySlug,
 	spaceScope,
 } from "./workspaces";
+import {
+	createActionType,
+	createMetric,
+	createObjectType,
+	listDatasets,
+	profileDataset,
+	suggestLinks,
+} from "./authoring";
+import {
+	createLinkType,
+	type DeletableKind,
+	deleteOntologyObject,
+	editOntologyObject,
+	type EditKind,
+	listEdits,
+	undoEdit,
+} from "./builder";
 import { describePolicy } from "./dataPolicy";
 import {
 	dashboardFilterOptions,
@@ -57,35 +75,9 @@ import {
 	saveDashboard,
 	validateLayout,
 } from "./dashboards";
-import { pool, query, waitForOntology } from "./db";
-import { clearColumnCache, dimensionValues, executeKpi, resolveKpi } from "./kpi";
+import { pool, query, waitForDatabase } from "./db";
+import { ensureOntologies } from "./definition";
 import { corpus, getDocument, searchDocumentation } from "./documentation";
-import { columnLineage, fetchGraph, trace, traceKpi, traceObjectType } from "./lineage";
-import {
-	deletePipeline,
-	getPipeline,
-	pipelineOutputs,
-	listPipelines,
-	listRuns,
-	listVersions,
-	ontologyPalette,
-	restoreVersion,
-	acceptPipeline,
-	proposePipeline,
-	runPipeline,
-	savePipeline,
-	validateGraph,
-} from "./pipelines";
-import { datasetVersions, nodeRunsFor, previewOutput } from "./execute";
-import { resourceData } from "./resourceData";
-import {
-	createLinkType,
-	deleteOntologyObject,
-	editOntologyObject,
-	type EditKind,
-	listEdits,
-	undoEdit,
-} from "./builder";
 import {
 	approveFunction,
 	functionRuns,
@@ -97,6 +89,7 @@ import {
 	updateFunction,
 	validateDefinition,
 } from "./functions";
+import { clearColumnCache, dimensionValues, executeKpi, resolveKpi } from "./kpi";
 import {
 	aggregateObjects,
 	getObject,
@@ -108,6 +101,7 @@ import {
 	BadRequest,
 	currentSpace,
 	getRegistry,
+	interfacesOf,
 	hasOntology,
 	loadRegistry,
 	NotFound,
@@ -115,6 +109,18 @@ import {
 	spacesWithOntology,
 	withSpace,
 } from "./registry";
+import { resourceData } from "./resourceData";
+import {
+	createSchedule,
+	deleteSchedule,
+	getSchedule,
+	listScheduleRuns,
+	listSchedules,
+	runScheduleNow,
+	setSyncSchedule,
+	startScheduler,
+	updateSchedule,
+} from "./schedules";
 import {
 	createConnection,
 	createFolder,
@@ -124,13 +130,12 @@ import {
 	deleteFolder,
 	deleteProject,
 	deleteResource,
+	listConnections,
 	listProjects,
 	listSpaces,
 	lookupResource,
 	previewResource,
 	projectTree,
-	publishedViews,
-	registerDataset,
 	renameResource,
 	retestConnection,
 	seedSandbox,
@@ -141,23 +146,10 @@ import {
 	deleteSync,
 	listSyncRuns,
 	listSyncs,
+	listSyncsInSpace,
 	runSync,
 	testConnection,
 } from "./connections";
-import {
-	buildRepo,
-	commitRepo,
-	createRepo,
-	deleteFile,
-	deleteRepo,
-	getRepo,
-	listBuilds,
-	listCommits,
-	listFiles,
-	listRepos,
-	putFile,
-	repoOutputs,
-} from "./repos";
 
 const app = express();
 const PORT = Number(process.env.PORT ?? 4000);
@@ -318,12 +310,11 @@ app.use("/api", spaceScope());
 app.use("/api", authorizeRoute());
 
 // ── the space in scope for this request ─────────────────────────────────────
-//  The ontology belongs to a space (0012): its object types, links, actions,
-//  metrics and lineage are published by a pipeline that ran in one particular
-//  space. Everything below reads it through getRegistry(), which resolves it
-//  from this context rather than from a parameter — thirty-odd call sites deep
-//  in the SQL builders would otherwise each need a space threaded through them
-//  for no purpose but to carry it.
+//  The ontology belongs to a space (0012): its object types, links, actions
+//  and metrics are authored there, from that space's datasets. Everything
+//  below reads it through getRegistry(), which resolves it from this context
+//  rather than from a parameter - thirty-odd call sites deep in the SQL
+//  builders would otherwise each need a space threaded through them.
 //
 //  Entering the context here rather than per route means a route added later
 //  is space-scoped by default, the same reasoning as the auth guard above.
@@ -360,15 +351,30 @@ app.get(
 	"/api/stats",
 	handle(async (_req, res) => {
 		const registry = getRegistry();
-		const [coverage, exceptions, runs] = await Promise.all([
-			query("SELECT * FROM tms_views.v_kpi_data_coverage ORDER BY source_coverage_pct DESC"),
-			query("SELECT * FROM tms_views.v_kpi_exception_summary ORDER BY item_count DESC"),
-			query(
-				`SELECT generation_run_id, started_at, finished_at, status, views_scanned,
-				        object_types, link_types, kpis, lineage_nodes
-				   FROM platform.generation_run ORDER BY generation_run_id DESC LIMIT 5`,
-			),
-		]);
+		// The flow, counted for this space: connections -> syncs -> datasets ->
+		// object types. Each stage's count is what the next one can be built from.
+		const [flow] = await query<Record<string, string | Date | null>>(
+			`SELECT
+			   (SELECT count(*) FROM platform.resource r JOIN platform.project p USING (project_id)
+			     WHERE p.space_id = s.space_id AND r.kind = 'connection')::text AS connections,
+			   (SELECT count(*) FROM platform.resource r JOIN platform.project p USING (project_id)
+			     WHERE p.space_id = s.space_id AND r.kind = 'dataset')::text AS datasets,
+			   (SELECT count(*) FROM platform.connection_sync cs
+			      JOIN platform.resource r ON r.resource_id = cs.resource_id
+			      JOIN platform.project p ON p.project_id = r.project_id
+			     WHERE p.space_id = s.space_id)::text AS syncs,
+			   (SELECT count(*) FROM platform.schedule sc
+			     WHERE sc.space_id = s.space_id AND sc.enabled)::text AS schedules,
+			   (SELECT count(*) FROM platform.function f
+			     WHERE f.space_id = s.space_id AND f.status = 'active')::text AS functions,
+			   (SELECT max(run.finished_at) FROM platform.connection_sync_run run
+			      JOIN platform.connection_sync cs ON cs.sync_id = run.sync_id
+			      JOIN platform.resource r ON r.resource_id = cs.resource_id
+			      JOIN platform.project p ON p.project_id = r.project_id
+			     WHERE p.space_id = s.space_id AND run.status = 'success') AS last_sync_at
+			  FROM platform.space s WHERE s.slug = $1`,
+			[currentSpace()],
+		);
 		const totalObjects = registry.objectTypes.reduce((sum, t) => sum + t.rowCount, 0);
 		res.json({
 			dataPolicy: describePolicy(),
@@ -380,6 +386,15 @@ app.get(
 				createdAt: registry.createdAt,
 				validation: registry.validation,
 			},
+			flow: {
+				connections: Number(flow?.connections ?? 0),
+				syncs: Number(flow?.syncs ?? 0),
+				schedules: Number(flow?.schedules ?? 0),
+				datasets: Number(flow?.datasets ?? 0),
+				objectTypes: registry.objectTypes.length,
+				functions: Number(flow?.functions ?? 0),
+				lastSyncAt: flow?.last_sync_at instanceof Date ? flow.last_sync_at.toISOString() : null,
+			},
 			counts: {
 				objectTypes: registry.objectTypes.length,
 				objects: totalObjects,
@@ -387,26 +402,15 @@ app.get(
 				linkTypes: registry.linkTypes.length,
 				completeLinks: registry.linkTypes.filter((l) => l.isVerified).length,
 				actionTypes: registry.actionTypes.length,
-				readOnlyActions: registry.actionTypes.filter((a) => a.isReadOnly).length,
 				kpis: registry.kpis.length,
-				simulatedKpis: registry.kpis.filter((k) => k.dependsOnSimulation).length,
 			},
-			groups: Object.entries(
-				registry.objectTypes.reduce<Record<string, { types: number; objects: number }>>(
-					(acc, type) => {
-						const key = type.group ?? "Other";
-						const bucket = acc[key] ?? { types: 0, objects: 0 };
-						bucket.types += 1;
-						bucket.objects += type.rowCount;
-						acc[key] = bucket;
-						return acc;
-					},
-					{},
-				),
-			).map(([group, value]) => ({ group, ...value })),
-			dataCoverage: coverage,
-			exceptions,
-			generationRuns: runs,
+			objectTypes: registry.objectTypes.map((type) => ({
+				apiName: type.apiName,
+				label: type.label,
+				objects: type.rowCount,
+				dataset: type.sourceView,
+				color: type.color,
+			})),
 		});
 	}),
 );
@@ -431,9 +435,13 @@ app.get(
 	handle(async (_req, res) => {
 		res.json(
 			await query(
-				`SELECT ontology_version_id, version, ontology_id, label, is_active,
-				        object_type_count, link_type_count, action_type_count, created_at, created_by
-				   FROM platform.ontology_version ORDER BY ontology_version_id DESC`,
+				`SELECT v.ontology_version_id, v.version, v.ontology_id, v.label, v.is_active,
+				        v.object_type_count, v.link_type_count, v.action_type_count, v.created_at, v.created_by
+				   FROM platform.ontology_version v
+				   JOIN platform.space s ON s.space_id = v.space_id
+				  WHERE s.slug = $1
+				  ORDER BY v.ontology_version_id DESC`,
+				[currentSpace()],
 			),
 		);
 	}),
@@ -442,9 +450,9 @@ app.get(
 app.get(
 	"/api/ontology/validate",
 	handle(async (_req, res) => {
-		// Runs ontograph's own validators against the published document, which is
-		// the authoritative check. The pipeline runs equivalent reference checks
-		// before publishing, so this endpoint normally confirms rather than finds.
+		// Runs ontograph's own validators against the document, which is the
+		// authoritative check. Every authoring change stores its own validation,
+		// so this endpoint normally confirms rather than finds.
 		const definition = getRegistry().definition;
 		const structural = new OntologyValidator().validate(definition);
 
@@ -602,6 +610,11 @@ app.get(
 					sourceProperty: null,
 				})),
 			],
+			// The interfaces this type declares `implements` for, resolved to
+			// names — the definition carries the raw @ids only.
+			implements: interfacesOf(registry)
+				.filter((iface) => iface.implementors.includes(type.apiName))
+				.map((iface) => ({ apiName: iface.apiName, label: iface.label })),
 			actions: registry.actionTypes
 				.filter((action) => action.targetObjectTypes.includes(type.rid))
 				.map((action) => ({
@@ -638,6 +651,13 @@ app.get(
 	"/api/action-types",
 	handle(async (_req, res) => {
 		res.json(getRegistry().actionTypes);
+	}),
+);
+
+app.get(
+	"/api/interfaces",
+	handle(async (_req, res) => {
+		res.json(interfacesOf(getRegistry()));
 	}),
 );
 
@@ -942,54 +962,6 @@ app.delete(
 	}),
 );
 
-// ── lineage ─────────────────────────────────────────────────────────────────
-
-app.get(
-	"/api/lineage/graph",
-	handle(async (req, res) => {
-		const layers = req.query.layers
-			? String(req.query.layers).split(",").map((s) => s.trim()).filter(Boolean)
-			: undefined;
-		res.json(await fetchGraph(layers));
-	}),
-);
-
-app.get(
-	"/api/lineage/trace",
-	handle(async (req, res) => {
-		const nodeId = String(req.query.nodeId ?? "");
-		if (!nodeId) throw new BadRequest("nodeId is required.");
-		res.json(
-			await trace(nodeId, {
-				direction: (req.query.direction as "upstream" | "downstream" | "both") ?? "both",
-				maxDepth: req.query.depth ? Number(req.query.depth) : undefined,
-			}),
-		);
-	}),
-);
-
-app.get(
-	"/api/lineage/object-type/:apiName",
-	handle(async (req, res) => {
-		const type = resolveObjectType(String(req.params.apiName));
-		res.json({
-			trace: await traceObjectType(type.apiName),
-			columns: await columnLineage(type.sourceView),
-		});
-	}),
-);
-
-app.get(
-	"/api/lineage/kpi/:apiName",
-	handle(async (req, res) => {
-		const kpi = resolveKpi(String(req.params.apiName));
-		res.json({
-			trace: await traceKpi(kpi.apiName),
-			columns: await columnLineage(kpi.sourceView),
-		});
-	}),
-);
-
 // ── actions ─────────────────────────────────────────────────────────────────
 
 app.post(
@@ -1043,196 +1015,56 @@ app.get(
 );
 
 
-// ── pipeline builder ────────────────────────────────────────────────────────
-
-// The real object types, links, actions and KPIs, offered as palette entries
-// so a node is configured against something that exists.
-app.get(
-	"/api/pipelines/palette",
-	handle(async (_req, res) => res.json(ontologyPalette())),
-);
+// ── datasets and authoring ──────────────────────────────────────────────────
+//  The ontology is built from datasets: a sync lands a view as it is, and an
+//  object type is created from it, then links, actions and metrics on top.
+//  The same routes serve the UI's forms and the AI-FDE - see authoring.ts.
 
 app.get(
-	"/api/pipelines",
-	handle(async (req, res) => {
-		const space = req.query.space ? String(req.query.space) : undefined;
-		res.json(await listPipelines(space));
-	}),
+	"/api/datasets",
+	handle(async (_req, res) => res.json(await listDatasets())),
 );
 
-// Validate a graph without saving it, which is what the canvas calls as the
-// user edits.
-app.post(
-	"/api/pipelines/validate",
-	handle(async (req, res) => {
-		res.json(validateGraph((req.body ?? {}).graph ?? { nodes: [], edges: [] }));
-	}),
+/** Real distinct and null counts, samples, key candidates and suggested roles. */
+app.get(
+	"/api/datasets/:ref/profile",
+	handle(async (req, res) => res.json(await profileDataset(String(req.params.ref)))),
 );
 
 app.post(
-	"/api/pipelines",
+	"/api/ontology/object-types",
 	handle(async (req, res) => {
-		res.json(await savePipeline(req.body ?? {}, req.principal?.username ?? "unknown"));
+		res.status(201).json(await createObjectType(req.body ?? {}, req.principal?.username ?? "unknown"));
 	}),
 );
 
+/** Links the data supports and the ontology does not have yet, measured. */
 app.get(
-	"/api/pipelines/:slug",
-	handle(async (req, res) =>
-		res.json(
-			await getPipeline(
-				String(req.params.slug),
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		),
-	),
-);
-
-/** What deleting this pipeline could drop - the confirmation dialog reads it. */
-app.get(
-	"/api/pipelines/:slug/outputs",
+	"/api/ontology/link-suggestions",
 	handle(async (req, res) => {
-		res.json(
-			await pipelineOutputs(
-				String(req.params.slug),
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		);
-	}),
-);
-
-/**
- * Delete a pipeline. Its tables are dropped only when listed in the body's
- * `outputs`; see deletePipeline for why there is no drop-everything default.
- */
-app.delete(
-	"/api/pipelines/:slug",
-	handle(async (req, res) => {
-		const body = (req.body ?? {}) as { outputs?: unknown };
-		const outputs = Array.isArray(body.outputs) ? body.outputs.map(String) : [];
-		res.json(
-			await deletePipeline(
-				String(req.params.slug),
-				req.query.space ? String(req.query.space) : undefined,
-				outputs,
-			),
-		);
-	}),
-);
-
-app.get(
-	"/api/pipelines/:slug/versions",
-	handle(async (req, res) =>
-		res.json(
-			await listVersions(
-				String(req.params.slug),
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		),
-	),
-);
-
-app.post(
-	"/api/pipelines/:slug/versions/:version/restore",
-	handle(async (req, res) => {
-		res.json(
-			await restoreVersion(
-				String(req.params.slug),
-				Number(req.params.version),
-				req.principal?.username ?? "unknown",
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		);
+		res.json(await suggestLinks(req.query.objectType ? String(req.query.objectType) : undefined));
 	}),
 );
 
 app.post(
-	"/api/pipelines/:slug/run",
+	"/api/ontology/action-types",
 	handle(async (req, res) => {
-		res.json(
-			await runPipeline(
-				String(req.params.slug),
-				req.principal?.username ?? "unknown",
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		);
+		res.status(201).json(await createActionType(req.body ?? {}, req.principal?.username ?? "unknown"));
 	}),
 );
 
-app.get(
-	"/api/pipelines/:slug/runs",
-	handle(async (req, res) => {
-		res.json(
-			await listRuns(
-				String(req.params.slug),
-				Number(req.query.limit ?? 20),
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		);
-	}),
-);
-
-// ── what a run actually produced ────────────────────────────────────────────
-//  The estimator had nothing to show beyond a row count, so these are new:
-//  each node's rows, timing, materialised table and the SQL it ran.
-
-/** Record a pipeline the assistant drafted (§18). It is inert until accepted. */
 app.post(
-	"/api/pipelines/propose",
+	"/api/ontology/metrics",
 	handle(async (req, res) => {
-		res
-			.status(201)
-			.json(await proposePipeline(req.body, req.principal?.username ?? "unknown"));
+		res.status(201).json(await createMetric(req.body ?? {}, req.principal?.username ?? "unknown"));
 	}),
 );
 
-/** The Accept in Accept / Edit / Reject. */
-app.post(
-	"/api/pipelines/:slug/accept",
-	handle(async (req, res) => {
-		res.json(
-			await acceptPipeline(String(req.params.slug), req.principal?.username ?? "unknown"),
-		);
-	}),
-);
+// ── the ontology builder ────────────────────────────────────────────────────
+//  Editing what was authored. Every change is applied, journalled and
+//  published in one request - see builder.ts.
 
-app.get(
-	"/api/pipelines/runs/:runId/nodes",
-	handle(async (req, res) => {
-		res.json(await nodeRunsFor(Number(req.params.runId)));
-	}),
-);
-
-/**
- * Preview a node's materialised output.
- *
- * Restricted to the pipeline_out schema by previewOutput itself: a caller
- * cannot use this to read an arbitrary table, and a warehouse relation goes
- * through the resource preview, which checks it against the registry.
- */
-app.get(
-	"/api/pipelines/outputs/:qualified/preview",
-	handle(async (req, res) => {
-		res.json(
-			await previewOutput(String(req.params.qualified), Number(req.query.limit ?? 50)),
-		);
-	}),
-);
-
-/** How a materialised dataset's shape has changed run over run. */
-app.get(
-	"/api/datasets/:qualified/versions",
-	handle(async (req, res) => {
-		res.json(await datasetVersions(String(req.params.qualified)));
-	}),
-);
-
-// ── the ontology builder (§7-10) ────────────────────────────────────────────
-//  Editing an ontology that a pipeline regenerates. Every change is applied to
-//  the live version AND journalled, so the next publish replays it rather than
-//  silently discarding it — see builder.ts.
-
-const EDIT_KINDS = ["objectType", "property", "linkType", "actionType"] as const;
+const EDIT_KINDS = ["objectType", "property", "linkType", "actionType", "metric"] as const;
 
 function editKind(raw: string): EditKind {
 	if (!(EDIT_KINDS as readonly string[]).includes(raw)) {
@@ -1241,6 +1073,22 @@ function editKind(raw: string): EditKind {
 		);
 	}
 	return raw as EditKind;
+}
+
+/** A RID from whatever the caller has: the RID itself, or an api name. */
+function ridFor(kind: DeletableKind, ref: string): string {
+	if (ref.includes(":")) return ref;
+	const registry = getRegistry();
+	const found =
+		kind === "objectType"
+			? registry.objectTypeByApiName.get(ref)?.rid
+			: kind === "linkType"
+				? registry.linkTypeByApiName.get(ref)?.rid
+				: kind === "actionType"
+					? registry.actionTypeByApiName.get(ref)?.rid
+					: registry.kpiByApiName.get(ref)?.rid;
+	if (!found) throw new NotFound(`No ${kind} '${ref}' in this space's ontology.`);
+	return found;
 }
 
 app.patch(
@@ -1259,7 +1107,7 @@ app.patch(
 	}),
 );
 
-/** Draw a link by hand (§9). The match ratio is measured, not assumed. */
+/** Draw a link between two object types. The match ratio is measured, not assumed. */
 app.post(
 	"/api/ontology/link-types",
 	handle(async (req, res) => {
@@ -1271,10 +1119,14 @@ app.delete(
 	"/api/ontology/:kind/:rid",
 	handle(async (req, res) => {
 		const kind = editKind(String(req.params.kind));
-		if (kind !== "linkType" && kind !== "actionType") {
-			throw new BadRequest("Only link types and action types can be deleted.");
+		if (kind === "property") {
+			throw new BadRequest("A property is removed with its object type.");
 		}
-		await deleteOntologyObject(kind, String(req.params.rid), req.principal?.username ?? "unknown");
+		await deleteOntologyObject(
+			kind,
+			ridFor(kind, String(req.params.rid)),
+			req.principal?.username ?? "unknown",
+		);
 		res.status(204).end();
 	}),
 );
@@ -1507,11 +1359,8 @@ app.get(
 // The database this platform is actually running against, read live.
 app.get("/api/spaces/database", handle(async (_req, res) => res.json(await databaseInfo())));
 
-// The views a dataset may be registered on, offered by the register dialog.
-app.get("/api/spaces/views", handle(async (_req, res) => res.json(publishedViews())));
-
-// Fills the sandbox on first use. Idempotent, so the UI can call it whenever
-// the sandbox is empty rather than needing a separate setup step.
+// Sets the sandbox up: folders and the platform-database connection. Runs at
+// boot as well; idempotent, so calling it again only adds what is missing.
 app.post(
 	"/api/spaces/sandbox/seed",
 	handle(async (req, res) => res.json(await seedSandbox(req.principal?.username ?? "unknown"))),
@@ -1596,22 +1445,6 @@ app.post(
 	}),
 );
 
-// Turn a view - typically one a pipeline node produced - into a dataset
-// resource anyone can open, share and build on.
-app.post(
-	"/api/spaces/:space/projects/:project/datasets",
-	handle(async (req, res) => {
-		res.json(
-			await registerDataset(
-				String(req.params.space),
-				String(req.params.project),
-				req.body ?? {},
-				req.principal?.username ?? "unknown",
-			),
-		);
-	}),
-);
-
 // Try a connection WITHOUT storing it, so a wrong host or an unreadable secret
 // is found before anything is written.
 app.post(
@@ -1678,12 +1511,14 @@ app.post(
 
 // ── data connection: what is on the far side, and bringing it across ─────────
 //
-//  A connection used to be a business card — registerable, testable, and
-//  incapable of delivering a single row. A SYNC is the missing half: a named,
-//  re-runnable pull from one table on the source into one dataset here.
+//  A SYNC copies one view or table from the source into one dataset here, as
+//  it is; a schedule decides how often.
 
-// Every relation the connection's own user can read, asked of the host it
-// points at rather than of this database.
+// Every connection in the space, with its sync count.
+app.get("/api/connections", handle(async (_req, res) => res.json(await listConnections())));
+
+// Every view and table the connection's own user can read, asked of the host
+// it points at rather than of this database.
 app.get(
 	"/api/resources/:id/catalog",
 	handle(async (req, res) => res.json(await connectionCatalog(Number(req.params.id)))),
@@ -1725,121 +1560,6 @@ app.delete(
 	"/api/syncs/:id",
 	handle(async (req, res) => {
 		await deleteSync(Number(req.params.id));
-		res.status(204).end();
-	}),
-);
-
-// ── code repositories ───────────────────────────────────────────────────────
-//
-//  Two kinds. A transforms repository ingests through a connection and builds
-//  tables from what lands; a functions repository publishes definitions into
-//  the function catalogue. Neither executes arbitrary code: see repos.ts.
-
-app.get(
-	"/api/repos",
-	handle(async (req, res) => {
-		res.json(await listRepos(req.query.space ? String(req.query.space) : undefined));
-	}),
-);
-
-app.post(
-	"/api/repos",
-	handle(async (req, res) => {
-		res.json(
-			await createRepo(
-				req.body ?? {},
-				req.principal?.username ?? "unknown",
-				req.query.space ? String(req.query.space) : undefined,
-			),
-		);
-	}),
-);
-
-/** Everything the repository page needs in one request. */
-app.get(
-	"/api/repos/:slug",
-	handle(async (req, res) => {
-		const space = req.query.space ? String(req.query.space) : undefined;
-		const repo = await getRepo(String(req.params.slug), space);
-		res.json({
-			repo,
-			files: await listFiles(repo.id),
-			commits: await listCommits(repo.id),
-			builds: await listBuilds(repo.id),
-			outputs: await repoOutputs(repo),
-		});
-	}),
-);
-
-app.put(
-	"/api/repos/:slug/files",
-	handle(async (req, res) => {
-		const repo = await getRepo(
-			String(req.params.slug),
-			req.query.space ? String(req.query.space) : undefined,
-		);
-		const body = req.body ?? {};
-		res.json(
-			await putFile(
-				repo.id,
-				String(body.path ?? ""),
-				String(body.content ?? ""),
-				req.principal?.username ?? "unknown",
-			),
-		);
-	}),
-);
-
-app.delete(
-	"/api/repos/:slug/files",
-	handle(async (req, res) => {
-		const repo = await getRepo(
-			String(req.params.slug),
-			req.query.space ? String(req.query.space) : undefined,
-		);
-		// The path arrives as a query parameter: a DELETE body is legal but not
-		// reliably forwarded, and a file path is not a secret.
-		await deleteFile(repo.id, String(req.query.path ?? ""));
-		res.status(204).end();
-	}),
-);
-
-app.post(
-	"/api/repos/:slug/commit",
-	handle(async (req, res) => {
-		const repo = await getRepo(
-			String(req.params.slug),
-			req.query.space ? String(req.query.space) : undefined,
-		);
-		res.json(
-			await commitRepo(
-				repo.id,
-				String((req.body ?? {}).message ?? ""),
-				req.principal?.username ?? "unknown",
-			),
-		);
-	}),
-);
-
-app.post(
-	"/api/repos/:slug/build",
-	handle(async (req, res) => {
-		const repo = await getRepo(
-			String(req.params.slug),
-			req.query.space ? String(req.query.space) : undefined,
-		);
-		res.json(await buildRepo(repo.id, req.principal?.username ?? "unknown"));
-	}),
-);
-
-app.delete(
-	"/api/repos/:slug",
-	handle(async (req, res) => {
-		const repo = await getRepo(
-			String(req.params.slug),
-			req.query.space ? String(req.query.space) : undefined,
-		);
-		await deleteRepo(repo.id);
 		res.status(204).end();
 	}),
 );
@@ -1944,6 +1664,112 @@ app.get(
 	}),
 );
 
+// ── schedules ────────────────────────────────────────────────────────────────
+//  How often a sync runs: every 20m, 2h, 1d, 8d... The background loop
+//  (startScheduler, at boot) fires them when due; these routes manage them.
+
+/** Every sync in the space, each with its schedule. */
+app.get(
+	"/api/syncs",
+	handle(async (req, res) => {
+		res.json(
+			await listSyncsInSpace(req.query.space ? String(req.query.space) : undefined),
+		);
+	}),
+);
+
+/**
+ * Set how often a sync runs: {"every": "2h"}, or {"every": "manual"} to stop
+ * it running on its own. Creates, changes or removes its one schedule.
+ */
+app.post(
+	"/api/syncs/:id/schedule",
+	handle(async (req, res) => {
+		res.json({
+			schedule: await setSyncSchedule(
+				Number(req.params.id),
+				(req.body ?? {}).every ?? null,
+				req.principal?.username ?? "unknown",
+			),
+		});
+	}),
+);
+
+app.get(
+	"/api/schedules",
+	handle(async (req, res) => {
+		res.json(
+			await listSchedules(req.query.space ? String(req.query.space) : undefined),
+		);
+	}),
+);
+
+app.post(
+	"/api/schedules",
+	handle(async (req, res) => {
+		res.status(201).json(
+			await createSchedule(req.body ?? {}, req.principal?.username ?? "unknown", currentSpace()),
+		);
+	}),
+);
+
+app.get(
+	"/api/schedules/:id",
+	handle(async (req, res) => {
+		res.json(
+			await getSchedule(
+				Number(req.params.id),
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.patch(
+	"/api/schedules/:id",
+	handle(async (req, res) => {
+		res.json(
+			await updateSchedule(
+				Number(req.params.id),
+				req.body,
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
+app.delete(
+	"/api/schedules/:id",
+	handle(async (req, res) => {
+		await deleteSchedule(
+			Number(req.params.id),
+			req.query.space ? String(req.query.space) : undefined,
+		);
+		res.status(204).end();
+	}),
+);
+
+app.get(
+	"/api/schedules/:id/runs",
+	handle(async (req, res) => {
+		res.json(await listScheduleRuns(Number(req.params.id), Number(req.query.limit ?? 25)));
+	}),
+);
+
+/** Fire now, from a person's click, without disturbing the cadence. */
+app.post(
+	"/api/schedules/:id/run",
+	handle(async (req, res) => {
+		res.json(
+			await runScheduleNow(
+				Number(req.params.id),
+				req.principal?.username ?? "unknown",
+				req.query.space ? String(req.query.space) : undefined,
+			),
+		);
+	}),
+);
+
 // ── errors ──────────────────────────────────────────────────────────────────
 
 app.use((_req, res) => {
@@ -1987,20 +1813,23 @@ app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
 
 async function start(): Promise<void> {
 	console.log("[boot] TMS ontology service starting.");
-	await waitForOntology();
-	await loadRegistry();
+	await waitForDatabase();
+	// Every space gets an active ontology (empty until something is created
+	// from a dataset), and every document is rebuilt from its rows.
+	await ensureOntologies();
+	const seeded = await seedSandbox("system");
+	if (seeded.added > 0) console.log(`[boot] sandbox set up: ${seeded.added} item(s) added.`);
 
-	// Report the validation state at boot: if the published ontology has a
-	// structural problem, the log says so before anyone hits an endpoint.
-	const validation = new OntologyValidator().validate(getRegistry().definition);
-	if (validation.valid) {
+	startScheduler();
+
+	// Report the validation state at boot: if an ontology has a structural
+	// problem, the log says so before anyone hits an endpoint.
+	for (const space of spacesWithOntology()) {
+		const validation = withSpace(space, () => new OntologyValidator().validate(getRegistry().definition));
 		console.log(
-			`[boot] ontology validates (${validation.warnings.length} warning(s)).`,
-		);
-	} else {
-		console.warn(
-			`[boot] ontology has ${validation.errors.length} validation error(s). ` +
-				`First: ${validation.errors[0]}`,
+			validation.valid
+				? `[boot] ${space}: ontology validates (${validation.warnings.length} warning(s)).`
+				: `[boot] ${space}: ${validation.errors.length} validation error(s). First: ${validation.errors[0]}`,
 		);
 	}
 

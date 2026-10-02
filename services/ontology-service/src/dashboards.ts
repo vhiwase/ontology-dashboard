@@ -49,7 +49,7 @@ export interface DashboardRecord {
 	isPinned: boolean;
 	/** The conversation that produced it, for an AI-built dashboard. */
 	chatSessionId: number | null;
-	/** The space it lives in. Dashboards are per-space, like pipelines. */
+	/** The space it lives in. Dashboards are per-space, like the metrics they chart. */
 	spaceSlug: string;
 	/** A dashboard is a grid; a report is the same widgets read as a document. */
 	kind: "dashboard" | "report";
@@ -799,18 +799,21 @@ export async function dashboardFilterOptions(slug: string, spaceSlug?: string): 
 }
 
 export function kpiCatalogueForPrompt(): Array<Record<string, unknown>> {
-	return getRegistry().kpis.map((kpi) => ({
+	const registry = getRegistry();
+	return registry.kpis.map((kpi) => ({
 		apiName: kpi.apiName,
 		label: kpi.label,
 		question: kpi.businessQuestion,
 		category: kpi.category,
+		objectType: registry.objectTypeByRid.get(kpi.objectTypeRid ?? kpi.relatedObjectTypes[0] ?? "")?.apiName ?? null,
+		aggregation: kpi.aggregation,
+		measure: kpi.measureColumn,
+		conditions: kpi.conditions ?? {},
 		unit: kpi.unit,
 		format: kpi.valueFormat,
 		dimensions: kpi.dimensions,
 		defaultDimension: kpi.defaultDimension,
 		simulated: kpi.dependsOnSimulation,
-		aggregation: kpi.aggregation,
-		objectType: kpi.objectTypeRid ? (getRegistry().objectTypeByRid.get(kpi.objectTypeRid)?.apiName ?? null) : null,
 	}));
 }
 

@@ -38,7 +38,8 @@ import {
 	typeApiName,
 	propertyApiName,
 } from "./profiling";
-import { BadRequest, currentSpace, quoteIdentifier, quoteQualified, reloadSpace } from "./registry";
+import { activeVersion as ensureActiveVersion, publishChange } from "./definition";
+import { BadRequest, currentSpace, quoteIdentifier, quoteQualified } from "./registry";
 
 export interface SourceForeignKey {
 	columns: string[];
@@ -166,7 +167,10 @@ async function activeVersion(client: PoolClient): Promise<{ versionId: number; s
 	);
 	const row = result.rows[0];
 	if (!row) {
-		throw new BadRequest(`No ontology is active in the '${currentSpace()}' space, so there is nothing to model into.`);
+		// A space starts with no ontology; definition.ts creates its empty
+		// active version (committed on its own), and this transaction locks it.
+		await ensureActiveVersion(currentSpace());
+		return activeVersion(client);
 	}
 	return { versionId: Number(row.ontology_version_id), spaceId: Number(row.space_id) };
 }
@@ -578,7 +582,7 @@ export async function modelSources(
 				unfiltered: boolean;
 			}>(
 				`SELECT api_name, object_type_rid, origin, measure_column, aggregation,
-				        (base_filters IS NULL OR base_filters = '{}'::jsonb) AS unfiltered
+				        (conditions IS NULL OR conditions = '{}'::jsonb) AS unfiltered
 				   FROM platform.kpi_definition WHERE space_id = $1`,
 				[spaceId],
 			)
@@ -639,7 +643,6 @@ export async function modelSources(
 			}
 		}
 
-		await syncDefinition(client, versionId);
 		await client.query("COMMIT");
 	} catch (error) {
 		await client.query("ROLLBACK").catch(() => {});
@@ -649,7 +652,7 @@ export async function modelSources(
 	}
 
 	clearColumnCache();
-	await reloadSpace(currentSpace());
+	await publishChange(currentSpace());
 	return outcome;
 }
 
@@ -686,6 +689,7 @@ export async function insertWorkspaceLink(request: {
 	inverseLabel: string;
 }): Promise<{ matchRatio: number; matched: number; candidates: number; cardinality: string }> {
 	const client = await pool.connect();
+	let outcome: { matchRatio: number; matched: number; candidates: number; cardinality: string };
 	try {
 		await client.query("BEGIN");
 		const { versionId } = await activeVersion(client);
@@ -711,17 +715,17 @@ export async function insertWorkspaceLink(request: {
 				measured.candidates, measured.ratio >= 0.999,
 			],
 		);
-		await syncDefinition(client, versionId);
 		await client.query("COMMIT");
-		return { matchRatio: measured.ratio, matched: measured.matched, candidates: measured.candidates, cardinality };
+		outcome = { matchRatio: measured.ratio, matched: measured.matched, candidates: measured.candidates, cardinality };
 	} catch (error) {
 		await client.query("ROLLBACK").catch(() => {});
 		throw error;
 	} finally {
 		client.release();
 		clearColumnCache();
-		await reloadSpace(currentSpace());
 	}
+	await publishChange(currentSpace());
+	return outcome;
 }
 
 /** Run `work` inside a transaction on the active version, then resync and reload. */
@@ -729,172 +733,24 @@ export async function withActiveVersion<T>(
 	work: (client: PoolClient, version: { versionId: number; spaceId: number }) => Promise<T>,
 ): Promise<T> {
 	const client = await pool.connect();
+	let result: T;
 	try {
 		await client.query("BEGIN");
 		const version = await activeVersion(client);
-		const result = await work(client, version);
-		await syncDefinition(client, version.versionId);
+		result = await work(client, version);
 		await client.query("COMMIT");
-		return result;
 	} catch (error) {
 		await client.query("ROLLBACK").catch(() => {});
 		throw error;
 	} finally {
 		client.release();
 		clearColumnCache();
-		await reloadSpace(currentSpace());
 	}
+	// The document, the registry and the workspace cards follow the rows.
+	await publishChange(currentSpace());
+	return result;
 }
 
-// ── the ontology document ───────────────────────────────────────────────────
-
-/**
- * Rewrite the workspace part of the ontology document from the rows.
- *
- * The rows are what queries run against; the document is what ontograph
- * validates and exports (OWL, SHACL, JSON Schema). Every entry this module and
- * the proposal layer write carries a `ws:` id, so the document's workspace
- * section is regenerated wholesale from the rows on every change, and the
- * pipeline's own entries are left exactly as they were.
- */
-export async function syncDefinition(client: PoolClient, versionId: number): Promise<void> {
-	const current = await client.query<{ definition: Record<string, unknown> }>(
-		"SELECT definition FROM platform.ontology_version WHERE ontology_version_id = $1",
-		[versionId],
-	);
-	const definition = { ...(current.rows[0]?.definition ?? {}) } as Record<string, unknown>;
-	const keep = (key: string) =>
-		((definition[key] as Array<Record<string, unknown>> | undefined) ?? []).filter(
-			(entry) => !String(entry["@id"] ?? "").startsWith("ws:"),
-		);
-
-	const types = (
-		await client.query<{ object_type_rid: string; label: string; description: string | null; group_name: string | null; color: string | null; primary_key_column: string }>(
-			`SELECT object_type_rid, label, description, group_name, color, primary_key_column FROM platform.object_type
-			  WHERE ontology_version_id = $1 AND object_type_rid LIKE 'ws:%' ORDER BY display_order, api_name`,
-			[versionId],
-		)
-	).rows;
-	const props = (
-		await client.query<{ object_property_rid: string; object_type_rid: string; label: string; description: string | null; datatype: string; sql_column: string; is_nullable: boolean }>(
-			`SELECT object_property_rid, object_type_rid, label, description, datatype, sql_column, is_nullable
-			   FROM platform.object_property WHERE ontology_version_id = $1 AND object_type_rid LIKE 'ws:%'
-			  ORDER BY object_type_rid, display_order`,
-			[versionId],
-		)
-	).rows;
-	const links = (
-		await client.query<{ link_type_rid: string; label: string; description: string | null; source_object_type: string; target_object_type: string; cardinality: string }>(
-			`SELECT link_type_rid, label, description, source_object_type, target_object_type, cardinality
-			   FROM platform.link_type WHERE ontology_version_id = $1 AND link_type_rid LIKE 'ws:%'`,
-			[versionId],
-		)
-	).rows;
-
-	const keyOf = new Map(types.map((t) => [t.object_type_rid, t.primary_key_column]));
-	const attributes = props.map((p) => ({
-		"@id": p.object_property_rid,
-		"@type": "Attribute",
-		label: { en: p.label },
-		...(p.description ? { description: { en: p.description } } : {}),
-		datatype: p.datatype,
-		required: !p.is_nullable,
-		identity: keyOf.get(p.object_type_rid) === p.sql_column,
-	}));
-	const entityTypes = types.map((t) => ({
-		"@id": t.object_type_rid,
-		"@type": "EntityType",
-		label: { en: t.label },
-		...(t.description ? { description: { en: t.description } } : {}),
-		kind: "entity",
-		attributes: props
-			.filter((p) => p.object_type_rid === t.object_type_rid)
-			.map((p) => ({
-				ref: p.object_property_rid,
-				required: !p.is_nullable,
-				identity: t.primary_key_column === p.sql_column,
-			})),
-		relations: links
-			.filter((l) => l.source_object_type === t.object_type_rid)
-			.map((l) => ({ ref: l.link_type_rid, min: 0, max: l.cardinality === "MANY_TO_ONE" ? 1 : null })),
-		constraints: [],
-		ui: { ...(t.color ? { color: t.color } : {}), ...(t.group_name ? { group: t.group_name } : {}) },
-	}));
-	const relationTypes = links.map((l) => ({
-		"@id": l.link_type_rid,
-		"@type": "RelationType",
-		label: { en: l.label },
-		...(l.description ? { description: { en: l.description } } : {}),
-		domain: l.source_object_type,
-		range: l.target_object_type,
-		min: 0,
-		max: l.cardinality === "MANY_TO_ONE" ? 1 : null,
-	}));
-
-	const actions = (
-		await client.query<{
-			action_type_rid: string;
-			label: string;
-			description: string | null;
-			target_object_types: string[];
-			parameters: Array<Record<string, unknown>>;
-			allowed_roles: string[];
-			tags: string[];
-		}>(
-			`SELECT action_type_rid, label, description, target_object_types, parameters, allowed_roles, tags
-			   FROM platform.action_type WHERE ontology_version_id = $1 AND action_type_rid LIKE 'ws:%'`,
-			[versionId],
-		)
-	).rows;
-	const actionTypes = actions.map((a) => ({
-		"@id": a.action_type_rid,
-		"@type": "ActionType",
-		label: { en: a.label },
-		...(a.description ? { description: { en: a.description } } : {}),
-		parameters: a.parameters.map((parameter) => ({
-			name: String(parameter.name),
-			label: { en: String(parameter.label ?? parameter.name) },
-			type: String(parameter.type ?? "string"),
-			required: Boolean(parameter.required),
-			...(Array.isArray(parameter.validation) ? { validation: parameter.validation } : {}),
-		})),
-		targetTypes: a.target_object_types,
-		approvalPolicy: { required: false },
-		auditConfig: { enabled: true, logLevel: "full" },
-		permissions: { allowedRoles: a.allowed_roles },
-		tags: a.tags,
-	}));
-	// Who may run a workspace action is part of the roles, because that is what
-	// the access controller reads: each allowed role gets an execute rule for
-	// it, rebuilt from the rows like everything else here.
-	const roles = ((definition.roles as Array<Record<string, unknown>> | undefined) ?? []).map((role) => {
-		const rules = ((role.rules as Array<Record<string, unknown>> | undefined) ?? []).filter(
-			(rule) => !String(rule.resourceRef ?? "").startsWith("ws:"),
-		);
-		for (const action of actions) {
-			if (action.allowed_roles.includes(String(role["@id"]))) {
-				rules.push({ resource: "actionType", resourceRef: action.action_type_rid, permissions: ["view", "execute"] });
-			}
-		}
-		return { ...role, rules };
-	});
-
-	definition.entityTypes = [...keep("entityTypes"), ...entityTypes];
-	definition.attributes = [...keep("attributes"), ...attributes];
-	definition.relationTypes = [...keep("relationTypes"), ...relationTypes];
-	definition.actionTypes = [...keep("actionTypes"), ...actionTypes];
-	definition.roles = roles;
-
-	await client.query(
-		`UPDATE platform.ontology_version
-		    SET definition = $2::jsonb,
-		        object_type_count = (SELECT count(*) FROM platform.object_type WHERE ontology_version_id = $1),
-		        link_type_count = (SELECT count(*) FROM platform.link_type WHERE ontology_version_id = $1),
-		        action_type_count = (SELECT count(*) FROM platform.action_type WHERE ontology_version_id = $1)
-		  WHERE ontology_version_id = $1`,
-		[versionId, JSON.stringify(definition)],
-	);
-}
 
 /** Remove a modelled or combined type with its properties, links and metrics. */
 export async function removeModelledType(apiName: string): Promise<void> {
@@ -923,7 +779,6 @@ export async function removeModelledType(apiName: string): Promise<void> {
 			await client.query(`DROP VIEW IF EXISTS ${quoteQualified(type.source_view)}`);
 			await client.query("DELETE FROM platform.combination WHERE space_id = $1 AND view_name = $2", [spaceId, type.source_view]);
 		}
-		await syncDefinition(client, versionId);
 		await client.query("COMMIT");
 	} catch (error) {
 		await client.query("ROLLBACK").catch(() => {});
@@ -932,7 +787,7 @@ export async function removeModelledType(apiName: string): Promise<void> {
 		client.release();
 	}
 	clearColumnCache();
-	await reloadSpace(currentSpace());
+	await publishChange(currentSpace());
 }
 
 /** Object types in the space that were modelled from connected tables. */

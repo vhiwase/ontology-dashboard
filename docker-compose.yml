@@ -38,11 +38,6 @@ secrets:
   # Encrypts connection passwords typed into the connect form.
   credential_key:
     file: ./secrets/credential_key
-  # Optional hosted models for the assistant; an empty file means "not set".
-  anthropic_api_key:
-    file: ./secrets/anthropic_api_key
-  openai_api_key:
-    file: ./secrets/openai_api_key
 
 services:
   # ─── Postgres: raw tables, semantic views, ontology registry ──────────────
@@ -77,68 +72,7 @@ services:
           cpus: "${POSTGRES_CPUS:-2}"
           memory: ${POSTGRES_MEMORY:-1g}
 
-  # ─── Ollama: hosts the open-source LLM ───────────────────────────────────
-  ollama:
-    # Pinned, like every other image here. `latest` meant the model server
-    # could change under a stack that had not been rebuilt.
-    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
-    restart: unless-stopped
-    environment:
-      # Keeping the model resident avoids a 20-30 s cold load on every question.
-      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
-    ports:
-      - "127.0.0.1:${OLLAMA_PORT:-11435}:11434"
-    volumes:
-      - ollama:/root/.ollama
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-      start_period: 20s
-    deploy:
-      resources:
-        limits:
-          # A 7B model quantised to 4 bits needs roughly 5-6 GB resident; the
-          # headroom above that is for the KV cache on a long conversation.
-          cpus: "${OLLAMA_CPUS:-6}"
-          memory: ${OLLAMA_MEMORY:-10g}
-
-  # ─── One-shot: pull the chat model so the first question is not a 404 ────
-  ollama-init:
-    image: ollama/ollama:${OLLAMA_VERSION:-0.34.2}
-    # No `profiles:` here. It used to carry profiles: ["default", "llm"], and
-    # "default" is not a special name in Compose - a service with any profile
-    # starts only when that profile is explicitly enabled. So this never ran on
-    # a plain `docker compose up`, the model was never pulled, and the first
-    # question to the local model got a 404 from Ollama. OLLAMA_AUTO_PULL=false
-    # is the supported way to skip the pull; the command below honours it.
-    depends_on:
-      ollama:
-        condition: service_healthy
-    environment:
-      OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
-      OLLAMA_AUTO_PULL: ${OLLAMA_AUTO_PULL:-true}
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        if [ "$${OLLAMA_AUTO_PULL}" != "true" ]; then
-          echo "OLLAMA_AUTO_PULL=false - skipping model pull."; exit 0
-        fi
-        if ollama list 2>/dev/null | grep -q "$${OLLAMA_MODEL%%:*}"; then
-          echo "Model $${OLLAMA_MODEL} already present."; exit 0
-        fi
-        echo "Pulling $${OLLAMA_MODEL} (several GB on first run)..."
-        ollama pull "$${OLLAMA_MODEL}"
-    restart: "no"
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 512m
-
-  # ─── Pipeline: migrations, ingestion, ontology, users, retention ─────────
+  # ─── Pipeline: migrations, the TMS snapshot, users, retention ────────────
   pipeline:
     build:
       context: ./services/pipeline
@@ -149,10 +83,7 @@ services:
       DATABASE_URL_FILE: /run/secrets/database_url
       PIPELINE_MIGRATIONS_DIR: /db/migrations
       PIPELINE_SOURCE_DIR: ${PIPELINE_SOURCE_DIR:-/data/api_responses}
-      PIPELINE_SIMULATE_EXECUTION: ${PIPELINE_SIMULATE_EXECUTION:-false}
-      PIPELINE_SIM_SEED: ${PIPELINE_SIM_SEED:-20260919}
       PIPELINE_FORCE_REINGEST: ${PIPELINE_FORCE_REINGEST:-false}
-      PIPELINE_LINK_MIN_MATCH_RATIO: ${PIPELINE_LINK_MIN_MATCH_RATIO:-0.05}
       # Creates the first admin when no users exist. Unset means no user is
       # created and every route answers 401, which is a visible failure rather
       # than a default credential.
@@ -165,7 +96,7 @@ services:
       # The captured TMS payloads, mounted read-only from the sibling folder.
       - ../api_responses:/data/api_responses:ro
       - ./db/migrations:/db/migrations:ro
-    # migrate -> run -> seed users -> retention, in that order, with any
+    # migrate -> land the snapshot -> seed users -> retention, in that order, with any
     # failure stopping the rest. The sequence lives in pipeline.bootstrap
     # rather than as an `entrypoint: sh -c` chain here, because overriding the
     # entrypoint would break the documented one-off form:
@@ -181,7 +112,7 @@ services:
           cpus: "${PIPELINE_CPUS:-2}"
           memory: ${PIPELINE_MEMORY:-1g}
 
-  # ─── Ontology service: @ontograph/core over the generated ontology ──────
+  # ─── Ontology service: connections, syncs, schedules, the ontology ──────
   ontology-service:
     build:
       context: ./services/ontology-service
@@ -205,8 +136,8 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       PORT: ${ONTOLOGY_SERVICE_PORT:-4000}
       ONTOLOGY_MAX_PAGE_SIZE: ${ONTOLOGY_MAX_PAGE_SIZE:-500}
-      # false refuses every KPI, widget and action derived from tms_sim, so a
-      # simulated figure cannot be served as though it were measured.
+      # false refuses every KPI, widget and action flagged as resting on
+      # generated data, so an invented figure cannot be served as measured.
       ALLOW_SIMULATED_DATA: ${ALLOW_SIMULATED_DATA:-false}
       # Self-registration: anyone who can reach the UI may create an account
       # with its own private workspace. false = accounts by administrators only.
@@ -218,6 +149,9 @@ services:
       # platform's own database are refused either way.
       BLOCK_PRIVATE_CONNECTION_HOSTS: ${BLOCK_PRIVATE_CONNECTION_HOSTS:-false}
       CREDENTIAL_KEY_FILE: /run/secrets/credential_key
+      # How often the background loop checks platform.schedule for due syncs.
+      # 0 disables scheduling entirely.
+      SCHEDULE_TICK_SECONDS: ${SCHEDULE_TICK_SECONDS:-20}
       NODE_ENV: production
     secrets:
       - database_url
@@ -241,7 +175,7 @@ services:
           cpus: "${ONTOLOGY_SERVICE_CPUS:-2}"
           memory: ${ONTOLOGY_SERVICE_MEMORY:-768m}
 
-  # ─── AI-FDE: the assistant that reads the ontology and builds dashboards ─
+  # ─── AI-FDE: builds the ontology from datasets, answers from it ─────────
   ai-fde:
     build:
       context: ./services/ai-fde
@@ -249,10 +183,6 @@ services:
     depends_on:
       ontology-service:
         condition: service_healthy
-      # Started, not healthy: with Azure as primary the assistant must not wait on
-      # a multi-gigabyte model pull, and Ollama is only the fallback.
-      ollama:
-        condition: service_started
     environment:
       DATABASE_URL_FILE: /run/secrets/database_url
       AUTH_JWT_SECRET_FILE: /run/secrets/jwt_secret
@@ -263,42 +193,20 @@ services:
       CHAT_RATE_PER_MINUTE: ${CHAT_RATE_PER_MINUTE:-10}
       CHAT_RATE_BURST: ${CHAT_RATE_BURST:-5}
       CHAT_DAILY_TOKEN_BUDGET: ${CHAT_DAILY_TOKEN_BUDGET:-0}
-      # auto resolves from whether Ollama has GPU offload; see .env.example.
-      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
-      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-}
-      LLM_FALLBACK_COOLDOWN: ${LLM_FALLBACK_COOLDOWN:-300}
-      OLLAMA_GPU: ${OLLAMA_GPU:-}
-      AI_FDE_MAX_TOOL_ROUNDS: ${AI_FDE_MAX_TOOL_ROUNDS:-8}
+      # azure_openai is the model; without its endpoint and key the built-in
+      # planner answers from the ontology. Any other value fails loudly.
+      LLM_PROVIDER: ${LLM_PROVIDER:-azure_openai}
+      AI_FDE_MAX_TOOL_ROUNDS: ${AI_FDE_MAX_TOOL_ROUNDS:-16}
       AI_FDE_TEMPERATURE: ${AI_FDE_TEMPERATURE:-0.1}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
-      # 300s, not 90s: a 7B model on CPU with a fifteen-tool schema routinely
-      # needs minutes for one round, and 90s meant the local model was selected
-      # and then always timed out. Still bounded, so a wedged model does not
-      # hang the request forever.
-      OLLAMA_TIMEOUT: ${OLLAMA_TIMEOUT:-300}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_KEY_FILE: /run/secrets/azure_openai_key
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-gpt-4.1}
       AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-12-01-preview}
       AZURE_OPENAI_TIMEOUT: ${AZURE_OPENAI_TIMEOUT:-120}
-      # Claude (Anthropic). Read only from these names - never from an ambient
-      # ANTHROPIC_API_KEY - so the bill goes where it was configured to.
-      AI_FDE_ANTHROPIC_API_KEY_FILE: /run/secrets/anthropic_api_key
-      AI_FDE_ANTHROPIC_MODEL: ${AI_FDE_ANTHROPIC_MODEL:-claude-opus-5-5}
-      AI_FDE_ANTHROPIC_EFFORT: ${AI_FDE_ANTHROPIC_EFFORT:-medium}
-      AI_FDE_ANTHROPIC_FALLBACKS: ${AI_FDE_ANTHROPIC_FALLBACKS:-default}
-      AI_FDE_ANTHROPIC_BASE_URL: ${AI_FDE_ANTHROPIC_BASE_URL:-https://api.anthropic.com}
-      # Any OpenAI-compatible endpoint (OpenAI, a gateway, vLLM, LM Studio).
-      AI_FDE_OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
-      AI_FDE_OPENAI_BASE_URL: ${AI_FDE_OPENAI_BASE_URL:-https://api.openai.com/v1}
-      AI_FDE_OPENAI_MODEL: ${AI_FDE_OPENAI_MODEL:-gpt-4.1}
     secrets:
       - database_url
       - jwt_secret
       - azure_openai_key
-      - anthropic_api_key
-      - openai_api_key
     ports:
       - "127.0.0.1:${AI_FDE_PORT:-4100}:${AI_FDE_PORT:-4100}"
     healthcheck:
@@ -353,5 +261,4 @@ services:
 
 volumes:
   pgdata:
-  ollama:
   ui-certs:

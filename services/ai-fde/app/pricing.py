@@ -15,7 +15,6 @@ invoice before anyone makes a decision on these numbers.
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 
 
@@ -36,90 +35,24 @@ class Rate:
     input_per_m: float
     output_per_m: float
     source: str
-    # Prompt-cache reads and writes, where the provider prices them apart from
-    # ordinary input. None means "same as input".
-    cache_read_per_m: float | None = None
-    cache_write_per_m: float | None = None
 
     @property
     def is_free(self) -> bool:
         return self.input_per_m == 0.0 and self.output_per_m == 0.0
 
 
-# Claude list prices, USD per million tokens: input, output, cache read. A
-# 5-minute cache write is 1.25x input. Check them against the pricing page and
-# an invoice; COST_ANTHROPIC_* overrides every one of them.
-CLAUDE_LIST_PRICES: dict[str, tuple[float, float, float]] = {
-    "claude-opus-5-5": (4.00, 20.00, 0.20),
-    "claude-sonnet-5-5": (2.00, 10.00, 0.20),
-    "claude-fable-5-1": (10.00, 50.00, 0.25),
-}
-
-
-def claude_rate(model: str) -> Rate | None:
-    base = re.sub(r"-\d{8}$", "", (model or "").strip().lower())
-    if os.environ.get("COST_ANTHROPIC_INPUT_PER_M"):
-        input_per_m = _rate("COST_ANTHROPIC_INPUT_PER_M", 0.0)
-        return Rate(
-            input_per_m=input_per_m,
-            output_per_m=_rate("COST_ANTHROPIC_OUTPUT_PER_M", 0.0),
-            source="configured",
-            cache_read_per_m=_rate("COST_ANTHROPIC_CACHE_READ_PER_M", input_per_m * 0.1),
-            cache_write_per_m=_rate("COST_ANTHROPIC_CACHE_WRITE_PER_M", input_per_m * 1.25),
-        )
-    listed = CLAUDE_LIST_PRICES.get(base)
-    if listed is None:
-        return None
-    input_per_m, output_per_m, read_per_m = listed
-    return Rate(
-        input_per_m=input_per_m,
-        output_per_m=output_per_m,
-        source=f"list price for {base} (verify)",
-        cache_read_per_m=read_per_m,
-        cache_write_per_m=input_per_m * 1.25,
-    )
-
-
-def rate_for(provider: str, model: str) -> Rate | None:
-    """The rate for the model that actually answered.
-
-    Claude is priced by model rather than by provider: a refusal fallback can
-    answer from a different model than the one configured.
-    """
-    if provider == "anthropic":
-        return claude_rate(model)
-    return rates().get(provider)
-
-
 def rates() -> dict[str, Rate]:
     """Per-provider rates, read at call time so a restart picks up a change."""
-    from .config import CONFIG
-
-    table = {
+    return {
         # Azure OpenAI list price for gpt-4.1 at the time of writing.
         "azure_openai": Rate(
             input_per_m=_rate("COST_AZURE_INPUT_PER_M", 2.00),
             output_per_m=_rate("COST_AZURE_OUTPUT_PER_M", 8.00),
             source="configured" if os.environ.get("COST_AZURE_INPUT_PER_M") else "list price (verify)",
         ),
-        # Self-hosted: no per-token charge. Not free in reality - it burns
-        # electricity and hardware - but there is no per-call price to attribute,
-        # and inventing one would make the comparison with Azure dishonest.
-        "ollama": Rate(0.0, 0.0, "self-hosted, no per-token charge"),
-        # Any OpenAI-compatible endpoint: priced only when configured, because
-        # the same API fronts very different models and gateways.
-        "openai": Rate(
-            input_per_m=_rate("COST_OPENAI_INPUT_PER_M", 2.00),
-            output_per_m=_rate("COST_OPENAI_OUTPUT_PER_M", 8.00),
-            source="configured" if os.environ.get("COST_OPENAI_INPUT_PER_M") else "gpt-4.1 list price (verify)",
-        ),
-        # No model is called at all.
-        "builtin": Rate(0.0, 0.0, "no model: the built-in planner"),
+        # The built-in planner calls no model, so a turn it answers costs nothing.
+        "builtin": Rate(input_per_m=0.0, output_per_m=0.0, source="no model"),
     }
-    claude = claude_rate(CONFIG.anthropic_model)
-    if claude is not None:
-        table["anthropic"] = claude
-    return table
 
 
 @dataclass(frozen=True)
@@ -152,23 +85,15 @@ def price_turn(
     prompt = count("promptTokens")
     completion = count("completionTokens")
     total = count("totalTokens") or (prompt + completion)
-    # Of the prompt tokens, those read from or written to the prompt cache,
-    # which Claude prices apart from ordinary input.
-    cache_read = min(count("cacheReadTokens"), prompt)
-    cache_write = min(count("cacheWriteTokens"), prompt - cache_read)
 
-    rate = rate_for(provider, model)
+    table = rates()
+    rate = table.get(provider)
     if rate is None:
         return Cost(prompt, completion, total, 0.0, 0.0, 0.0, provider, model, priced=False)
 
-    read_per_m = rate.input_per_m if rate.cache_read_per_m is None else rate.cache_read_per_m
-    write_per_m = rate.input_per_m if rate.cache_write_per_m is None else rate.cache_write_per_m
-    cost = (
-        ((prompt - cache_read - cache_write) / 1_000_000) * rate.input_per_m
-        + (cache_read / 1_000_000) * read_per_m
-        + (cache_write / 1_000_000) * write_per_m
-        + (completion / 1_000_000) * rate.output_per_m
-    )
+    cost = (prompt / 1_000_000) * rate.input_per_m + (
+        completion / 1_000_000
+    ) * rate.output_per_m
 
     return Cost(
         prompt_tokens=prompt,

@@ -44,10 +44,11 @@ interface Turn {
 		latencyMs: number;
 		model: string;
 		stoppedBecause: string;
-		failoverReason?: string | null;
 		tokens?: number;
 		costUsd?: number;
 		priced?: boolean;
+		/** The operational mode the conversation is in after this turn. */
+		agentMode?: string;
 	};
 }
 
@@ -62,21 +63,22 @@ interface ProviderOption {
 	model: string;
 	configured: boolean;
 	available: boolean;
-	/** Usable, but slow enough to warn about — a CPU-only local model. */
-	slow: boolean;
 	detail: string | null;
 }
 
 interface ProviderCatalogue {
 	providers: ProviderOption[];
 	auto: { id: string; label: string; resolvedTo: string | null; reason: string | null };
-	/** Which option to preselect; the server yields off Ollama if it is not usable. */
+	/** Which option to preselect. */
 	default: string;
 }
 
 export function Assistant() {
 	const [turns, setTurns] = useState<Turn[]>([]);
-	const [input, setInput] = useState("");
+	// ?prompt= pre-fills the composer - how "Ask the AI-FDE to model it" hands a
+	// request over. It is never sent on its own; the person reads it first.
+	const [searchParams] = useSearchParams();
+	const [input, setInput] = useState(() => searchParams.get("prompt") ?? "");
 	const [busy, setBusy] = useState(false);
 	const [sessionId, setSessionId] = useState<number | null>(null);
 	const [error, setError] = useState<string | null>(null);
@@ -203,10 +205,10 @@ export function Assistant() {
 						latencyMs: response.latencyMs,
 						model: response.model,
 						stoppedBecause: response.stoppedBecause,
-						failoverReason: response.failoverReason,
 						tokens: response.cost?.totalTokens,
 						costUsd: response.cost?.usd,
 						priced: response.cost?.priced,
+						agentMode: response.agentMode,
 					},
 				},
 			]);
@@ -239,44 +241,13 @@ export function Assistant() {
 	}, [catalogue]);
 
 	const llmDown = health && !health.llm.reachable;
-	const modelMissing = health?.llm.reachable && health.llm.modelPresent === false;
-	// The primary can be in cooldown while the fallback answers fine. That is a
-	// working state, not an error, so it gets a note rather than a red banner.
-	const onFallback = Boolean(
-		health?.llm.breakerOpen ||
-			(health?.configuredProvider && health.configuredProvider !== "auto" &&
-				health.provider !== health.configuredProvider),
-	);
-
 	return (
 		<div className="chat">
 			<div className="chat-scroll" ref={scrollRef}>
-				{(llmDown || modelMissing) && (
+				{llmDown && (
 					<div className="banner error" style={{ marginBottom: 12 }}>
 						<strong>The language model is not ready.</strong>{" "}
-						{llmDown ? (
-							<>
-								{health?.provider === "ollama"
-									? "Ollama is not reachable. "
-									: "The configured provider is not reachable. "}
-								{health?.llm.detail}
-							</>
-						) : (
-							<>
-								Ollama is up but the model <code>{health?.model}</code> has not been pulled
-								yet. Run{" "}
-								<code>docker compose exec ollama ollama pull {health?.model}</code> and
-								reload. Everything else in this workbench works without it.
-							</>
-						)}
-					</div>
-				)}
-
-				{onFallback && !llmDown && (
-					<div className="banner" style={{ marginBottom: 12 }}>
-						<strong>Running on the fallback model.</strong>{" "}
-						{health?.llm.lastFailoverReason ?? health?.providerReason}{" "}
-						Answers are unaffected; only which model produces them has changed.
+						The configured provider is not reachable. {health?.llm.detail}
 					</div>
 				)}
 
@@ -303,10 +274,11 @@ export function Assistant() {
 							</p>
 						) : (
 							<p className="secondary" style={{ margin: "0 0 12px", maxWidth: 780 }}>
-								I know this space's ontology: <Link to="/ontology">object types</Link>, their links, the{" "}
-								<Link to="/dashboards">metric catalogue</Link> and the action layer. Ask me a question, or tell
-								me what dashboard you need and I will build it. Every figure I show is measured from the data;
-								where it does not carry something, I will say so rather than estimate it.
+								I build the ontology from this space's <Link to="/browse/datasets">datasets</Link> - object
+								types, the links between them, metrics and actions - and then answer from it. Ask me to sync a
+								view, to model what has been synced, a question about the data, or to build a dashboard. Every
+								figure I show is measured from the synced data; where the source does not carry something, I
+								will say so rather than estimate it.
 							</p>
 						)}
 						<div className="starters">
@@ -434,7 +406,7 @@ export function Assistant() {
 							{catalogue?.providers.map((option) => (
 								<option key={option.id} value={option.id} disabled={!option.available}>
 									{option.label}
-									{!option.available ? " — unavailable" : option.slow ? " — slow (CPU)" : ""}
+									{!option.available ? " — unavailable" : ""}
 								</option>
 							))}
 							{catalogue && (
@@ -446,9 +418,9 @@ export function Assistant() {
 						</select>
 					</label>
 					{selected && <span className="mono">{selected.model}</span>}
-					{selected?.detail && (selected.slow || !selected.available) && (
+					{selected?.detail && !selected.available && (
 						<span className="model-warn" title={selected.detail}>
-							⚠ {selected.slow ? "CPU-only — answers take minutes" : selected.detail}
+							⚠ {selected.detail}
 						</span>
 					)}
 					<span>Enter to send · Shift+Enter for a new line</span>
@@ -604,15 +576,21 @@ function TurnView({
 
 				{turn.artifacts && turn.artifacts.length > 0 && (
 					<div className="col" style={{ gap: 10, marginTop: 10 }}>
-						{turn.artifacts.map((artifact, index) => (
-							<ArtifactView
-								key={index}
-								artifact={artifact}
-								onReviewFunction={onReviewFunction}
-								onApproved={onApproved}
-								onAsk={onAnswer}
-							/>
-						))}
+						<ChangesCard
+							changes={turn.artifacts.filter((artifact) => artifact.kind === "ontologyChange")}
+							onResource={onResource}
+						/>
+						{turn.artifacts
+							.filter((artifact) => artifact.kind !== "ontologyChange")
+							.map((artifact, index) => (
+								<ArtifactView
+									key={index}
+									artifact={artifact}
+									onReviewFunction={onReviewFunction}
+									onApproved={onApproved}
+									onAsk={onAnswer}
+								/>
+							))}
 					</div>
 				)}
 
@@ -656,8 +634,8 @@ function TurnView({
 					<div className="muted" style={{ fontSize: 11, marginTop: 7 }}>
 						{turn.meta.rounds} round{turn.meta.rounds === 1 ? "" : "s"} ·{" "}
 						{(turn.meta.latencyMs / 1000).toFixed(1)}s · {turn.meta.model}
+						{turn.meta.agentMode && ` · mode: ${turn.meta.agentMode}`}
 						{turn.meta.stoppedBecause !== "answered" && ` · ${turn.meta.stoppedBecause}`}
-						{turn.meta.failoverReason && " · answered by the fallback model"}
 						{/* Tokens and cost per turn, so the price of a question is visible
 						    where the question was asked rather than only in a report.
 						    A turn on an unpriced provider says so instead of showing $0. */}
@@ -674,124 +652,51 @@ function TurnView({
 	);
 }
 
+const CHANGE_LABELS: Record<string, { verb: string; glyph: string }> = {
+	dataset: { verb: "Synced", glyph: "▤" },
+	objectType: { verb: "Object type", glyph: "◈" },
+	linkType: { verb: "Link", glyph: "↔" },
+	kpi: { verb: "Metric", glyph: "Σ" },
+	actionType: { verb: "Action", glyph: "⚡" },
+};
+
 /**
- * The decision card for a drafted pipeline.
+ * Everything a turn created, as one card.
  *
- * Its own component because it holds state - a card that has been accepted
- * should say so rather than keep offering the button, and the artifact list
- * re-renders around it.
+ * A build turn creates a dozen things; a card each would bury the answer. One
+ * list, each entry opening the resource it names, is what the reader needs to
+ * check the work.
  */
-function PipelineProposalCard({
-	pipeline,
-	compiled,
+function ChangesCard({
+	changes,
+	onResource,
 }: {
-	pipeline: {
-		slug: string;
-		name: string;
-		description: string | null;
-		graph: { nodes: Array<{ id: string; kind: string; name: string }> };
-		acceptedBy: string | null;
-	};
-	compiled: Array<{ node: string; ok: boolean; detail: string }>;
+	changes: ChatArtifact[];
+	onResource: (kind: string, ref: string) => void;
 }) {
-	const [state, setState] = useState<"pending" | "accepted" | "rejected">(
-		pipeline.acceptedBy ? "accepted" : "pending",
-	);
-	const [busy, setBusy] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-	const nodes = pipeline.graph?.nodes ?? [];
-
-	async function decide(action: "accept" | "reject") {
-		setBusy(true);
-		setError(null);
-		try {
-			if (action === "accept") {
-				await api.post(`/api/pipelines/${pipeline.slug}/accept`);
-				setState("accepted");
-			} else {
-				await api.del(`/api/pipelines/${pipeline.slug}`);
-				setState("rejected");
-			}
-		} catch (exc) {
-			setError((exc as Error).message);
-		} finally {
-			setBusy(false);
-		}
-	}
-
+	if (changes.length === 0) return null;
 	return (
-		<div className="card fn-proposal-card">
-			<div className="row" style={{ gap: 8, alignItems: "flex-start" }}>
-				<span className="rp-glyph" aria-hidden>
-					⑄
-				</span>
-				<div style={{ minWidth: 0, flex: "1 1 auto" }}>
-					<div className="row" style={{ gap: 6 }}>
-						<strong>{pipeline.name}</strong>
-						<span className={`chip ${state === "accepted" ? "good" : state === "rejected" ? "bad" : "warn"}`}>
-							{state === "accepted" ? "accepted" : state === "rejected" ? "rejected" : "proposed"}
-						</span>
-						<span className="chip mono">{nodes.length} nodes</span>
-					</div>
-					<p className="muted" style={{ margin: "3px 0 0", fontSize: 11.5 }}>
-						{pipeline.description || "No description."}
-					</p>
-
-					{/* The graph as a line, which is how a pipeline reads. */}
-					<p className="mono" style={{ margin: "6px 0 0", fontSize: 11 }}>
-						{nodes.map((node) => node.name).join("  →  ")}
-					</p>
-
-					{/* Anything the compiler flagged. A node that compiles but
-					    computes nothing is the failure worth surfacing here. */}
-					{compiled
-						.filter((entry) => !entry.ok || entry.detail.includes("computes nothing"))
-						.map((entry) => (
-							<p
-								key={entry.node}
-								className="muted"
-								style={{ margin: "4px 0 0", fontSize: 11 }}
-							>
-								⚠ {entry.node}: {entry.detail}
-							</p>
-						))}
-
-					{error && (
-						<p className="muted" style={{ margin: "5px 0 0", fontSize: 11, color: "var(--bad)" }}>
-							{error}
-						</p>
-					)}
-
-					<p className="muted" style={{ margin: "5px 0 0", fontSize: 11 }}>
-						{state === "accepted"
-							? "Accepted. You can run it from the Pipeline builder."
-							: state === "rejected"
-								? "Rejected and removed."
-								: "Nothing has run. Accepting makes it runnable."}
-					</p>
-				</div>
-
-				<div className="col" style={{ gap: 5, marginLeft: "auto" }}>
-					{state === "pending" && (
-						<>
-							<button className="btn sm primary" onClick={() => decide("accept")} disabled={busy}>
-								Accept
-							</button>
-							<Link className="btn sm" to="/pipeline">
-								Edit
-							</Link>
-							<button className="btn sm ghost" onClick={() => decide("reject")} disabled={busy}>
-								Reject
-							</button>
-						</>
-					)}
-					{state === "accepted" && (
-						<Link className="btn sm primary" to="/pipeline">
-							Open
-						</Link>
-					)}
-				</div>
+		<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card-head">
+				<h3>Built in this turn</h3>
+				<span className="sub">{changes.length} change{changes.length === 1 ? "" : "s"}</span>
 			</div>
+			<ul className="rb-lineage-list" style={{ margin: 0 }}>
+				{changes.map((change, index) => {
+					const kind = String(change.change);
+					const label = CHANGE_LABELS[kind] ?? { verb: "Changed", glyph: "▫" };
+					const ref = String(change.apiName);
+					return (
+						<li key={`${kind}-${ref}-${index}`}>
+							<span aria-hidden>{label.glyph}</span> <span className="muted">{label.verb}</span>{" "}
+							<button type="button" className="res-chip" onClick={() => onResource(kind, ref)}>
+								{kind === "dataset" ? ref.split(".").pop() : ref}
+							</button>
+							{change.detail ? <span className="muted"> · {String(change.detail)}</span> : null}
+						</li>
+					);
+				})}
+			</ul>
 		</div>
 	);
 }
@@ -918,25 +823,8 @@ function ArtifactView({
 		return proposal?.id ? <ProposalArtifact id={proposal.id} onApproved={onApproved} /> : null;
 	}
 
-	// A drafted pipeline. Accept / Edit / Reject, as §18 asks - and the graph
-	// is summarised inline so the decision can be made without leaving the
-	// conversation for a canvas.
-	if (artifact.kind === "pipelineProposal") {
-		const pipeline = artifact.pipeline as {
-			slug: string;
-			name: string;
-			description: string | null;
-			graph: { nodes: Array<{ id: string; kind: string; name: string }> };
-			acceptedBy: string | null;
-		};
-		const compiled = (artifact.compiled as Array<{ node: string; ok: boolean; detail: string }>) ?? [];
-		return (
-			<PipelineProposalCard pipeline={pipeline} compiled={compiled} />
-		);
-	}
-
-	// A drafted metric. Deliberately not rendered as a finished result: it
-	// computes nothing until someone approves it, so the card is an invitation
+	// A drafted function. Deliberately not rendered as a finished result: it
+	// computes nothing until an admin approves it, so the card is an invitation
 	// to review rather than a report of something done.
 	if (artifact.kind === "functionProposal") {
 		const fn = artifact.function as {
@@ -1085,25 +973,78 @@ function ArtifactView({
 		);
 	}
 
-	if (artifact.kind === "lineage") {
-		const byLayer = (artifact.upstreamByLayer as Record<string, string[]>) ?? {};
+	// The plan the assistant is working through. Steps render with their live
+	// status, because a plan only earns its place on the screen while it is
+	// visibly being followed - a finished list of ticks is an answer, not a plan.
+	if (artifact.kind === "plan" && artifact.plan) {
+		const plan = artifact.plan as {
+			title: string;
+			background?: string | null;
+			status: string;
+			steps: Array<{ description: string; status: string }>;
+		};
+		const glyph: Record<string, string> = {
+			pending: "○",
+			in_progress: "◐",
+			done: "●",
+			skipped: "◌",
+		};
 		return (
 			<div className="card" style={{ background: "var(--surface-2)" }}>
 				<div className="card-head">
-					<h3>Lineage for {String(artifact.subject)}</h3>
-					<Link className="btn sm" to="/lineage" style={{ marginLeft: "auto" }}>
-						Open lineage graph
-					</Link>
+					<h3>Plan · {plan.title}</h3>
+					<span className="rp-rows mono" style={{ marginLeft: "auto" }}>
+						{plan.status}
+					</span>
 				</div>
-				<dl className="kv">
-					{Object.entries(byLayer).map(([layer, labels]) => (
-						<div key={layer} style={{ display: "contents" }}>
-							<dt>{layer}</dt>
-							<dd className="secondary">{labels.join(", ")}</dd>
-						</div>
+				{plan.background && <p className="secondary">{plan.background}</p>}
+				<ol style={{ margin: "8px 0 0", paddingLeft: 4, listStyle: "none" }}>
+					{plan.steps.map((step, index) => (
+						<li key={index} style={{ padding: "3px 0" }}>
+							<span aria-hidden style={{ marginRight: 8 }}>
+								{glyph[step.status] ?? "○"}
+							</span>
+							<span className={step.status === "done" ? "secondary" : ""}>
+								{step.description}
+							</span>
+						</li>
 					))}
-				</dl>
+				</ol>
 			</div>
+		);
+	}
+
+	if (artifact.kind === "todos" && Array.isArray(artifact.todos)) {
+		const todos = artifact.todos as Array<{ text: string; status: string }>;
+		if (!todos.length) return null;
+		return (
+			<div className="card" style={{ background: "var(--surface-2)" }}>
+				<div className="card-head">
+					<h3>Follow-ups</h3>
+				</div>
+				<ul style={{ margin: "8px 0 0", paddingLeft: 20 }}>
+					{todos.map((todo, index) => (
+						<li
+							key={index}
+							className={todo.status === "done" ? "secondary" : ""}
+							style={{ padding: "2px 0" }}
+						>
+							{todo.status === "done" ? "✓ " : ""}
+							{todo.text}
+						</li>
+					))}
+				</ul>
+			</div>
+		);
+	}
+
+	// A mode switch is worth one quiet line in the transcript: it explains why
+	// the next answer was shaped by a different set of tools.
+	if (artifact.kind === "modeChange" && artifact.mode) {
+		return (
+			<p className="muted" style={{ fontSize: 12, margin: "8px 0" }}>
+				↳ switched to the <strong>{String(artifact.label ?? artifact.mode)}</strong> mode
+			</p>
 		);
 	}
 

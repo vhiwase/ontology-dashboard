@@ -251,12 +251,12 @@ describe("space roles", () => {
 	});
 
 	it("refuses features that run caller-written SQL in a personal workspace", () => {
-		expect(personalSpaceRefusal("POST", "/pipelines", self, own)).toMatch(/not available in a personal workspace/);
-		expect(personalSpaceRefusal("POST", "/functions", self, own)).not.toBeNull();
+		expect(personalSpaceRefusal("POST", "/functions", self, own)).toMatch(/not available in a personal workspace/);
+		expect(personalSpaceRefusal("PATCH", "/functions/revenue", self, own)).not.toBeNull();
 		expect(personalSpaceRefusal("GET", "/spaces/database", self, own)).not.toBeNull();
 		// Metrics, links and combinations are compiled from the ontology.
 		expect(personalSpaceRefusal("POST", "/proposals", self, own)).toBeNull();
-		expect(personalSpaceRefusal("POST", "/pipelines", self, shared("editor"))).toBeNull();
+		expect(personalSpaceRefusal("POST", "/functions", self, shared("editor"))).toBeNull();
 	});
 });
 

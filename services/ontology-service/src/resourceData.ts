@@ -1,22 +1,17 @@
 /**
  * The data behind any workspace resource, one page at a time.
  *
- * The resource preview used to show rows only for datasets. An object type
- * with four real objects showed none; a metric, a link, an action type, a
- * connection and a pipeline showed nothing at all - even though every one of
- * them has real data behind it. This module answers "what does this contain"
- * for every kind, and answers it with the thing that genuinely IS its content:
+ * This module answers "what does this contain" for every kind of resource, and
+ * answers it with the thing that genuinely IS its content:
  *
- *   dataset, object type, metric  the rows of the backing view
+ *   dataset, object type, metric  the rows of the synced table behind it
  *   link type                     the link instances: source -> target pairs
  *   action type                   its execution log
- *   connection                    the tables and views in that database
- *   pipeline                      its latest run's output table
- *   dashboard                     its widgets and the view each one reads
+ *   connection                    the views and tables in that database
+ *   dashboard                     its widgets and the dataset each one reads
  *
  * Every page reports its `source`, so the reader can always see what the rows
- * were read from - tms_views.v_kpi_mode_mix, pipeline_out.lane_volume_analytics__out -
- * rather than taking a grid on trust.
+ * were read from - connection_raw.<table> - rather than taking a grid on trust.
  *
  * ── on safety ───────────────────────────────────────────────────────────────
  * Relation names come from the registry or from the platform's own tables,
@@ -250,7 +245,7 @@ async function actionRelation(apiName: string): Promise<Relation> {
  * Needed where the rows do not come from this database at all — a connection's
  * catalogue is read from the host it points at — so the sort, the search and
  * the paging happen here instead of in a query. The sets are small: a
- * catalogue is hundreds of rows, a repository is tens of files.
+ * catalogue is hundreds of rows, an action's log a handful.
  */
 function pageFromRows(
 	rows: Array<Record<string, unknown>>,
@@ -339,26 +334,23 @@ async function connectionPage(resourceId: number, request: DataQuery): Promise<D
 			note:
 				"Every table and view this connection's user can read. estimated_rows is the " +
 				"planner's statistic; it is blank for views, which store no rows, and for " +
-				"tables not yet analysed. Declare a sync against one of these to bring it across.",
+				"tables not yet analysed. Add a sync on one of these to bring it across as a dataset.",
 		},
 		request,
 	);
 }
 
 /**
- * A table the platform itself wrote: a synced landing table, a built transform,
- * a pipeline output.
+ * A table a sync landed.
  *
- * The published ontology is no longer the only honest source of rows, so
- * `publishedView` alone would refuse a dataset this platform created itself.
- * The relation is still never taken on trust: its schema must be one of the
- * three the platform writes, and it must exist in the catalogue.
+ * `publishedView` alone would refuse a dataset no object type is built on yet.
+ * The relation is still never taken on trust: it must be in connection_raw and
+ * exist in the catalogue.
  */
 async function platformWrittenRelation(qualified: string, note: string | null): Promise<Relation> {
 	if (!(await isPlatformWrittenRelation(qualified))) {
 		throw new BadRequest(
-			`'${qualified}' is not a relation this platform wrote, and the published ontology ` +
-				"does not expose it either.",
+			`'${qualified}' is not a synced dataset, and no object type is built on it either.`,
 		);
 	}
 	return {
@@ -367,95 +359,6 @@ async function platformWrittenRelation(qualified: string, note: string | null): 
 		source: qualified,
 		sourceKind: "output",
 		note,
-	};
-}
-
-/** The files in a repository, which is what a repository resource contains. */
-async function repoPage(slug: string, request: DataQuery): Promise<DataPage> {
-	const rows = await query<{
-		path: string;
-		language: string;
-		lines: string;
-		updated_by: string;
-		updated_at: Date;
-	}>(
-		`SELECT f.path, f.language,
-		        (length(f.content) - length(replace(f.content, E'\\n', '')) + 1)::text AS lines,
-		        f.updated_by, f.updated_at
-		   FROM platform.code_file f
-		   JOIN platform.code_repo r ON r.repo_id = f.repo_id
-		   JOIN platform.space s ON s.space_id = r.space_id
-		  WHERE s.slug = $1 AND r.slug = $2
-		  ORDER BY f.path`,
-		[currentSpace(), slug],
-	);
-
-	return pageFromRows(
-		rows.map((row) => ({
-			path: row.path,
-			language: row.language,
-			lines: Number(row.lines),
-			updated_by: row.updated_by,
-			updated_at: row.updated_at.toISOString(),
-		})),
-		[
-			{ name: "path", type: "text" },
-			{ name: "language", type: "text" },
-			{ name: "lines", type: "int8" },
-			{ name: "updated_by", type: "text" },
-			{ name: "updated_at", type: "timestamptz" },
-		],
-		{
-			source: `platform.code_file (${slug})`,
-			sourceKind: "catalog",
-			defaultSort: "path",
-			note:
-				rows.length === 0
-					? "This repository has no files yet."
-					: "Open the repository to read or edit a file, and to build it.",
-		},
-		request,
-	);
-}
-
-async function pipelineRelation(slug: string): Promise<Relation> {
-	// The most recent successful run's final output. Found through the
-	// platform's own run records, so the table name is one this engine wrote.
-	const output = await queryOne<{ output_table: string; finished_at: Date }>(
-		`SELECT nr.output_table, r.finished_at
-		   FROM platform.pipeline p
-		   JOIN platform.space s ON s.space_id = p.space_id
-		   JOIN platform.pipeline_run r ON r.pipeline_id = p.pipeline_id AND r.status = 'success'
-		   JOIN platform.pipeline_node_run nr ON nr.pipeline_run_id = r.pipeline_run_id
-		  WHERE s.slug = $1 AND p.slug = $2 AND nr.status = 'success' AND nr.output_table IS NOT NULL
-		  ORDER BY r.pipeline_run_id DESC,
-		           (nr.node_kind = 'output') DESC,
-		           nr.pipeline_node_run_id DESC
-		  LIMIT 1`,
-		[currentSpace(), slug],
-	);
-
-	if (!output) {
-		return {
-			sql: "SELECT NULL::text AS nothing WHERE false",
-			params: [],
-			source: "no run yet",
-			sourceKind: "output",
-			note: "This pipeline has not run successfully yet, so it has produced no data. Run it from the Pipeline builder.",
-		};
-	}
-
-	const [schema, table] = output.output_table.split(".");
-	if (schema !== "pipeline_out" || !table) {
-		throw new BadRequest(`Unexpected output location '${output.output_table}'.`);
-	}
-
-	return {
-		sql: `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)}`,
-		params: [],
-		source: output.output_table,
-		sourceKind: "output",
-		note: `The output of the last successful run, finished ${output.finished_at.toISOString().slice(0, 16).replace("T", " ")}.`,
 	};
 }
 
@@ -476,7 +379,7 @@ function dashboardRelation(slug: string): Relation {
 		source: "platform.dashboard",
 		sourceKind: "layout",
 		defaultSort: "position",
-		note: "What this dashboard charts and which view each widget reads. Open it to see the charts.",
+		note: "What this dashboard charts and which dataset each widget reads. Open it to see the charts.",
 	};
 }
 
@@ -506,10 +409,9 @@ export async function resourceData(resourceId: number, request: DataQuery): Prom
 		typeof resource.properties?.sourceView === "string"
 			? String(resource.properties.sourceView)
 			: ref;
-	// A dataset the platform wrote itself — a synced landing table, a built
-	// transform — is readable without a published ontology, because nothing
-	// about it resolves through the registry. Only the kinds that genuinely
-	// need the ontology are gated on it.
+	// A synced dataset is readable before any object type is built on it,
+	// because nothing about it resolves through the registry. Only the kinds
+	// that genuinely need the ontology are gated on it.
 	const platformWritten = resource.kind === "dataset" && (await isPlatformWrittenRelation(backing));
 	const needsOntology =
 		!platformWritten && ["dataset", "objectType", "kpi", "linkType"].includes(resource.kind);
@@ -520,17 +422,11 @@ export async function resourceData(resourceId: number, request: DataQuery): Prom
 	switch (resource.kind) {
 		case "dataset": {
 			if (platformWritten) {
-				const origin = String(resource.properties?.backing ?? "");
 				return page(
 					await platformWrittenRelation(
 						backing,
-						origin === "sync"
-							? `Landed by the '${resource.properties?.syncName ?? "?"}' sync from ` +
-									`${resource.properties?.source ?? "the source"} through the ` +
-									`'${resource.properties?.connectionName ?? "?"}' connection.`
-							: origin === "transform"
-								? `Built by ${resource.properties?.repo ?? "a repository"}/${resource.properties?.repoPath ?? "?"}.`
-								: null,
+						`Synced as it is from ${resource.properties?.source ?? "the source"} through the ` +
+							`'${resource.properties?.connectionName ?? "?"}' connection.`,
 					),
 					request,
 				);
@@ -538,13 +434,11 @@ export async function resourceData(resourceId: number, request: DataQuery): Prom
 			return page(publishedView(backing), request);
 		}
 
-		case "codeRepo":
-			return repoPage(ref, request);
 		case "objectType": {
 			const type = getRegistry().objectTypeByApiName.get(ref);
 			if (!type) throw new NotFound(`No object type '${ref}' in this space.`);
 			return page(
-				publishedView(type.sourceView, `Every ${type.apiName} object, read from its backing view.`),
+				publishedView(type.sourceView, `Every ${type.apiName} object, read from the dataset it was created from.`),
 				request,
 			);
 		}
@@ -566,8 +460,6 @@ export async function resourceData(resourceId: number, request: DataQuery): Prom
 			return page(await actionRelation(ref), request);
 		case "connection":
 			return connectionPage(resourceId, request);
-		case "pipeline":
-			return page(await pipelineRelation(ref), request);
 		case "dashboard":
 			return page(dashboardRelation(ref), request);
 		default:

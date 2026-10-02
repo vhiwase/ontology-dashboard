@@ -23,9 +23,10 @@ DECLARE
         'v_entity_relationship', 'v_transportation_mode', 'v_unit_of_measure',
         'v_order', 'v_shipment', 'v_transport', 'v_transport_leg',
         'v_transport_stop', 'v_stop_event', 'v_handling_unit',
-        -- The account scorecard, carrier scorecard and on-time views were
-        -- withdrawn with the simulated execution data (migration 0018) and are
-        -- no longer created by 05_kpi_views.sql.
+        -- The eight KPI views that exist after migrations 0018/0019: the
+        -- carrier scorecard, on-time performance and account scorecard were
+        -- withdrawn with the simulated execution data and are deliberately
+        -- NOT expected here.
         'v_kpi_order_volume_daily', 'v_kpi_lane_performance',
         'v_kpi_shipment_status_funnel', 'v_kpi_freight_spend_monthly',
         'v_kpi_facility_throughput', 'v_kpi_mode_mix',

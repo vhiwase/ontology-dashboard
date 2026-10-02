@@ -2,8 +2,8 @@
  * The resources registered in the current space, shared by the nav badges and
  * the resource browser.
  *
- * One fetch per space rather than one per component: eight nav badges each
- * loading the project tree would be eight identical requests on every page.
+ * One load per space rather than one per component: every nav badge loading
+ * the project trees would be the same requests repeated on every page.
  * Deleting a resource calls refresh(), so the badge beside "Datasets" drops
  * the moment a dataset goes rather than on the next page load.
  */
@@ -28,6 +28,7 @@ export interface BrowseResource {
 	targetRef: string | null;
 	backingView: string | null;
 	folderId: number | null;
+	properties: Record<string, unknown>;
 	updatedAt: string;
 }
 
@@ -57,22 +58,23 @@ export function ResourceProvider({ children }: { children: ReactNode }) {
 	const refresh = useCallback(async () => {
 		setLoading(true);
 		try {
-			// The first project in the space. Choosing among projects is what the
-			// Spaces page is for; the nav shows one workspace.
+			// Every project in the space: a dataset lands in its connection's
+			// project and the ontology's cards in the space's oldest one, so
+			// reading only one project would hide whatever lives in the others.
 			const projects = await api.get<Array<{ slug: string; name: string }>>(
 				`/api/spaces/${spaceSlug}/projects`,
 			);
-			const first = projects[0];
-			if (!first) {
-				setResources([]);
-				setProjectName(null);
-				return;
-			}
-			const tree = await api.get<{ resources: BrowseResource[] }>(
-				`/api/spaces/${spaceSlug}/projects/${first.slug}/tree`,
+			const trees = await Promise.all(
+				projects.map((project) =>
+					api.get<{ resources: BrowseResource[] }>(
+						`/api/spaces/${spaceSlug}/projects/${project.slug}/tree`,
+					),
+				),
 			);
-			setResources(tree.resources);
-			setProjectName(first.name);
+			setResources(trees.flatMap((tree) => tree.resources));
+			setProjectName(
+				projects.length === 0 ? null : projects.length === 1 ? projects[0]!.name : `${projects.length} projects`,
+			);
 		} catch (exc) {
 			// A space with nothing published has nothing to count. That is a
 			// normal state, not a failure worth surfacing in the navigation.

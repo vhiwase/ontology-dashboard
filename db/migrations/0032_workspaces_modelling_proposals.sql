@@ -87,10 +87,14 @@ CREATE INDEX IF NOT EXISTS ix_credential_space ON platform.credential (space_id)
 
 -- ── provenance of ontology objects ──────────────────────────────────────────
 
+-- Rows already there came from the retired generator; from here on a type is
+-- authored by hand or by the assistant (the default), modelled automatically
+-- when a table is imported, or a combination of linked types.
 ALTER TABLE platform.object_type ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'pipeline';
+ALTER TABLE platform.object_type ALTER COLUMN origin SET DEFAULT 'authored';
 ALTER TABLE platform.object_type DROP CONSTRAINT IF EXISTS object_type_origin_check;
 ALTER TABLE platform.object_type
-    ADD CONSTRAINT object_type_origin_check CHECK (origin IN ('pipeline','modelled','combination'));
+    ADD CONSTRAINT object_type_origin_check CHECK (origin IN ('pipeline','authored','modelled','combination'));
 -- The dataset resource a modelled type was built from, so the two can be
 -- shown together and the type rebuilt when the dataset is re-synced.
 ALTER TABLE platform.object_type ADD COLUMN IF NOT EXISTS dataset_resource_id BIGINT;
@@ -107,14 +111,15 @@ ALTER TABLE platform.link_type
 
 -- ── metrics ─────────────────────────────────────────────────────────────────
 
--- Equality filters baked into the definition: "revenue from completed orders"
--- is sum(amount) WHERE status = 'completed', and the filter is part of what
--- the metric means rather than something every chart has to remember.
-ALTER TABLE platform.kpi_definition ADD COLUMN IF NOT EXISTS base_filters JSONB NOT NULL DEFAULT '{}'::jsonb;
+-- A metric's own filters ("revenue from completed orders") are the
+-- conditions column of 0031. Where it came from: the retired catalogue,
+-- authored on an object type, modelled with an imported table, or approved
+-- from a proposal.
 ALTER TABLE platform.kpi_definition ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'catalogue';
+ALTER TABLE platform.kpi_definition ALTER COLUMN origin SET DEFAULT 'authored';
 ALTER TABLE platform.kpi_definition DROP CONSTRAINT IF EXISTS kpi_definition_origin_check;
 ALTER TABLE platform.kpi_definition
-    ADD CONSTRAINT kpi_definition_origin_check CHECK (origin IN ('catalogue','modelled','proposal'));
+    ADD CONSTRAINT kpi_definition_origin_check CHECK (origin IN ('catalogue','authored','modelled','proposal'));
 ALTER TABLE platform.kpi_definition ADD COLUMN IF NOT EXISTS object_type_rid TEXT;
 ALTER TABLE platform.kpi_definition ADD COLUMN IF NOT EXISTS created_by TEXT;
 

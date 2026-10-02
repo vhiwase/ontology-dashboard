@@ -18,7 +18,7 @@ interface ColumnMeta {
 }
 
 // Metric views are not object types, so their columns are not in the registry.
-// Cached on first use; the set only changes when the pipeline reruns.
+// Cached on first use; cleared when a sync rebuilds a dataset or the ontology changes.
 const columnCache = new Map<string, Map<string, ColumnMeta>>();
 
 async function metricViewColumns(view: string): Promise<Map<string, ColumnMeta>> {
@@ -141,8 +141,8 @@ export interface KpiExecuteResult {
 	appliedFilters: Record<string, unknown>;
 	/** The grain of the dimension when it is a date grouped by period. */
 	dimensionGrain: TimeGrain | null;
-	/** Filters that are part of the metric's own definition. */
-	baseFilters: Record<string, unknown>;
+	/** The metric's own conditions, applied to every computation of it. */
+	conditions: Record<string, unknown>;
 	/** count, sum, avg, ...: whether the parts of a breakdown add up to the total. */
 	aggregation?: string;
 	trend?: KpiTrend | null;
@@ -370,9 +370,10 @@ export async function executeKpiWith(
 	assertSimulationAllowed(`KPI ${kpi.apiName}`, kpi.dependsOnSimulation);
 	const columns = await metricViewColumns(kpi.sourceView);
 	const expression = valueExpression(kpi, columns);
-	// The metric's own filters first, then the caller's: both hold, so a
+	// The metric's own conditions first, then the caller's: both hold, so a
 	// request cannot widen "revenue from completed orders" to every order.
-	const base = buildFilters(kpi, columns, kpi.baseFilters ?? {});
+	const conditions = kpi.conditions ?? {};
+	const base = buildFilters(kpi, columns, conditions);
 	const requested = buildFilters(kpi, columns, request.filters ?? {}, base.values.length);
 	const predicates = [...base.predicates, ...requested.predicates];
 	const whereSql = predicates.length ? `WHERE ${predicates.join(" AND ")}` : "";
@@ -532,7 +533,7 @@ export async function executeKpiWith(
 		sql: dimension ? seriesSql : totalSql,
 		appliedFilters: applied,
 		dimensionGrain: dimensionRef?.grain ?? null,
-		baseFilters: kpi.baseFilters ?? {},
+		conditions,
 		aggregation: kpi.aggregation,
 		trend,
 		dataThrough,
@@ -582,13 +583,16 @@ export async function dimensionValues(
 	const column = dimensionSql(kpi, ref, columns);
 	// Periods are offered in time order; categories by how common they are.
 	const order = ref.grain ? `${column} DESC` : `count(*) DESC, ${column}`;
+	// Only the values the metric can actually show: its conditions apply here too.
+	const own = buildFilters(kpi, columns, kpi.conditions ?? {});
 	const rows = await query<{ value: string; n: string }>(
 		`SELECT ${column}::text AS value, count(*)::bigint AS n
 		   FROM ${quoteQualified(kpi.sourceView)}
-		  WHERE ${quoteIdentifier(ref.column)} IS NOT NULL
+		  WHERE ${[...own.predicates, `${quoteIdentifier(ref.column)} IS NOT NULL`].join(" AND ")}
 		  GROUP BY ${column}
 		  ORDER BY ${order}
 		  LIMIT ${clampLimit(limit, 100, 1000)}`,
+		own.values,
 	);
 	return rows.map((r) => ({ value: r.value, count: Number(r.n) }));
 }

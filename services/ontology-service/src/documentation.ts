@@ -7,14 +7,15 @@
  * already knows and can stand behind —
  *
  *   * every metric's definition, business question and coverage caveat;
- *   * every object type, with its properties, links and backing view;
+ *   * every object type, with its properties, links and dataset;
  *   * every action, with its permissions and effects;
  *   * a small set of written pages for the things that are true of the
- *     platform rather than of any one object — simulated data, roles, spaces.
+ *     platform rather than of any one object - the data flow, authoring,
+ *     data quality, roles, spaces, actions and schedules.
  *
  * It is generated from the live registry rather than stored, so it cannot go
  * stale against the ontology it describes. That is the whole point: a cited
- * caveat about simulated data has to be the caveat that is actually in force.
+ * caveat about the data has to be the caveat that is actually in force.
  */
 
 import { currentSpace, getRegistry, hasOntology, NotFound } from "./registry";
@@ -54,59 +55,126 @@ export interface SearchHit {
  */
 const PLATFORM_PAGES: Document[] = [
 	{
-		path: "platform/simulated-data",
-		title: "What this snapshot measures, and what it cannot",
-		category: "Data quality",
+		path: "platform/data-flow",
+		title: "How data becomes an ontology",
+		category: "Platform",
 		summary:
-			"Everything on this platform is measured. What the snapshot does not carry is named here rather than filled in.",
+			"PostgreSQL connection, scheduled sync, dataset as it is, then object types with links, actions, metrics and functions.",
 		sections: [
 			{
-				title: "What is measured",
+				title: "The flow",
 				body:
-					"This platform runs on a captured planning snapshot of a real TMS. Orders, " +
-					"shipments, transports, stops, the party master and the configuration behind " +
-					"them are real, measured records taken from the source system. Counts, weights, " +
-					"piece counts, planned rates and anything derived only from those are measured.",
+					"A PostgreSQL CONNECTION names a host and the secret that holds its password. A " +
+					"SYNC copies one view or table from it into a DATASET here (connection_raw.<table>) " +
+					"exactly as it is: same columns, same rows, types mapped through a fixed table. A " +
+					"SCHEDULE decides how often a sync runs - every 20 minutes, 2 hours, 1 day, 8 " +
+					"days. OBJECT TYPES are then created from datasets, one per dataset, with a " +
+					"property per column; LINKS, ACTIONS and METRICS are defined on object types, and " +
+					"FUNCTIONS compute over datasets.",
 			},
 			{
-				title: "What the snapshot does not carry",
+				title: "Snapshots, not appends",
 				body:
-					"It is a PLANNING snapshot: it records intent, not outcome. There are no " +
-					"recorded arrivals (0 of 122 stops), no execution actuals (0 of 61 transports " +
-					"have an actualStart or actualEnd), no leg distance (every captured leg reports " +
-					"0 m) and no carrier assignment (0 of 90 orders carry a carrierId). Only 14 of " +
-					"61 shipments carry a charge. On-time performance, dwell, transit time, cost " +
-					"per kilometre, carrier scorecards and margin therefore cannot be computed from " +
-					"it at all.",
+					"Every sync rebuilds its dataset from the source, so a dataset is what the source " +
+					"holds now and never keeps rows the source has deleted. A run reads at most its row " +
+					"limit (50,000 by default) and says truncated when it stopped there. Columns whose " +
+					"type has no local equivalent land as text and are listed on the dataset.",
 			},
 			{
-				title: "What was done about that",
+				title: "What a sync refreshes",
 				body:
-					"For a time the pipeline generated those figures into a separate tms_sim schema " +
-					"so the catalogue had something to display, and 17 of 31 metrics rested on " +
-					"invented numbers while looking authoritative. Migration 0018 removed the " +
-					"generated columns, the three metric views composed wholly of them, and the " +
-					"schema itself. The pipeline's second stage now reports the coverage gaps " +
-					"instead of filling them, and PIPELINE_SIMULATE_EXECUTION=true refuses rather " +
-					"than regenerating. Three read-only what-if actions went with it.",
+					"After each run the object types built on that dataset get their new object counts. " +
+					"If the source dropped a column an object type's property uses, the run names that " +
+					"property rather than hiding it: the type still describes the old shape until the " +
+					"property is removed or the source restores the column.",
+			},
+		],
+	},
+	{
+		path: "platform/building-the-ontology",
+		title: "Creating object types, links, actions, metrics and functions",
+		category: "Platform",
+		summary: "What each authoring step checks against the data before anything is stored.",
+		sections: [
+			{
+				title: "Object types",
+				body:
+					"Created from a dataset. Profiling it first gives real distinct and null counts, " +
+					"sample values, the columns that could be a primary key, and a suggested role per " +
+					"column. The primary key must be unique and never null in the data as it stands, or " +
+					"the type is refused with the counts. A measure must be numeric: a key, a code, a " +
+					"year or a coordinate is a number that identifies rather than measures.",
 			},
 			{
-				title: "Columns that are NULL rather than absent",
+				title: "Links",
 				body:
-					"actual_start_at, total_distance_km and charge_per_kg are kept and read NULL. " +
-					"They are genuine columns awaiting genuine data and will fill themselves the " +
-					"day the TMS starts sending actuals. A column that could only ever have held an " +
-					"invented value was removed instead, because leaving one in place is an " +
-					"invitation to fill it in later.",
+					"Drawn between a property of one object type and the key of another. The share of " +
+					"values that really resolve is measured and stored as the match ratio, and a link " +
+					"where no value matches is refused. Suggested links are columns named like another " +
+					"type's key, measured the same way.",
 			},
 			{
-				title: "The lock that is still in place",
+				title: "Actions",
 				body:
-					"ALLOW_SIMULATED_DATA=false makes the platform refuse rather than caveat: any " +
-					"metric, widget or action flagged dependsOnSimulation returns HTTP 409 with an " +
-					"explanation instead of a number. Nothing carries that flag today, so it gates " +
-					"nothing - which is the state it is meant to be in, and it stays so that a " +
-					"generated figure cannot reappear quietly.",
+					"Declared on an object type, with typed parameters and the roles allowed to run it. " +
+					"The target's key is always the first parameter. Running one validates, checks the " +
+					"runner's role and records the request in the audit trail as staged.",
+			},
+			{
+				title: "Metrics",
+				body:
+					"An aggregation over one object type: count, count_distinct, sum, avg, min, max, or " +
+					"ratio (sum over sum, never an average of per-row ratios), sliceable by the dimensions " +
+					"named. A new metric is computed once before it is kept; one that does not compute is " +
+					"refused with the database's message.",
+			},
+			{
+				title: "Functions",
+				body:
+					"A single SELECT over datasets for what a metric cannot express. Proposed first, " +
+					"computing nothing, until an admin approves it. It may read only synced datasets - " +
+					"checked against the query planner, not the text - and runs read-only with a time " +
+					"limit.",
+			},
+			{
+				title: "Who may do it",
+				body:
+					"Creating needs the analyst platform role, deleting needs admin. The AI-FDE builds " +
+					"with the signed-in user's token, so it can do exactly what that user can.",
+			},
+		],
+	},
+	{
+		path: "platform/data-quality",
+		title: "What the TMS data measures, and what it cannot",
+		category: "Data quality",
+		summary:
+			"Only measured data is shown. What the source does not carry is named rather than filled in.",
+		sections: [
+			{
+				title: "The source",
+				body:
+					"The tms_views schema this platform's own database connection reads is a captured " +
+					"PLANNING snapshot of a real TMS: orders, shipments, transports, stops, the party " +
+					"master and the configuration behind them are real records. Counts, weights, piece " +
+					"counts, planned rates and anything derived only from those are measured.",
+			},
+			{
+				title: "What it does not carry",
+				body:
+					"It records intent, not outcome: no recorded arrivals (0 of 122 stops), no execution " +
+					"actuals (0 of 61 transports), no leg distance (every leg reports 0 m) and no carrier " +
+					"assignment (0 of 90 orders). Only 14 of 61 shipments carry a charge. On-time " +
+					"performance, dwell, transit time, cost per kilometre, carrier scorecards and margin " +
+					"cannot be computed from it, and no metric should claim to.",
+			},
+			{
+				title: "The rule",
+				body:
+					"Nothing is simulated, estimated or filled in. A figure that cannot be computed from " +
+					"real data is reported as not measured. Changing data needs explicit approval and goes " +
+					"into a new copy, never the original. ALLOW_SIMULATED_DATA=false refuses anything " +
+					"flagged as resting on generated data with an HTTP 409.",
 			},
 		],
 	},
@@ -120,26 +188,23 @@ const PLATFORM_PAGES: Document[] = [
 				title: "Platform role",
 				body:
 					"viewer, analyst or admin. Decides which API routes a caller may reach at all. " +
-					"viewer reads; analyst additionally creates dashboards, runs pipelines and " +
-					"applies actions; admin additionally reads the audit trail, reloads the registry " +
-					"and deletes. Anything under /api not listed as elevated requires at least viewer, " +
-					"so a route added later is protected by default.",
+					"viewer reads; analyst additionally creates connections, syncs, schedules, object " +
+					"types, links, actions, metrics, function proposals and dashboards, and applies " +
+					"actions; admin additionally approves functions, reads the audit trail and deletes. " +
+					"Anything under /api not listed as elevated requires at least viewer.",
 			},
 			{
 				title: "Ontology role",
 				body:
-					"The business hat declared in the ontology — AdminRole, OperationsManagerRole, " +
-					"DispatcherRole, FinanceRole or AnalystRole. Decides which ACTIONS may be " +
-					"executed, and is what AccessController checks. A dispatcher and a finance user " +
-					"are both analyst on the platform but may run different actions, which one column " +
-					"could not express.",
+					"The business hat - AdminRole, OperationsManagerRole, DispatcherRole, FinanceRole or " +
+					"AnalystRole. Decides which ACTIONS may be executed: an action names the roles allowed " +
+					"to run it, the admin may run all of them, and AnalystRole may run none.",
 			},
 			{
 				title: "Who the assistant acts as",
 				body:
-					"The assistant queries the ontology as the signed-in user, forwarding their token. " +
-					"Its reads are bound by their permissions and any action it applies is recorded " +
-					"against them in the audit trail, not against the assistant.",
+					"The assistant calls the platform as the signed-in user, forwarding their token. Its " +
+					"reads and writes are bound by their permissions and recorded against them.",
 			},
 		],
 	},
@@ -147,28 +212,21 @@ const PLATFORM_PAGES: Document[] = [
 		path: "platform/spaces",
 		title: "Spaces and what is scoped to them",
 		category: "Platform",
-		summary: "One space per environment, and which things differ between them.",
+		summary: "One space per environment, each with its own connections, datasets and ontology.",
 		sections: [
 			{
 				title: "The spaces",
 				body:
 					"Sandbox, Development, Staging and Production exist from the start, one per " +
-					"environment. Sandbox is where work begins; the others are where it is promoted to.",
+					"environment. The sandbox comes with the platform's own database registered as a " +
+					"connection.",
 			},
 			{
 				title: "What is per-space",
 				body:
-					"Pipelines, projects, folders, resources, dashboards and conversations. These are " +
-					"things people make, and two environments should be able to hold different ones. " +
-					"A slug is unique within its space, so the same pipeline or dashboard promoted to " +
-					"production keeps its name.",
-			},
-			{
-				title: "What is shared",
-				body:
-					"The ontology — object types, link types, action types and metrics. There is one " +
-					"published ontology per database, generated wholesale by the pipeline. Switching " +
-					"space does not change it.",
+					"Everything people make: connections, syncs, schedules, datasets, the ontology " +
+					"(object types, links, actions, metrics), functions, dashboards and conversations. " +
+					"Every space starts with an empty ontology.",
 			},
 		],
 	},
@@ -176,16 +234,15 @@ const PLATFORM_PAGES: Document[] = [
 		path: "platform/actions",
 		title: "How actions behave",
 		category: "Platform",
-		summary: "Why a mutating action is staged rather than executed.",
+		summary: "Why an action is staged rather than written back.",
 		sections: [
 			{
 				title: "Staged, not executed",
 				body:
-					"This platform reads a captured snapshot and has no write-back endpoint to the " +
-					"source TMS. A mutating action validates its parameters, checks the caller's " +
-					"ontology role and records an audit row with status 'staged'. Nothing is sent " +
-					"anywhere. 'succeeded' is reserved for read-only actions, which really do run and " +
-					"return a computed result.",
+					"A dataset is a copy of the source, and this platform has no write-back to it. An " +
+					"action validates its parameters, checks the caller's ontology role and records an " +
+					"audit row with status staged, carrying the exact request that would be sent. " +
+					"Nothing is changed anywhere.",
 			},
 			{
 				title: "Audit",
@@ -193,6 +250,34 @@ const PLATFORM_PAGES: Document[] = [
 					"Every apply writes to the action audit trail with the actor, their ontology role, " +
 					"the parameters, the validation outcome and whether the assistant initiated it. " +
 					"Identity comes from the verified token, never from the request body.",
+			},
+		],
+	},
+	{
+		path: "platform/schedules",
+		title: "Schedules: how often a sync runs",
+		category: "Platform",
+		summary: "One cadence per sync - every 20 minutes, 2 hours, a day, 8 days - and what a run records.",
+		sections: [
+			{
+				title: "What a schedule is",
+				body:
+					"An interval on one sync, written as 20m, 2h, 1d, 8d or 1w, at least a minute and at " +
+					"most a year. The ontology service's background loop runs each sync when due. Setting " +
+					"a sync back to manual removes its schedule.",
+			},
+			{
+				title: "A scheduled run is a normal run",
+				body:
+					"The scheduler calls the same sync the Run button does, so a scheduled run lands in " +
+					"the same run history. Run now fires at once without moving the next scheduled run.",
+			},
+			{
+				title: "Failure keeps the cadence",
+				body:
+					"A failing sync writes a failed schedule run with the error and updates the " +
+					"schedule's last status, and the cadence continues, so a broken source is visible " +
+					"rather than a silent gap.",
 			},
 		],
 	},
@@ -222,10 +307,10 @@ function metricDocs(): Document[] {
 		}
 		if (kpi.dependsOnSimulation) {
 			sections.push({
-				title: "Simulated",
+				title: "Flagged as generated",
 				body:
-					"This metric depends on the seeded execution simulation. It is refused outright " +
-					"when ALLOW_SIMULATED_DATA=false. See the simulated execution data page.",
+					"This metric is flagged as resting on generated data. It is refused outright " +
+					"when ALLOW_SIMULATED_DATA=false. See the data quality page.",
 			});
 		}
 		return {
@@ -255,7 +340,7 @@ function objectTypeDocs(): Document[] {
 			title: "Shape",
 			body:
 				`${type.rowCount.toLocaleString("en-US")} objects, ${type.properties.length} properties. ` +
-				`Primary key ${type.primaryKeyColumn}. Backed by ${type.sourceView}.` +
+				`Primary key ${type.primaryKeyColumn}. Created from the dataset ${type.sourceView}.` +
 				(measures.length
 					? ` Summable measures: ${measures.map((m) => m.apiName).join(", ")}.`
 					: " No summable measures; this type is dimensional."),
@@ -298,8 +383,8 @@ function actionDocs(): Document[] {
 			title: "Behaviour",
 			body: action.isReadOnly
 				? "Read-only. Runs and returns a computed result; changes nothing."
-				: "Mutating, and therefore staged rather than executed. Parameters and permissions " +
-					"are checked and an audit row is written; nothing is sent to the source TMS.",
+				: "Staged rather than executed. Parameters and permissions are checked and an " +
+					"audit row is written; nothing is written back to the source.",
 		});
 		if (targets.length) sections.push({ title: "Acts on", body: targets.join(", ") });
 		if (action.allowedRoles?.length) {
@@ -318,10 +403,9 @@ function actionDocs(): Document[] {
 /**
  * The whole corpus, rebuilt per call so it tracks the live registry.
  *
- * In a space with no published ontology the platform pages still stand — what
- * a space is, which data is simulated, how roles work — so documentation
- * degrades to those rather than failing. The assistant can then still answer
- * "why is this space empty", which is the one question worth asking there.
+ * In a space with nothing authored yet the platform pages still stand - how
+ * data gets in, how an ontology is built, how roles work - so the assistant
+ * can still answer "where do I start", which is the question worth asking.
  */
 export function corpus(): Document[] {
 	if (!hasOntology(currentSpace())) return [...PLATFORM_PAGES];

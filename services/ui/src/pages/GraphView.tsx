@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { type LinkTypeRow, type ObjectTypeSummary, api, isMissingOntology, round } from "../api";
 import { useSpace } from "../SpaceContext";
+import { NoObjectTypesYet } from "../components/ontology/NoObjectTypesYet";
 import { GraphCanvas, type GraphLink, type GraphNode } from "../components/GraphCanvas";
 import {
 	DataTable,
@@ -91,6 +92,7 @@ export function GraphView() {
 		return <NoOntologyHere what="object graph" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
 	if (!types || !links) return <Spinner label="Loading ontology graph" />;
+	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
 		<div className="col" style={{ gap: 12 }}>

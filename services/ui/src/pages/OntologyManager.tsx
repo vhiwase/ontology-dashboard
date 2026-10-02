@@ -1,13 +1,14 @@
 /**
- * Ontology manager: browse and inspect the generated model.
+ * Ontology manager: browse and inspect the object types built from datasets.
  *
  * The properties table shows the semantic role of every column, because that is
- * the thing the generator decided and the thing everything downstream depends on.
+ * what decides what may be summed and grouped, and everything downstream depends on it.
  * The links table shows the match ratio and how each link was discovered, so a
  * partial join is visibly partial rather than looking like a clean arrow.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
 	type LinkTypeRow,
 	type ObjectTypeDetail,
@@ -17,6 +18,7 @@ import {
 	round,
 } from "../api";
 import { useSpace } from "../SpaceContext";
+import { NoObjectTypesYet } from "../components/ontology/NoObjectTypesYet";
 import { ObjectTypeEditor } from "../components/ontology/OntologyEditor";
 import {
 	EditJournal,
@@ -33,11 +35,21 @@ import {
 
 type Tab = "properties" | "links" | "actions" | "raw";
 
+/** GET /api/interfaces — the shared shapes object types declare. */
+interface InterfaceMeta {
+	apiName: string;
+	label: string;
+	description: string | null;
+	requiredAttributes: Array<{ apiName: string; label: string; required: boolean }>;
+	implementors: string[];
+}
+
 export function OntologyManager() {
 	const [types, setTypes] = useState<ObjectTypeSummary[] | null>(null);
 	const [selected, setSelected] = useState<string | null>(null);
 	const [detail, setDetail] = useState<ObjectTypeDetail | null>(null);
 	const [allLinks, setAllLinks] = useState<LinkTypeRow[] | null>(null);
+	const [interfaces, setInterfaces] = useState<InterfaceMeta[]>([]);
 	const [tab, setTab] = useState<Tab>("properties");
 	const [filter, setFilter] = useState("");
 	const [error, setError] = useState<string | null>(null);
@@ -86,11 +98,13 @@ export function OntologyManager() {
 			// Tolerated separately: the journal is context, and failing to load
 			// it should not hide the ontology itself.
 			api.get<OntologyEdit[]>("/api/ontology/edits").catch(() => [] as OntologyEdit[]),
+			api.get<InterfaceMeta[]>("/api/interfaces").catch(() => [] as InterfaceMeta[]),
 		])
-			.then(([typeRows, linkRows, journal]) => {
+			.then(([typeRows, linkRows, journal, interfaceRows]) => {
 				setTypes(typeRows);
 				setAllLinks(linkRows);
 				setEdits(journal);
+				setInterfaces(interfaceRows);
 				setSelected((current) => current ?? typeRows[0]?.apiName ?? null);
 			})
 			.catch((exc: Error) =>
@@ -132,10 +146,14 @@ export function OntologyManager() {
 		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
 	if (!types) return <Spinner label="Loading ontology" />;
+	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
 		<div className="split">
 			<div className="card" style={{ padding: 10 }}>
+				<Link className="btn sm" to="/browse/datasets" style={{ width: "100%", marginBottom: 8 }}>
+					New object type from a dataset
+				</Link>
 				<input
 					placeholder="Filter object types"
 					value={filter}
@@ -361,13 +379,58 @@ export function OntologyManager() {
 						/>
 					</div>
 				)}
+
+				{/* Interfaces are the shared shapes several types declare — the
+				    generated ontology has carried them all along; this renders
+				    them instead of leaving them inside the JSON export. */}
+				{interfaces.length > 0 && (
+					<div className="card">
+						<div className="card-head">
+							<h3>Interfaces</h3>
+							<span className="sub">
+								shapes several object types declare — required attributes every
+								implementor carries
+							</span>
+						</div>
+						<div className="col" style={{ gap: 8 }}>
+							{interfaces.map((iface) => (
+								<div key={iface.apiName} style={{ padding: "6px 0" }}>
+									<div className="row" style={{ gap: 8, alignItems: "baseline" }}>
+										<strong>{iface.label}</strong>
+										<span className="mono muted" style={{ fontSize: 11.5 }}>
+											{iface.apiName}
+										</span>
+										<span className="muted" style={{ fontSize: 11.5 }}>
+											{iface.implementors.length} implementor
+											{iface.implementors.length === 1 ? "" : "s"}
+										</span>
+									</div>
+									{iface.description && (
+										<p className="muted" style={{ fontSize: 12, margin: "2px 0 4px" }}>
+											{iface.description}
+										</p>
+									)}
+									<div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+										{iface.requiredAttributes.map((attr) => (
+											<span key={attr.apiName} className={`chip ${attr.required ? "good" : ""}`}>
+												{attr.apiName}
+												{attr.required ? "" : " (optional)"}
+											</span>
+										))}
+									</div>
+									<div className="muted" style={{ fontSize: 11.5, marginTop: 4 }}>
+										Implemented by: {iface.implementors.join(", ") || "nothing yet"}
+									</div>
+								</div>
+							))}
+						</div>
+					</div>
+				)}
 			</div>
 			<div className="card">
 				<div className="card-head">
-					<h3>Edit journal</h3>
-					<span className="sub">
-						replayed onto every ontology the pipeline publishes afterwards
-					</span>
+					<h3>Change history</h3>
+					<span className="sub">every creation, edit and deletion, with who made it</span>
 				</div>
 				<EditJournal
 					edits={edits}

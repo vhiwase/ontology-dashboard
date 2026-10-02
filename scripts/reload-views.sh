@@ -7,9 +7,9 @@
 #  replaying 04/05 is the only way to pick up a column rename, and it is cheap
 #  because tms_views holds no data of its own.
 #
-#  Nothing outside tms_views depends on it: the platform tables reference views
-#  by name as text, so they survive the drop and the next `pipeline.run` picks up
-#  the new shape.
+#  tms_views is the SOURCE the platform's own connection syncs from. Nothing
+#  on the platform side depends on it directly: a sync names a view as text and
+#  re-reads it on its next run, so re-running the syncs picks up the new shape.
 #
 #  Usage:  ./scripts/reload-views.sh            (via the compose postgres service)
 # ---------------------------------------------------------------------------
@@ -34,5 +34,5 @@ echo "Verifying ..."
 count=$("${PSQL[@]}" -tAc \
     "SELECT count(*) FROM information_schema.views WHERE table_schema='tms_views'")
 echo "Done: ${count// /} views in tms_views."
-echo "Re-run the ontology generator to pick up the new shape:"
-echo "    docker compose run --rm pipeline python -m pipeline.run --skip-ingest"
+echo "Run the syncs of any view that changed (Schedules page, Run now) so their"
+echo "datasets pick up the new shape."

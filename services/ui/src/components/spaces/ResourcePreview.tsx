@@ -1,8 +1,8 @@
 /**
  * The resource preview window.
  *
- * Opening a dataset, an object type, a link, an action, a pipeline or a
- * dashboard shows the same anatomy every time — header, tabs, body — so the
+ * Opening a connection, a dataset, an object type, a link, an action, a metric
+ * or a dashboard shows the same anatomy every time — header, tabs, body — so the
  * shape of the answer does not change with the kind of thing being asked
  * about. Only the tabs that have content for a kind are shown: a link type has
  * no rows to preview, and an empty "Preview" tab is worse than no tab.
@@ -172,7 +172,7 @@ export function ResourcePreview({
 					{preview && !preview.resolved && (
 						<span
 							className="chip rp-stale"
-							title="This resource points at something the ontology no longer publishes. Re-run the pipeline, or delete it."
+							title="This card points at something that no longer exists - deleted, or its dataset dropped. Delete the card."
 						>
 							unresolved
 						</span>
@@ -213,9 +213,9 @@ export function ResourcePreview({
 
 					{preview && !preview.resolved && (
 						<div className="banner warn" style={{ marginBottom: 12 }}>
-							<strong>{preview.resource.targetRef}</strong> is no longer in the published
-							ontology, so there is nothing to show. The pipeline regenerates the ontology
-							on each run, and a resource can outlive what it pointed at.
+							<strong>{preview.resource.targetRef}</strong> no longer exists, so there is
+							nothing to show. A card can outlive what it pointed at - when an object type
+							is deleted, or a dataset's table is dropped.
 						</div>
 					)}
 

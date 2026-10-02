@@ -1528,7 +1528,7 @@ export async function planBoard(
 	// Figures someone named when approving them (an on-time rate, late
 	// orders) come before the ones modelling made on its own.
 	const named = metrics.filter(
-		(k) => k !== lead && k !== count && k.origin === "proposal" && Object.keys(k.baseFilters ?? {}).length === 0,
+		(k) => k !== lead && k !== count && k.origin === "proposal" && Object.keys(k.conditions ?? {}).length === 0,
 	);
 	// A rate leads with its companions (other averages) before totals.
 	const rateLed = lead !== undefined && !isAdditive(lead);

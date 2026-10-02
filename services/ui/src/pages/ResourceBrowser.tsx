@@ -8,10 +8,13 @@
  * per kind, and choosing an entry opens this page.
  *
  * Every resource shows real rows. What those rows are depends on the kind
- * (see resourceData.ts on the server): a metric shows the view it is computed
- * from, a link shows its actual source -> target pairs, a connection lists the
- * tables it can read. "Open full data" pages through all of it in the grid
- * window.
+ * (see resourceData.ts on the server): a dataset shows what its sync copied, a
+ * metric the dataset it is computed from, a link its actual source -> target
+ * pairs, a connection the views it can read. "Open full data" pages through
+ * all of it in the grid window.
+ *
+ * Two kinds carry the next step of the flow on their page: a connection its
+ * syncs and how often each runs, a dataset the object type made from it.
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -20,7 +23,8 @@ import { ApiError, api, session } from "../api";
 import { useResources, type BrowseResource } from "../ResourceContext";
 import { useSpace } from "../SpaceContext";
 import { DataGrid, type DataPage } from "../components/data/DataGrid";
-import { DeletePipelineDialog } from "../components/pipeline/DeletePipelineDialog";
+import { CreateObjectTypeDialog } from "../components/ontology/CreateObjectTypeDialog";
+import { SyncPanel } from "../components/spaces/SyncPanel";
 import { BROWSE_KINDS, RESOURCE_SPECS } from "../components/spaces/resourceKinds";
 import { ConnectionDialog } from "../components/spaces/ConnectionDialog";
 import { Empty, ErrorBanner, Spinner } from "../components/common";
@@ -52,11 +56,9 @@ export function ResourceBrowser() {
 	const [deleting, setDeleting] = useState<number | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [gridOpen, setGridOpen] = useState(false);
-	const [deletingPipeline, setDeletingPipeline] = useState<string | null>(null);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [creating, setCreating] = useState(false);
 	const role = session.user()?.role;
-	const isAdmin = role === "admin";
 	const canWrite = role === "admin" || role === "analyst";
 
 	const items = useMemo(() => {
@@ -130,11 +132,6 @@ export function ResourceBrowser() {
 						New connection
 					</button>
 				)}
-				{entry.kind === "codeRepo" && canWrite && (
-					<a className="btn sm" style={{ margin: "0 8px 8px" }} href="/repos">
-						Open repositories
-					</a>
-				)}
 				<ul className="rb-items">
 					{loading && items.length === 0 && (
 						<li className="muted rb-empty">Loading…</li>
@@ -193,15 +190,12 @@ export function ResourceBrowser() {
 					<ResourceDetail
 						resource={selected}
 						kindLabel={spec.label}
+						canWrite={canWrite}
 						onOpenGrid={() => setGridOpen(true)}
-						// Deleting a PIPELINE, as opposed to unregistering its card.
-						// The x on the card only removes it from the workspace; this
-						// removes the pipeline and lets you choose its outputs.
-						onDeletePipeline={
-							entry.kind === "pipeline" && isAdmin && selected.targetRef
-								? () => setDeletingPipeline(selected.targetRef)
-								: undefined
-						}
+						onChanged={(message) => {
+							setNotice(message);
+							void refresh();
+						}}
 					/>
 				) : (
 					<div className="card">
@@ -227,21 +221,6 @@ export function ResourceBrowser() {
 				</div>
 			)}
 
-			<DeletePipelineDialog
-				slug={deletingPipeline}
-				name={selected?.name ?? ""}
-				onClose={() => setDeletingPipeline(null)}
-				onDeleted={async (result) => {
-					setDeletingPipeline(null);
-					await refresh();
-					setNotice(
-						result.droppedOutputs.length > 0
-							? `Deleted ${result.deleted} and dropped ${result.droppedOutputs.length} output table${result.droppedOutputs.length === 1 ? "" : "s"}.`
-							: `Deleted ${result.deleted}.`,
-					);
-				}}
-			/>
-
 			<DataGrid
 				resourceId={gridOpen && selected ? selected.id : null}
 				title={selected?.name ?? ""}
@@ -254,17 +233,21 @@ export function ResourceBrowser() {
 function ResourceDetail({
 	resource,
 	kindLabel,
+	canWrite,
 	onOpenGrid,
-	onDeletePipeline,
+	onChanged,
 }: {
 	resource: BrowseResource;
 	kindLabel: string;
+	canWrite: boolean;
 	onOpenGrid: () => void;
-	onDeletePipeline?: () => void;
+	onChanged: (message: string) => void;
 }) {
 	const [data, setData] = useState<DataPage | null>(null);
 	const [preview, setPreview] = useState<Preview | null>(null);
 	const [error, setError] = useState<string | null>(null);
+	const [modelling, setModelling] = useState(false);
+	const modelledAs = (preview?.lineage?.downstream ?? []).filter((entry) => entry.kind === "objectType");
 
 	useEffect(() => {
 		setData(null);
@@ -290,18 +273,19 @@ function ResourceDetail({
 						<div className="rp-kind">{kindLabel.toUpperCase()}</div>
 						<h3 style={{ fontSize: 16, margin: "2px 0 0" }}>{resource.name}</h3>
 					</div>
-					{onDeletePipeline && (
+					{resource.kind === "dataset" && canWrite && (
 						<button
-							className="btn sm ghost danger"
+							className="btn sm primary"
 							style={{ marginLeft: "auto" }}
-							onClick={onDeletePipeline}
+							onClick={() => setModelling(true)}
+							title="Model this dataset as an object type, a property per column"
 						>
-							Delete pipeline…
+							Create object type
 						</button>
 					)}
 					<button
-						className="btn sm primary"
-						style={{ marginLeft: onDeletePipeline ? 6 : "auto" }}
+						className="btn sm"
+						style={{ marginLeft: resource.kind === "dataset" && canWrite ? 6 : "auto" }}
 						onClick={onOpenGrid}
 						disabled={!data || data.total === 0}
 						title={data && data.total === 0 ? "There are no rows to open." : undefined}
@@ -315,6 +299,25 @@ function ResourceDetail({
 					</p>
 				)}
 				<dl className="kv">
+					{resource.kind === "dataset" && (
+						<>
+							<dt>Synced from</dt>
+							<dd className="mono">
+								{String(resource.properties.source ?? "—")} via{" "}
+								{String(resource.properties.connectionName ?? "?")}
+							</dd>
+							<dt>Last synced</dt>
+							<dd className="mono">
+								{resource.properties.lastSyncedAt
+									? new Date(String(resource.properties.lastSyncedAt)).toLocaleString()
+									: "never"}
+							</dd>
+							<dt>Modelled as</dt>
+							<dd className="mono">
+								{modelledAs.length ? modelledAs.map((entry) => entry.name).join(", ") : "not yet"}
+							</dd>
+						</>
+					)}
 					<dt>Backed by</dt>
 					<dd className="mono">{resource.backingView ?? "—"}</dd>
 					<dt>Reads from</dt>
@@ -326,9 +329,30 @@ function ResourceDetail({
 				</dl>
 			</div>
 
+			{resource.kind === "connection" && (
+				<div className="card">
+					<SyncPanel resourceId={resource.id} />
+				</div>
+			)}
+
+			{modelling && (
+				<div className="rb-dialog-backdrop">
+					<div className="rb-dialog rb-dialog-wide">
+						<CreateObjectTypeDialog
+							dataset={resource.targetRef ?? resource.name}
+							onClose={() => setModelling(false)}
+							onCreated={(apiName) => {
+								setModelling(false);
+								onChanged(`Created the ${apiName} object type from ${resource.name}.`);
+							}}
+						/>
+					</div>
+				</div>
+			)}
+
 			<div className="card">
 				<div className="card-head">
-					<h3>Preview</h3>
+					<h3>{resource.kind === "connection" ? "Views it can read" : "Preview"}</h3>
 					<span className="sub">
 						{data
 							? data.total > PREVIEW_ROWS

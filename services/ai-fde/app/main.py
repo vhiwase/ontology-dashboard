@@ -19,12 +19,13 @@ from pydantic import BaseModel, Field
 from . import store
 from .agent import Agent
 from .auth import Principal, require_role
-from .context import current_request_id, current_session, current_space
+from .context import current_request_id, current_session, current_space, current_user
 from .config import CONFIG
 from .limits import REPLICA_WARNING, RateLimited, limiter
 from .llm import LlmError, _single_provider, build_provider
+from .modes import SessionAgentState, resolve_mode
 from .pricing import price_turn, rates
-from .prompts import is_tms, starter_prompts
+from .prompts import starter_prompts
 from .tools import NoOntologyInSpace, OntologyClient
 
 logging.basicConfig(
@@ -38,15 +39,12 @@ state: dict[str, Any] = {}
 
 
 # The providers a caller may choose between, in the order the dropdown shows
-# them. "auto" is the server's configured chain, which is what ran before a
-# per-request choice existed. One that cannot be constructed (no key) is left
-# out of the dropdown rather than offered and then failing.
-SELECTABLE_PROVIDERS = ("anthropic", "openai", "azure_openai", "ollama", "builtin")
+# them. "auto" is the server's configured provider; with one backend the
+# choice is between the hosted model and the hosted model, and the picker
+# remains so a second backend can be added without UI churn.
+SELECTABLE_PROVIDERS = ("azure_openai", "builtin")
 
 PROVIDER_LABELS = {
-    "anthropic": "Claude (Anthropic)",
-    "openai": "OpenAI-compatible (hosted)",
-    "ollama": "Ollama (local, open source)",
     "azure_openai": "Azure OpenAI (hosted)",
     "builtin": "Built-in planner (no AI model)",
     "auto": "Automatic (server default)",
@@ -165,32 +163,26 @@ async def correlate_and_log(request: Request, call_next):
 
 
 async def ontology_snapshot() -> dict[str, Any]:
-    """The orientation data handed to the model each turn.
-
-    Read from the conversation's space: the workspace summary (what the space
-    is, what it holds), its object types, links and metrics. The transport
-    demo's source-coverage figures are added only in a space that holds that
-    ontology - in anyone else's workspace they describe somebody else's data.
-    """
+    """The orientation data handed to the model each turn."""
     client: OntologyClient = state["ontology"]
     try:
+        types, kpis, stats, datasets = (
+            await client.get("/api/object-types"),
+            await client.get("/api/kpis/catalogue"),
+            await client.get("/api/stats"),
+            await client.get("/api/datasets"),
+        )
+        # What the space is and holds, and how its types connect: the
+        # assistant answers "by customer country" by following a link.
         summary = await client.get("/api/workspace/summary")
-        types = await client.get("/api/object-types")
-        kpis = await client.get("/api/kpis/catalogue")
         links = await client.get("/api/link-types")
-        ontology = await client.get("/api/ontology")
     except NoOntologyInSpace as exc:
-        # Not a fault: this space is simply empty. Said plainly, because the
-        # answer is an action the user can take, not an incident to report.
-        space = current_space.get()
+        # Not a fault: this space has no ontology loaded. Said plainly, because
+        # the answer is an action the user can take, not an incident to report.
         raise HTTPException(
             status_code=409,
             detail=(
-                "Your workspace has no data yet. Connect a PostgreSQL database on the Home "
-                "page and import the tables you want to report on, then ask again."
-                if space.startswith("u-")
-                else f"There is no ontology in the '{space}' space yet, so there is nothing "
-                f"here to ask about. Switch to a space that has one, or import tables into it. ({exc})"
+                f"The '{current_space.get()}' space has no ontology loaded yet. ({exc})"
             ),
         ) from exc
     except Exception as exc:  # noqa: BLE001
@@ -200,10 +192,11 @@ async def ontology_snapshot() -> dict[str, Any]:
         ) from exc
 
     by_rid = {t.get("rid"): t.get("apiName") for t in types}
-    snapshot: dict[str, Any] = {
-        "ontologyVersion": ontology.get("version"),
+    return {
+        "ontologyVersion": stats["ontology"]["version"],
         "space": summary.get("space"),
         "counts": summary.get("counts"),
+        "flow": stats.get("flow") or {},
         "objectTypes": [
             {
                 "apiName": t["apiName"],
@@ -222,40 +215,11 @@ async def ontology_snapshot() -> dict[str, Any]:
             for link in links
         ],
         "kpis": kpis,
-        "coverage": [],
+        "datasets": [
+            {"name": d["name"], "rowCount": d["rowCount"], "objectTypes": d["objectTypes"]}
+            for d in datasets
+        ],
     }
-    if is_tms(snapshot):
-        try:
-            stats = await client.get("/api/stats")
-            snapshot["coverage"] = [
-                {
-                    "metricArea": row["metric_area"],
-                    "sourceCoveragePct": float(row["source_coverage_pct"] or 0),
-                }
-                for row in stats.get("dataCoverage") or []
-            ]
-        except Exception as exc:  # noqa: BLE001 - orientation only
-            log.warning("Could not read data coverage: %s", exc)
-    return snapshot
-
-
-async def default_space() -> str:
-    """The space a new conversation opens in when the caller names none.
-
-    The caller's own workspace, as the ontology service reports it. The old
-    default was the shared sandbox, which put every new user's first question
-    in somebody else's data.
-    """
-    client: OntologyClient = state["ontology"]
-    try:
-        # An empty space means "wherever the caller defaults to", which the
-        # ontology service resolves to their own workspace.
-        me = await client.get("/api/auth/me", params={"space": ""})
-        if isinstance(me, dict) and me.get("personalSpace"):
-            return str(me["personalSpace"])
-    except Exception as exc:  # noqa: BLE001 - the sandbox is still a valid answer
-        log.warning("Could not resolve the caller's personal space: %s", exc)
-    return "sandbox"
 
 
 # ── schemas ─────────────────────────────────────────────────────────────────
@@ -267,16 +231,14 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     sessionId: int | None = None
     # Which model answers this turn. Unset, or "auto", uses the server's
-    # configured chain with its failover. Naming one pins the turn to it, with
-    # no failover: a caller who asked for the local model should be told it is
-    # unavailable, not quietly billed for the hosted one.
+    # configured provider. Naming one pins the turn to it.
     provider: str | None = None
     # Ontology entities the user attached to this question with the + control.
     # They are resolved server-side and prepended to the turn as context, so
     # the model starts from the right object instead of having to find it.
     attachments: list["Attachment"] = Field(default_factory=list, max_length=12)
     # The space this conversation belongs to. Chats are per-space like
-    # dashboards and pipelines, so switching space shows a different history.
+    # dashboards and the ontology, so switching space shows a different history.
     spaceSlug: str | None = None
 
 
@@ -306,8 +268,11 @@ class ChatResponse(BaseModel):
     usage: dict[str, Any]
     provider: str
     model: str
-    # Set when the primary provider was skipped or failed for this turn.
-    failoverReason: str | None = None
+    # The conversation's agent state after this turn: which mode it is in and
+    # which capabilities are enabled, so the UI can show both without a
+    # second request.
+    agentMode: str = "exploration"
+    enabledCapabilities: list[str] = Field(default_factory=list)
     # What the turn cost, priced with the rate in force when it ran. `priced`
     # is false when the provider has no configured rate, so an unpriced model
     # reads as a gap rather than as free.
@@ -458,35 +423,6 @@ async def assistant_health(
     return await _health_detail()
 
 
-async def _ollama_is_cpu_only(agent: Agent) -> bool:
-    """Whether Ollama lacks GPU offload, cached for the life of the process.
-
-    has_gpu() proves offload by loading the model and reading its VRAM, which
-    on CPU-only hardware is the very multi-minute operation this is trying to
-    warn about - so probing it on every dropdown render would be its own
-    outage. Whether a GPU is present cannot change while the container runs,
-    so the first answer is kept.
-    """
-    if "ollamaCpuOnly" in state:
-        return bool(state["ollamaCpuOnly"])
-
-    gpu = CONFIG.ollama_gpu
-    if gpu in ("true", "false"):
-        state["ollamaCpuOnly"] = gpu == "false"
-        return bool(state["ollamaCpuOnly"])
-
-    try:
-        detected, _why = await agent.provider.has_gpu()
-        # None means "could not tell", which is not evidence of CPU-only, so it
-        # is not cached: a later call can still find out.
-        if detected is None:
-            return False
-        state["ollamaCpuOnly"] = detected is False
-    except Exception:  # noqa: BLE001 - advisory only, never fatal
-        return False
-    return bool(state["ollamaCpuOnly"])
-
-
 @app.get("/api/assistant/providers")
 async def providers(
     _: Principal = Depends(require_role("viewer")),
@@ -494,8 +430,8 @@ async def providers(
     """The models a chat may choose between, with live availability.
 
     Availability is probed per request rather than cached, because "is the
-    local model pulled yet" changes while the stack is running and a dropdown
-    that lies about it is worse than no dropdown.
+    key working" is exactly the thing that can change while the stack runs,
+    and a dropdown that lies about it is worse than no dropdown.
     """
     agents: dict[str, Agent] = state.get("agents", {})
 
@@ -506,8 +442,6 @@ async def providers(
             "model": CONFIG.model_for(name),
             "configured": name in agents,
             "available": False,
-            # Usable, but slow enough that the choice deserves a warning.
-            "slow": False,
             "detail": None,
         }
         agent = agents.get(name)
@@ -517,29 +451,8 @@ async def providers(
         try:
             health = await agent.provider.health()
             entry["available"] = bool(health.get("reachable"))
-            # Ollama can be reachable with the model absent, which is not the
-            # same as usable, so that case is reported as unavailable.
-            if entry["available"] and health.get("modelPresent") is False:
-                entry["available"] = False
-                entry["detail"] = (
-                    f"{CONFIG.model_for(name)} is not pulled yet. "
-                    "docker compose up ollama-init"
-                )
-            elif not entry["available"]:
+            if not entry["available"]:
                 entry["detail"] = health.get("detail") or "Not reachable."
-
-            # Reachable is not the same as usable. A 7B model with this tool
-            # schema needs minutes per round on CPU, which reads as a hang
-            # rather than as slowness, so the dropdown says so up front instead
-            # of letting someone wait out the timeout to find out.
-            if name == "ollama" and entry["available"]:
-                entry["slow"] = await _ollama_is_cpu_only(agent)
-                if entry.get("slow"):
-                    entry["detail"] = (
-                        "No GPU offload detected, so this runs on CPU and a single "
-                        f"answer can take several minutes (timeout {CONFIG.ollama_timeout:.0f}s). "
-                        "Azure OpenAI answers in seconds."
-                    )
         except Exception as exc:  # noqa: BLE001 - availability, never fatal
             entry["detail"] = str(exc)
         return entry
@@ -554,10 +467,6 @@ async def providers(
             "resolvedTo": getattr(state.get("provider"), "name", None),
             "reason": state.get("providerReason"),
         },
-        # Automatic by default: it uses the server's configured chain and its
-        # failover, so a turn still gets answered when one provider is down.
-        # Pinning a specific model is a deliberate act - and it disables
-        # failover, which is only what you want when you meant it.
         "default": "auto",
     }
 
@@ -585,6 +494,24 @@ async def costs(
         for name, rate in rates().items()
     }
     return summary
+
+
+async def default_space() -> str:
+    """The space a new conversation opens in when the caller names none.
+
+    The caller's own workspace, as the ontology service reports it, so a new
+    user's first question is about their data rather than the shared sandbox.
+    """
+    client: OntologyClient = state["ontology"]
+    try:
+        # An empty space means "wherever the caller defaults to", which the
+        # ontology service resolves to their own workspace.
+        me = await client.get("/api/auth/me", params={"space": ""})
+        if isinstance(me, dict) and me.get("personalSpace"):
+            return str(me["personalSpace"])
+    except Exception as exc:  # noqa: BLE001 - the sandbox is still a valid answer
+        log.warning("Could not resolve the caller's personal space: %s", exc)
+    return "sandbox"
 
 
 @app.get("/api/assistant/starters")
@@ -666,9 +593,8 @@ async def chat(
         ) from exc
 
     # Pick the agent for this turn. An explicit choice is honoured exactly:
-    # no failover to the other provider, because someone who selected the
-    # local model wants to know it is down rather than have the hosted one
-    # answer - and be charged for it - without saying so.
+    # naming a provider that is not configured is refused rather than silently
+    # answered by the server default.
     chosen = (request.provider or "auto").strip().lower()
     if chosen in ("", "auto"):
         if "agent" not in state:
@@ -703,12 +629,12 @@ async def chat(
     # The space this turn reads the ontology in, fixed before the snapshot is
     # taken and before any tool runs. For an existing conversation the stored
     # space wins over whatever the request says, so a chat cannot be steered
-    # into another environment mid-thread. A new one opens in the caller's own
-    # workspace unless they named another.
+    # into another environment mid-thread.
     session_id = request.sessionId
     if session_id is None:
-        space_slug = request.spaceSlug or await default_space()
-        current_space.set(space_slug)
+        # A new conversation opens in the caller's own workspace unless they
+        # named another.
+        current_space.set(request.spaceSlug or await default_space())
     elif not store.session_exists(session_id, _visible_owner(principal)):
         # Continuing someone else's conversation would hand the caller its
         # history, so an unowned id is simply not found.
@@ -724,19 +650,40 @@ async def chat(
     )
 
     # Taken before a new session is stored: a space with nothing in it answers
-    # 409 here, and used to leave an empty conversation behind every time.
+    # 409 here, and would otherwise leave an empty conversation behind.
     snapshot = await ontology_snapshot()
     if session_id is None:
         session_id = store.create_session(
             title=None,
             user_id=principal.username,
             user_role=principal.ontology_role,
-            provider=chosen if chosen not in ("", "auto") else attempted_provider,
-            model=CONFIG.model_for(chosen if chosen not in ("", "auto") else attempted_provider),
+            provider=attempted_provider,
+            model=CONFIG.model_for(attempted_provider),
             space_slug=current_space.get(),
         )
-    history = store.history_for_model(session_id)
     current_session.set(session_id)
+    history = store.history_for_model(session_id)
+
+    # The conversation's agent state - its mode and enabled capabilities, its
+    # plan and todos - comes from the session row, not from the request, for
+    # the same reason the space does: a conversation cannot be steered into a
+    # different configuration by what a turn claims to be.
+    stored_state = store.get_session_state(session_id)
+    try:
+        stored_mode = resolve_mode(stored_state["agent_mode"])
+    except ValueError:
+        # A mode that no longer exists (renamed or removed) falls back rather
+        # than wedging the conversation.
+        stored_mode = "exploration"
+    agent_state = SessionAgentState(
+        mode=stored_mode,
+        capabilities={c for c in stored_state["capabilities"] if isinstance(c, str)},
+        plan=stored_state["plan"],
+        todos=stored_state["todos"],
+    )
+    # Tools that write something the user owns - the notepad - need to know
+    # whose note it is, from the token rather than the request.
+    current_user.set(principal.username)
 
     # Resolve what the user attached. Anything that cannot be resolved is
     # reported in the block rather than dropped: the model should know a
@@ -746,7 +693,17 @@ async def chat(
 
     store.append_message(session_id, "user", request.message)
 
-    result = await agent.run(request.message, history, snapshot)
+    result = await agent.run(request.message, history, snapshot, agent_state)
+
+    # Whatever the turn changed - a mode switch, a capability toggled, a plan
+    # written - is the conversation's state now, persisted for its next turn.
+    store.set_session_state(
+        session_id,
+        agent_state.mode,
+        sorted(agent_state.capabilities),
+        agent_state.plan,
+        agent_state.todos,
+    )
 
     # Charge the budget with what the turn actually cost. This runs after the
     # call, so a single turn can overshoot the cap; the next one is refused.
@@ -808,14 +765,12 @@ async def chat(
         stoppedBecause=result.stopped_because,
         usage=result.usage,
         # When the model errors, result.provider is empty. Falling back to
-        # CONFIG.provider then reported the SERVER default rather than what was
-        # actually attempted - so a turn pinned to Ollama that timed out came
-        # back labelled azure_openai, which reads as "the hosted model answered"
-        # and, worse, as "you were billed for it". Fall back to what this turn
-        # actually selected.
+        # CONFIG.provider then reports the server default rather than what was
+        # actually attempted - so report what this turn actually selected.
         provider=result.provider or attempted_provider,
         model=result.model or CONFIG.model_for(attempted_provider),
-        failoverReason=result.failover_reason,
+        agentMode=agent_state.mode,
+        enabledCapabilities=sorted(agent_state.capabilities),
         cost={
             "usd": cost.cost_usd,
             "priced": cost.priced,

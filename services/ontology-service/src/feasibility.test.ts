@@ -93,7 +93,7 @@ function kpi(apiName: string, label: string, on: ObjectTypeMeta, aggregation: st
 		dependsOnSimulation: false,
 		coverageNote: null,
 		displayOrder: 0,
-		baseFilters: {},
+		conditions: {},
 		origin: "modelled",
 		objectTypeRid: on.rid,
 		...extra,

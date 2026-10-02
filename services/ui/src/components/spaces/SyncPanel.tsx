@@ -1,22 +1,25 @@
 /**
  * The syncs on a connection: the only way anything crosses it.
  *
- * A connection that has never been synced is a business card, and this panel
- * is what makes that visible — it leads with the syncs and says plainly when
- * there are none, rather than leaving "can this actually bring data in" as
- * something you discover by its absence.
+ * A sync copies one view from the source into a dataset exactly as it is, and
+ * its cadence - manual, every 20 minutes, every 2 hours, daily, every 8 days -
+ * is set right here beside it, because "how fresh is this" is part of what a
+ * sync is rather than a separate thing to go and find.
  *
- * The source table is chosen from the far side's real catalogue rather than
- * typed, so a sync cannot name a table the connection's user cannot read.
+ * The view is chosen from the far side's real catalogue rather than typed, so
+ * a sync cannot name something the connection's user cannot read.
  */
 
 import { useCallback, useEffect, useState } from "react";
 import {
+	CADENCES,
 	type ConnectionCatalog,
 	type RemoteRelation,
 	type SyncOutcome,
 	type SyncRecord,
 	api,
+	cadenceFor,
+	describeInterval,
 } from "../../api";
 import { Empty, Spinner } from "../common";
 
@@ -29,9 +32,66 @@ function runSummary(sync: SyncRecord): string {
 	const run = sync.lastRun;
 	if (!run) return "never run";
 	if (run.status === "failed") return `failed — ${run.errorMessage ?? "no reason recorded"}`;
-	const rows = `${run.rowsWritten ?? 0} rows in, ${run.rowsAfter ?? 0} now`;
 	const cut = run.truncated ? `, stopped at the ${sync.rowLimit}-row limit` : "";
-	return `${run.status} · ${rows}${cut} · ${when(run.finishedAt ?? run.startedAt)}`;
+	return `${run.rowsAfter ?? 0} rows${cut} · ${when(run.finishedAt ?? run.startedAt)}`;
+}
+
+/** What a run did, as the sentence shown after pressing Run. */
+function outcomeMessage(sync: SyncRecord, outcome: SyncOutcome): string {
+	return (
+		`'${sync.name}' copied ${outcome.run.rowsAfter ?? 0} rows into ${sync.targetRelation}.` +
+		(outcome.run.truncated
+			? ` It stopped at the ${sync.rowLimit}-row limit, so the dataset is a prefix of the source.`
+			: "") +
+		(outcome.widenedColumns.length > 0
+			? ` These columns landed as text because they have no local equivalent: ${outcome.widenedColumns.join(", ")}.`
+			: "") +
+		(outcome.objectTypesRefreshed > 0 ? ` ${outcome.objectTypesRefreshed} object type(s) refreshed.` : "") +
+		(outcome.brokenProperties.length > 0
+			? ` The source no longer has columns these properties use: ${outcome.brokenProperties.join(", ")}.`
+			: "")
+	);
+}
+
+/**
+ * A cadence picker: the presets, plus a custom value when the current cadence
+ * is not one of them. Anything the server reads ("3d", "45m") may be typed.
+ */
+export function CadenceSelect({
+	intervalSeconds,
+	disabled,
+	onChange,
+}: {
+	intervalSeconds: number | null;
+	disabled?: boolean;
+	onChange: (every: string) => void;
+}) {
+	const current = cadenceFor(intervalSeconds);
+	const known = CADENCES.some((option) => option.every === current);
+	return (
+		<select
+			value={known ? current : "__current"}
+			disabled={disabled}
+			onChange={(event) => {
+				const value = event.target.value;
+				if (value === "__custom") {
+					const typed = window.prompt("How often? e.g. 45m, 3h, 3d, 2w", current === "manual" ? "4h" : current);
+					if (typed?.trim()) onChange(typed.trim());
+					return;
+				}
+				if (value !== "__current") onChange(value);
+			}}
+			aria-label="Refresh cadence"
+		>
+			{!known && intervalSeconds && <option value="__current">{describeInterval(intervalSeconds)}</option>}
+			{CADENCES.map((option) => (
+				<option key={option.every} value={option.every}>
+					{option.label}
+				</option>
+			))}
+			<option value="__custom">Custom…</option>
+		</select>
+	);
 }
 
 export function SyncPanel({ resourceId }: { resourceId: number }) {
@@ -55,15 +115,25 @@ export function SyncPanel({ resourceId }: { resourceId: number }) {
 		setError(null);
 		setNotice(null);
 		try {
-			const outcome = await api.post<SyncOutcome>(`/api/syncs/${sync.id}/run`);
+			setNotice(outcomeMessage(sync, await api.post<SyncOutcome>(`/api/syncs/${sync.id}/run`)));
+			load();
+		} catch (exc) {
+			setError((exc as Error).message);
+		} finally {
+			setBusy(null);
+		}
+	}
+
+	async function schedule(sync: SyncRecord, every: string) {
+		setBusy(sync.id);
+		setError(null);
+		setNotice(null);
+		try {
+			await api.post(`/api/syncs/${sync.id}/schedule`, { every });
 			setNotice(
-				`'${sync.name}' pulled ${outcome.run.rowsWritten ?? 0} rows into ${sync.targetRelation}.` +
-					(outcome.run.truncated
-						? ` It stopped at the ${sync.rowLimit}-row limit, so the table is a prefix of the source.`
-						: "") +
-					(outcome.widenedColumns.length > 0
-						? ` These columns landed as text because they have no local equivalent: ${outcome.widenedColumns.join(", ")}.`
-						: ""),
+				every === "manual"
+					? `'${sync.name}' now runs only when someone runs it.`
+					: `'${sync.name}' will refresh ${CADENCES.find((c) => c.every === every)?.label.toLowerCase() ?? `every ${every}`}.`,
 			);
 			load();
 		} catch (exc) {
@@ -76,8 +146,8 @@ export function SyncPanel({ resourceId }: { resourceId: number }) {
 	async function remove(sync: SyncRecord) {
 		if (
 			!window.confirm(
-				`Delete the sync '${sync.name}'? ${sync.targetRelation} is left in place; ` +
-					"nothing will rebuild it afterwards.",
+				`Delete the sync '${sync.name}' and its schedule? ${sync.targetRelation} is left in place; ` +
+					"nothing will refresh it afterwards.",
 			)
 		) {
 			return;
@@ -98,10 +168,10 @@ export function SyncPanel({ resourceId }: { resourceId: number }) {
 			<div className="row" style={{ marginBottom: 6 }}>
 				<strong style={{ fontSize: 12 }}>Syncs</strong>
 				<span className="muted" style={{ fontSize: 11 }}>
-					a named, re-runnable pull from one table into one dataset
+					each copies one view into a dataset, as it is, on its own cadence
 				</span>
 				<button className="btn sm" onClick={() => setAdding((open) => !open)}>
-					{adding ? "Cancel" : "New sync"}
+					{adding ? "Cancel" : "Sync a view"}
 				</button>
 			</div>
 
@@ -123,18 +193,16 @@ export function SyncPanel({ resourceId }: { resourceId: number }) {
 				<Spinner label="Loading syncs" />
 			) : syncs.length === 0 ? (
 				<Empty>
-					Nothing is synced through this connection yet, so it has brought no data in.
-					Declare one here, or commit a <span className="mono">*.sync.json</span> file to a
-					transforms repository.
+					Nothing is synced through this connection yet. Choose <strong>Sync a view</strong> to copy
+					one into a dataset.
 				</Empty>
 			) : (
 				<table className="dense">
 					<thead>
 						<tr>
-							<th>Name</th>
-							<th>Source</th>
-							<th>Mode</th>
-							<th>Lands in</th>
+							<th>Source view</th>
+							<th>Dataset</th>
+							<th>Refresh</th>
 							<th>Last run</th>
 							<th />
 						</tr>
@@ -142,32 +210,32 @@ export function SyncPanel({ resourceId }: { resourceId: number }) {
 					<tbody>
 						{syncs.map((sync) => (
 							<tr key={sync.id}>
-								<td>{sync.name}</td>
 								<td className="mono">
-									{sync.sourcePath ?? `${sync.sourceSchema}.${sync.sourceTable}`}
-									{sync.recordsPath ? ` → ${sync.recordsPath}` : ""}
+									{sync.sourceSchema}.{sync.sourceTable}
 								</td>
+								<td className="mono" title={sync.targetRelation}>
+								{sync.sourceTable}
+							</td>
 								<td>
-									{sync.mode}
-									{sync.cursorColumn ? ` (${sync.cursorColumn})` : ""}
+									<CadenceSelect
+										intervalSeconds={sync.schedule?.intervalSeconds ?? null}
+										disabled={busy !== null}
+										onChange={(every) => void schedule(sync, every)}
+									/>
+									{sync.schedule?.nextRunAt && (
+										<div className="muted" style={{ fontSize: 11 }}>
+											next {when(sync.schedule.nextRunAt)}
+										</div>
+									)}
 								</td>
-								<td className="mono">{sync.targetRelation}</td>
-								<td className={sync.lastRun?.status === "failed" ? "error" : undefined}>
+								<td className={sync.lastRun?.status === "failed" ? "error" : undefined} style={{ fontSize: 11 }}>
 									{runSummary(sync)}
 								</td>
-								<td>
-									<button
-										className="btn sm"
-										disabled={busy !== null}
-										onClick={() => void run(sync)}
-									>
-										{busy === sync.id ? "Running…" : "Run"}
+								<td style={{ whiteSpace: "nowrap" }}>
+									<button className="btn sm" disabled={busy !== null} onClick={() => void run(sync)}>
+										{busy === sync.id ? "Running…" : "Run now"}
 									</button>{" "}
-									<button
-										className="btn sm"
-										disabled={busy !== null}
-										onClick={() => void remove(sync)}
-									>
+									<button className="btn sm" disabled={busy !== null} onClick={() => void remove(sync)}>
 										Delete
 									</button>
 								</td>
@@ -181,11 +249,10 @@ export function SyncPanel({ resourceId }: { resourceId: number }) {
 }
 
 /**
- * Declaring a sync.
+ * Syncing a view: choose it, choose how often, and it is copied at once.
  *
- * The table list comes from the connection's own catalogue, which is also the
- * check that the connection can read it: information_schema only shows what
- * the caller has a privilege on.
+ * The list comes from the connection's own catalogue, views first, which is
+ * also the check that the connection can read it.
  */
 function NewSync({
 	resourceId,
@@ -199,13 +266,9 @@ function NewSync({
 	const [busy, setBusy] = useState(false);
 
 	const [chosen, setChosen] = useState<string>("");
-	const [name, setName] = useState("");
-	const [mode, setMode] = useState<"snapshot" | "incremental">("snapshot");
-	const [cursorColumn, setCursorColumn] = useState("");
+	const [every, setEvery] = useState("manual");
 	const [rowLimit, setRowLimit] = useState(50_000);
-	// REST: there is no catalogue to choose from, so the path is typed.
-	const [sourcePath, setSourcePath] = useState("");
-	const [recordsPath, setRecordsPath] = useState("");
+	const [runNow, setRunNow] = useState(true);
 
 	useEffect(() => {
 		api
@@ -216,26 +279,29 @@ function NewSync({
 
 	const pick = (relation: RemoteRelation) => `${relation.schema}.${relation.name}`;
 
-	const isRest = catalog?.connector === "rest";
-
 	async function submit() {
 		const [sourceSchema, sourceTable] = chosen.split(".");
-		const fallbackName = isRest
-			? sourcePath.split("?")[0]!.split("/").filter(Boolean).pop() || "records"
-			: sourceTable;
 		setBusy(true);
 		setError(null);
 		try {
 			const created = await api.post<SyncRecord>(`/api/resources/${resourceId}/syncs`, {
-				name: name.trim() || fallbackName,
-				...(isRest
-					? { sourcePath: sourcePath.trim(), recordsPath: recordsPath.trim() || null }
-					: { sourceSchema, sourceTable }),
-				mode,
-				cursorColumn: mode === "incremental" ? cursorColumn.trim() : null,
+				sourceSchema,
+				sourceTable,
 				rowLimit,
 			});
-			onDone(`Declared '${created.name}'. It lands in ${created.targetRelation} when you run it.`);
+			if (every !== "manual") {
+				await api.post(`/api/syncs/${created.id}/schedule`, { every });
+			}
+			let ran = "";
+			if (runNow) {
+				const outcome = await api.post<SyncOutcome>(`/api/syncs/${created.id}/run`);
+				ran = ` ${outcomeMessage(created, outcome)}`;
+			}
+			onDone(
+				`Syncing ${chosen} into ${created.targetRelation}, ${
+					CADENCES.find((c) => c.every === every)?.label.toLowerCase() ?? `every ${every}`
+				}.${ran}`,
+			);
 		} catch (exc) {
 			setError((exc as Error).message);
 		} finally {
@@ -248,95 +314,33 @@ function NewSync({
 
 	return (
 		<div className="card" style={{ marginBottom: 10 }}>
-			{isRest ? (
-				<>
-					<label className="field">
-						<span>Path on {catalog.connection}</span>
-						<input
-							value={sourcePath}
-							placeholder="/orders"
-							onChange={(event) => setSourcePath(event.target.value)}
-						/>
-						<span className="field-hint">
-							{catalog.note ?? "Appended to the connection's base URL."}
-						</span>
-					</label>
-					<label className="field">
-						<span>Records path</span>
-						<input
-							value={recordsPath}
-							placeholder="data.items — leave empty if the response is already a list"
-							onChange={(event) => setRecordsPath(event.target.value)}
-						/>
-						<span className="field-hint">
-							Where the rows sit inside the response. Getting this wrong would land the
-							whole document as a single row, so the sync refuses rather than guesses —
-							and tells you where the records look to be.
-						</span>
-					</label>
-				</>
-			) : (
-				<label className="field">
-					<span>Table or view on {catalog.connection}</span>
-					<select value={chosen} onChange={(event) => setChosen(event.target.value)}>
-						<option value="">Choose…</option>
-						{catalog.relations.map((relation) => (
-							<option key={pick(relation)} value={pick(relation)}>
-								{pick(relation)} · {relation.kind}
-								{relation.estimatedRows !== null ? ` · ~${relation.estimatedRows} rows` : ""}
-							</option>
-						))}
-					</select>
-					<span className="field-hint">
-						{catalog.relations.length} readable by this connection's user.
-					</span>
-				</label>
-			)}
-
 			<label className="field">
-				<span>Name</span>
-				<input
-					value={name}
-					placeholder={
-						isRest
-							? sourcePath.split("?")[0]!.split("/").filter(Boolean).pop() || "records"
-							: (chosen.split(".")[1] ?? "orders")
-					}
-					onChange={(event) => setName(event.target.value)}
-				/>
-			</label>
-
-			<label className="field">
-				<span>Mode</span>
-				<select
-					value={mode}
-					onChange={(event) => setMode(event.target.value as "snapshot" | "incremental")}
-				>
-					<option value="snapshot">Snapshot — rebuild the table each run</option>
-					<option value="incremental">Incremental — append rows past a cursor</option>
+				<span>View on {catalog.connection}</span>
+				<select value={chosen} onChange={(event) => setChosen(event.target.value)}>
+					<option value="">Choose…</option>
+					{catalog.relations.map((relation) => (
+						<option key={pick(relation)} value={pick(relation)}>
+							{pick(relation)} · {relation.kind}
+							{relation.estimatedRows !== null ? ` · ~${relation.estimatedRows} rows` : ""}
+						</option>
+					))}
 				</select>
 				<span className="field-hint">
-					{mode === "snapshot"
-						? "The table is exactly what the source holds now. It cannot keep rows the source has since deleted."
-						: "Cheaper, and wrong if the source edits rows in place without moving the cursor."}
+					{catalog.relations.length} views and tables readable by this connection's user. The
+					dataset is a copy of it, rebuilt on every run: same columns, same rows.
 				</span>
 			</label>
 
-			{mode === "incremental" && (
-				<label className="field">
-					<span>{isRest ? "Cursor field" : "Cursor column"}</span>
-					<input
-						value={cursorColumn}
-						placeholder="updated_at"
-						onChange={(event) => setCursorColumn(event.target.value)}
-					/>
-					<span className="field-hint">
-						{isRest
-							? "The field whose increasing value says which records are new. It is sent back as a query parameter of the same name on the next run."
-							: "The column whose increasing value says which rows are new."}
-					</span>
-				</label>
-			)}
+			<label className="field">
+				<span>Refresh</span>
+				<select value={every} onChange={(event) => setEvery(event.target.value)}>
+					{CADENCES.map((option) => (
+						<option key={option.every} value={option.every}>
+							{option.label}
+						</option>
+					))}
+				</select>
+			</label>
 
 			<label className="field">
 				<span>Row limit</span>
@@ -348,19 +352,20 @@ function NewSync({
 					onChange={(event) => setRowLimit(Number(event.target.value))}
 				/>
 				<span className="field-hint">
-					A run holds its result in memory before writing it. One that reaches this limit says
-					so rather than reporting a partial table as complete.
+					A run holds its result in memory before writing it. One that reaches this limit says so
+					rather than reporting a partial dataset as complete.
 				</span>
+			</label>
+
+			<label className="row" style={{ gap: 6, fontSize: 12 }}>
+				<input type="checkbox" checked={runNow} onChange={(event) => setRunNow(event.target.checked)} />
+				Copy it now as well
 			</label>
 
 			{error && <div className="banner error">{error}</div>}
 			<div className="row">
-				<button
-					className="btn primary sm"
-					disabled={busy || (isRest ? !sourcePath.trim() : !chosen)}
-					onClick={submit}
-				>
-					{busy ? "Checking the source…" : "Declare sync"}
+				<button className="btn primary sm" disabled={busy || !chosen} onClick={submit}>
+					{busy ? "Syncing…" : "Sync"}
 				</button>
 			</div>
 		</div>

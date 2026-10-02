@@ -319,7 +319,7 @@ function metricMeta(type: ObjectTypeMeta, p: Record<string, unknown>, apiName: s
 		dependsOnSimulation: false,
 		coverageNote: null,
 		displayOrder: 2000,
-		baseFilters: (p.filters as Record<string, unknown>) ?? {},
+		conditions: (p.filters as Record<string, unknown>) ?? {},
 		origin: "proposal",
 		objectTypeRid: type.rid,
 	};
@@ -471,7 +471,7 @@ async function applyMetric(payload: Record<string, unknown>, username: string): 
 			   (space_id, kpi_rid, api_name, label, description, business_question, category, source_view,
 			    measure_column, aggregation, numerator_column, denominator_column, dimensions,
 			    default_dimension, time_column, unit, value_format, related_object_types,
-			    depends_on_simulation, display_order, origin, object_type_rid, base_filters, created_by)
+			    depends_on_simulation, display_order, origin, object_type_rid, conditions, created_by)
 			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,false,2000,'proposal',$19,$20::jsonb,$21)`,
 			[
 				spaceId, `kpi:${p.apiName}`, p.apiName, p.label, p.description, p.businessQuestion, type.label,
@@ -497,7 +497,7 @@ function automaticTwin(type: ObjectTypeMeta, p: Record<string, unknown>): KpiMet
 				(k.measureColumn ?? null) === (p.measure ?? null) &&
 				(k.numeratorColumn ?? null) === (p.numerator ?? null) &&
 				(k.denominatorColumn ?? null) === (p.denominator ?? null) &&
-				unfiltered(k.baseFilters),
+				unfiltered(k.conditions),
 		) ?? null
 	);
 }

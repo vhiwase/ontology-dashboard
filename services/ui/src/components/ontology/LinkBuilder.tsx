@@ -1,10 +1,8 @@
 /**
  * Drawing a link by hand (§9), and the journal of everything edited.
  *
- * The pipeline discovers links by probing the data for value overlap, so the
- * ones it finds are real by construction. A link drawn here is an assertion
- * instead — someone saying "these two columns refer to the same thing" — and
- * an assertion can be wrong.
+ * A link is an assertion - someone saying "these two columns refer to the same
+ * thing" - and an assertion can be wrong.
  *
  * So the server MEASURES it before accepting: it runs the join and reports how
  * many source rows actually resolve. A link at 12% is not a mistake to hide,
@@ -130,10 +128,9 @@ export function LinkBuilder({
 
 				<div className="fn-body">
 					<p className="fn-lede">
-						The pipeline finds links by probing the data. This one is your assertion that
-						two columns refer to the same thing — so the join is{" "}
-						<strong>measured before it is accepted</strong>, and you are told what share
-						of rows actually resolve.
+						A link is your assertion that two columns refer to the same thing — so the
+						join is <strong>measured before it is accepted</strong>, you are told what
+						share of rows actually resolve, and a link where none do is refused.
 					</p>
 
 					{error && <ErrorBanner error={error} />}
@@ -267,7 +264,7 @@ export function LinkBuilder({
 
 				<footer className="fn-foot">
 					<div className="fn-foot-note">
-						Replayed onto every future publish, so the pipeline will not overwrite it.
+						Recorded in the ontology's change history, where it can be undone.
 					</div>
 					<div className="row" style={{ gap: 8 }}>
 						<button className="ghost" onClick={close} disabled={busy}>
@@ -316,8 +313,8 @@ export function EditJournal({
 	if (edits.length === 0) {
 		return (
 			<p className="muted" style={{ fontSize: 11.5, margin: 0 }}>
-				Nothing has been edited in this space. Changes made here are replayed onto every
-				ontology the pipeline publishes afterwards.
+				Nothing has been changed in this space's ontology yet. Every creation, edit and
+				deletion is recorded here, with who made it.
 			</p>
 		);
 	}

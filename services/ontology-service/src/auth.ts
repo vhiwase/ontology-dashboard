@@ -497,16 +497,16 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "POST", pattern: /^\/actions\/[^/]+\/apply$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/actions\/[^/]+\/validate$/, role: "analyst" },
 
-	// A proposal is inert, so drafting one is an analyst act. ACCEPTING makes
-	// it runnable against the warehouse, which is the act that matters.
-	{ method: "POST", pattern: /^\/pipelines\/propose$/, role: "analyst" },
-	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/accept$/, role: "admin" },
-
-	// The ontology builder. Editing a label or drawing a link changes what
+	// Authoring the ontology. Creating an object type from a dataset, drawing
+	// a link, declaring an action or a metric, or editing a label changes what
 	// everyone sees and what every dashboard resolves against, so it is an
-	// analyst act; removing part of the ontology is an admin one.
+	// analyst act - and the assistant, running with the user's token, is
+	// bound by the same rule. Removing part of the ontology is an admin one.
 	{ method: "PATCH", pattern: /^\/ontology\/[^/]+\/.+$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/ontology\/object-types$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/ontology\/link-types$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/ontology\/action-types$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/ontology\/metrics$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/ontology\/edits\/[^/]+\/undo$/, role: "analyst" },
 	{ method: "DELETE", pattern: /^\/ontology\/[^/]+\/.+$/, role: "admin" },
 
@@ -522,22 +522,21 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "POST", pattern: /^\/functions\/[^/]+\/reject$/, role: "admin" },
 	{ method: "POST", pattern: /^\/functions\/[^/]+\/archive$/, role: "admin" },
 
-	// A pipeline defines how data becomes an ontology, so editing one is an
-	// analyst act and deleting one is an admin act. Reading, validating and
-	// the palette stay at viewer.
-	{ method: "POST", pattern: /^\/pipelines$/, role: "analyst" },
-	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/run$/, role: "analyst" },
-	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/versions\/[^/]+\/restore$/, role: "analyst" },
-	{ method: "DELETE", pattern: /^\/pipelines\/[^/]+$/, role: "admin" },
+	// Schedules run syncs on a cadence, so defining or triggering one is an
+	// analyst act; deleting one is admin, like the other destructive verbs.
+	{ method: "POST", pattern: /^\/schedules$/, role: "analyst" },
+	{ method: "PATCH", pattern: /^\/schedules\/[^/]+$/, role: "analyst" },
+	{ method: "POST", pattern: /^\/schedules\/[^/]+\/run$/, role: "analyst" },
+	{ method: "DELETE", pattern: /^\/schedules\/[^/]+$/, role: "admin" },
+	{ method: "POST", pattern: /^\/syncs\/[^/]+\/schedule$/, role: "analyst" },
 
-	// Creating projects, folders, resources and datasets is authoring work.
+	// Creating projects, folders and resources is authoring work.
 	// Reading the tree and previewing a resource stay at viewer, so anyone can
 	// look at what exists without being able to reshape it.
 	{ method: "POST", pattern: /^\/spaces\/sandbox\/seed$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/folders$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/resources$/, role: "analyst" },
-	{ method: "POST", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+\/datasets$/, role: "analyst" },
 	{ method: "POST", pattern: /^\/resources\/[^/]+\/rename$/, role: "analyst" },
 	// Testing a connection reaches out to a host of the caller's choosing and
 	// reads a credential the service can see, so it is not a viewer action.
@@ -557,17 +556,6 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	// are reading.
 	{ method: "DELETE", pattern: /^\/syncs\/[^/]+$/, role: "admin" },
 
-	// Code repositories. Writing a file and committing it are authoring acts.
-	// BUILDING is the one that reaches outside the repository - it runs syncs,
-	// replaces tables in repo_out and publishes into the function catalogue -
-	// so it sits with running a pipeline, at analyst. It still cannot approve
-	// a function: that stays admin, on its own route.
-	{ method: "POST", pattern: /^\/repos$/, role: "analyst" },
-	{ method: "PUT", pattern: /^\/repos\/[^/]+\/files$/, role: "analyst" },
-	{ method: "DELETE", pattern: /^\/repos\/[^/]+\/files$/, role: "analyst" },
-	{ method: "POST", pattern: /^\/repos\/[^/]+\/commit$/, role: "analyst" },
-	{ method: "POST", pattern: /^\/repos\/[^/]+\/build$/, role: "analyst" },
-	{ method: "DELETE", pattern: /^\/repos\/[^/]+$/, role: "admin" },
 	// Importing tables and modelling them write into connection_raw and into
 	// the space's ontology. Removing a modelled type takes its metrics with it,
 	// which is an admin act in a shared space - and, through ownership, every
@@ -624,7 +612,6 @@ export function apiAuthorization() {
 const PLATFORM_ADMIN_ONLY: ReadonlyArray<{ method: string; pattern: RegExp }> = [
 	{ method: "POST", pattern: /^\/registry\/reload$/ },
 	{ method: "POST", pattern: /^\/functions\/[^/]+\/(approve|reject|archive)$/ },
-	{ method: "POST", pattern: /^\/pipelines\/[^/]+\/accept$/ },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/members$/ },
 	{ method: "DELETE", pattern: /^\/spaces\/[^/]+\/members\/[^/]+$/ },
 ];
@@ -647,23 +634,16 @@ export function effectiveRole(principal: Principal, access: SpaceAccess | undefi
 /**
  * Features that cannot be offered inside a personal workspace.
  *
- * Each of these runs SQL or Python the caller wrote, or reads a relation the
- * caller names, and the tables of every workspace live in one database. In a
+ * Each of these runs SQL the caller wrote, or reads a relation the caller
+ * names, and the synced tables of every workspace live in one schema. In a
  * shared space that is the trust the team already extends to an analyst; in a
  * personal workspace it would let one account read another's synced tables.
  * Metrics, links and combined datasets are still available there - they are
  * compiled from the ontology, never written as SQL by the caller.
  */
 const PERSONAL_SPACE_REFUSED: ReadonlyArray<{ method: string; pattern: RegExp; feature: string }> = [
-	{ method: "POST", pattern: /^\/pipelines(\/.*)?$/, feature: "Pipelines run SQL and Python you write" },
-	{ method: "DELETE", pattern: /^\/pipelines\/.+$/, feature: "Pipelines" },
-	{ method: "GET", pattern: /^\/pipelines\/outputs\/.+$/, feature: "Reading pipeline outputs by table name" },
-	{ method: "POST", pattern: /^\/repos(\/.*)?$/, feature: "Code repositories run SQL and Python you write" },
-	{ method: "PUT", pattern: /^\/repos\/.+$/, feature: "Code repositories" },
-	{ method: "DELETE", pattern: /^\/repos\/.+$/, feature: "Code repositories" },
 	{ method: "POST", pattern: /^\/functions(\/.*)?$/, feature: "SQL functions" },
 	{ method: "PATCH", pattern: /^\/functions\/.+$/, feature: "SQL functions" },
-	{ method: "GET", pattern: /^\/datasets\/[^/]+\/versions$/, feature: "Reading dataset versions by table name" },
 	{ method: "POST", pattern: /^\/spaces\/sandbox\/seed$/, feature: "Seeding the sandbox from the TMS ontology" },
 	{ method: "GET", pattern: /^\/spaces\/database$/, feature: "The platform database's own details" },
 ];

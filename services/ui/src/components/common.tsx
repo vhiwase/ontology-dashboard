@@ -297,7 +297,6 @@ const RESOURCE_GLYPHS: Record<string, string> = {
 	kpi: "Σ",
 	dataset: "▤",
 	dashboard: "▦",
-	pipeline: "⑄",
 	connection: "⛁",
 };
 
@@ -550,14 +549,12 @@ export function CoverageBanner({ notes }: { notes: string[] }) {
 }
 
 /**
- * What an ontology page shows in a space nothing has been published to.
+ * What an ontology page shows in a space with no ontology loaded.
  *
- * The ontology is produced by a pipeline, and pipelines belong to a space, so
- * the object types, links, actions, metrics and lineage in a space are the
- * ones its own pipeline published. A space nobody has published to has none —
- * and saying so is the honest answer. Borrowing the sandbox's, which is what
- * this page used to do, presented unreviewed work as though it were live in
- * an environment it had never been promoted to.
+ * The ontology belongs to a space: its object types are built from that
+ * space's datasets. Every space is given an empty one at boot, so this is a
+ * space created since - and saying so is the honest answer. Borrowing the
+ * sandbox's would present its work as though it were live here.
  */
 export function NoOntologyHere({
 	what,
@@ -575,12 +572,11 @@ export function NoOntologyHere({
 				No {what} in {spaceName}
 			</h3>
 			<p>
-				No ontology has been published to this space yet. One arrives when a pipeline runs
-				here, or when a version is promoted from another space.
+				This space has no ontology yet. Sync a view from a connection, then create object types
+				from the datasets it lands.
 			</p>
 			<p className="empty-space-hint">
-				The sandbox holds the ontology built so far — switch to it in the space selector
-				above.
+				The sandbox holds the ontology built so far — switch to it in the space selector above.
 			</p>
 		</div>
 	);

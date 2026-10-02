@@ -6,15 +6,17 @@
 --  given their column metadata so it can compose dashboards without writing
 --  free-form SQL against the raw tables.
 --
---  Each view exposes grain columns first, then measures. Measures that depend on
---  simulated execution data carry an explicit *_coverage or sample-size column
---  so a dashboard can show the denominator and the assistant can caveat the
---  answer instead of quoting a number built on two rows.
+--  This file defines exactly the views that exist after migrations 0018 and
+--  0019: the carrier scorecard, on-time performance and account scorecard were
+--  withdrawn with the simulated execution data (0018), and the six views 0019
+--  rebuilt are copied here VERBATIM from that migration. Drift between this
+--  file and the migrations breaks fresh-volume init - init runs only when the
+--  data directory is empty, so this file is the post-migration truth, not a
+--  historical snapshot. services/pipeline tests guard it.
 -- ============================================================================
 
 SET search_path = tms_views, tms_raw, public;
 
--- ---------------------------------------------------------------------------
 --  Demand: order volume over time
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW tms_views.v_kpi_order_volume_daily AS
@@ -43,44 +45,6 @@ GROUP BY pickup_date, pickup_week, pickup_month, transportation_mode;
 COMMENT ON VIEW tms_views.v_kpi_order_volume_daily IS
 'Daily order intake by mode: volume, weight, and how much of the demand got planned.';
 
-
--- ---------------------------------------------------------------------------
---  Demand: share of orders by mode
--- ---------------------------------------------------------------------------
-CREATE OR REPLACE VIEW tms_views.v_kpi_mode_mix AS
-SELECT
-    COALESCE(o.transportation_mode, 'Unassigned')  AS transportation_mode,
-    count(*)                                       AS order_count,
-    ROUND(100.0 * count(*) / NULLIF(sum(count(*)) OVER (), 0), 1) AS order_share_pct,
-    sum(o.shipment_count)                          AS shipment_count,
-    sum(o.transport_count)                         AS transport_count,
-    ROUND(sum(o.gross_weight_kg), 2)               AS gross_weight_kg,
-    ROUND(100.0 * sum(o.gross_weight_kg)
-          / NULLIF(sum(sum(o.gross_weight_kg)) OVER (), 0), 1) AS weight_share_pct,
-    ROUND(avg(o.planned_transit_days)::numeric, 2) AS avg_planned_transit_days,
-    count(*) FILTER (WHERE o.is_unplanned)         AS unplanned_order_count,
-    count(DISTINCT o.lane)                         AS lane_count,
-    count(DISTINCT o.account_key)                  AS account_count
-FROM tms_views.v_order o
-GROUP BY COALESCE(o.transportation_mode, 'Unassigned');
-
-COMMENT ON VIEW tms_views.v_kpi_mode_mix IS
-'Share of demand carried by each transportation mode.';
-
-
--- ---------------------------------------------------------------------------
---  Withdrawn views
--- ---------------------------------------------------------------------------
---  v_kpi_account_scorecard, v_kpi_carrier_scorecard and v_kpi_on_time_performance
---  were composed of execution figures the captured snapshot does not carry
---  (cost, carrier, arrivals). Migration 0018 dropped them on existing
---  databases; they are not created here either, so a fresh volume and a
---  migrated one end up with the same schema. Before this, a fresh volume failed
---  on this file: 04_views.sql had already lost is_on_time and total_cost, and
---  the three views below still selected them.
---
---  The definitions that follow are the post-0019 shapes, kept identical to
---  db/migrations/0019_rebuild_kpi_views.sql.
 -- ---------------------------------------------------------------------------
 
 CREATE OR REPLACE VIEW tms_views.v_kpi_lane_performance AS
@@ -336,3 +300,27 @@ FROM stops st;
 
 COMMENT ON VIEW tms_views.v_kpi_data_coverage IS
 'How much of each metric area the snapshot measures. An area at 0% is absent at source, not estimated.';
+
+--  Network: mode mix
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE VIEW tms_views.v_kpi_mode_mix AS
+SELECT
+    COALESCE(o.transportation_mode, 'Unassigned')  AS transportation_mode,
+    count(*)                                       AS order_count,
+    ROUND(100.0 * count(*) / NULLIF(sum(count(*)) OVER (), 0), 1) AS order_share_pct,
+    sum(o.shipment_count)                          AS shipment_count,
+    sum(o.transport_count)                         AS transport_count,
+    ROUND(sum(o.gross_weight_kg), 2)               AS gross_weight_kg,
+    ROUND(100.0 * sum(o.gross_weight_kg)
+          / NULLIF(sum(sum(o.gross_weight_kg)) OVER (), 0), 1) AS weight_share_pct,
+    ROUND(avg(o.planned_transit_days)::numeric, 2) AS avg_planned_transit_days,
+    count(*) FILTER (WHERE o.is_unplanned)         AS unplanned_order_count,
+    count(DISTINCT o.lane)                         AS lane_count,
+    count(DISTINCT o.account_key)                  AS account_count
+FROM tms_views.v_order o
+GROUP BY COALESCE(o.transportation_mode, 'Unassigned');
+
+COMMENT ON VIEW tms_views.v_kpi_mode_mix IS
+'Share of demand carried by each transportation mode.';
+
+-- ---------------------------------------------------------------------------

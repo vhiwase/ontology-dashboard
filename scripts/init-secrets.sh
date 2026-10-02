@@ -65,8 +65,8 @@ write_secret database_url \
 
 # ── Azure OpenAI ───────────────────────────────────────────────────────────
 # Carried over from .env if it is there, so an existing working key is not
-# lost. An empty file is valid: it means "no Azure", and LLM_PROVIDER=ollama
-# then runs the stack entirely offline.
+# lost. An empty file is valid: the assistant is the only thing that needs it,
+# and it reports exactly that at /health until the key is set.
 AZURE_KEY=""
 if [ -f .env ]; then
     AZURE_KEY=$(grep -E '^AZURE_OPENAI_KEY=' .env | head -1 | cut -d= -f2- || true)
@@ -79,7 +79,7 @@ else
     if [ -n "$AZURE_KEY" ]; then
         echo "  + azure_openai_key taken from .env"
     else
-        echo "  + azure_openai_key written empty (set it, or run Ollama only)"
+        echo "  + azure_openai_key written empty (the built-in planner answers until it is set)"
     fi
 fi
 
@@ -88,27 +88,6 @@ fi
 # apart from jwt_secret so rotating the signing key does not make every stored
 # connection password unreadable. 64 hex characters = 32 bytes.
 write_secret credential_key "$(openssl rand -hex 32)" "AES-256 key for stored connection passwords"
-
-# ── hosted models for the assistant (optional) ─────────────────────────────
-# Each is carried over from .env when set there, and otherwise written empty:
-# an empty file means "not configured", and with no model at all the assistant
-# still answers through its built-in planner.
-carry_key() {
-    local name=$1 variable=$2
-    local value=""
-    if [ -f .env ]; then
-        value=$(grep -E "^${variable}=" .env | head -1 | cut -d= -f2- || true)
-    fi
-    if [ -s "$SECRETS_DIR/$name" ] && [ "$FORCE" -eq 0 ]; then
-        echo "  = $name already exists, left alone"
-        return
-    fi
-    printf '%s' "$value" > "$SECRETS_DIR/$name"
-    chmod 600 "$SECRETS_DIR/$name"
-    if [ -n "$value" ]; then echo "  + $name taken from .env"; else echo "  + $name written empty (optional)"; fi
-}
-carry_key anthropic_api_key AI_FDE_ANTHROPIC_API_KEY
-carry_key openai_api_key AI_FDE_OPENAI_API_KEY
 
 echo
 echo "Done. Next:"

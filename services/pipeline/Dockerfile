@@ -1,5 +1,6 @@
 # ---------------------------------------------------------------------------
-#  Pipeline: captured TMS payloads -> raw tables -> views -> ontology -> lineage
+#  Pipeline: migrations, then captured TMS payloads -> tms_raw (read through
+#  tms_views by a PostgreSQL connection), then users and retention.
 #  Runs to completion and exits; the ontology service waits on that via
 #  service_completed_successfully.
 # ---------------------------------------------------------------------------

@@ -126,12 +126,6 @@ export async function importTables(resourceId: number, body: unknown, username: 
 	const request = validateImport(body);
 	const connection = await connectionRow(resourceId);
 	const spec = specFromProperties(connection.name, connection.properties ?? {});
-	if (spec?.engine === "rest") {
-		throw new BadRequest(
-			"Importing tables needs a PostgreSQL connection. A REST source has no tables or keys to read; declare a sync on one of its paths instead.",
-		);
-	}
-
 	const keys = await remoteKeys(spec, request.tables);
 	const tables: ImportedTable[] = [];
 	const sources: ModelSource[] = [];
@@ -141,7 +135,7 @@ export async function importTables(resourceId: number, body: unknown, username: 
 		try {
 			const sync = await createSync(
 				resourceId,
-				{ name: source, sourceSchema: schema, sourceTable: table, mode: "snapshot", rowLimit: request.rowLimit },
+				{ name: source, sourceSchema: schema, sourceTable: table, rowLimit: request.rowLimit },
 				username,
 			);
 			const tableKeys = keysFor(keys, schema, table);
