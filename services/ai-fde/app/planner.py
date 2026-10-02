@@ -388,7 +388,8 @@ def compose_answer(turn: Turn) -> str:
             board = builds[-1]
             parts.append(f"Approve it below and the {board.get('build')} **{board.get('title')}** is built straight away.")
         else:
-            parts.append("Approve them below, then ask again and the answer will be ready.")
+            them = "it" if len(proposals) == 1 else "them"
+            parts.append(f"Approve {them} below, then ask again and the answer will be ready.")
     for step in failed_proposals:
         parts.append(f"A proposal could not be drafted: {(step.result or {}).get('error')}")
 

@@ -553,15 +553,32 @@ export async function modelSources(
 		}
 
 		// ── metrics ───────────────────────────────────────────────────────────
+		const existingMetrics = (
+			await client.query<{
+				api_name: string;
+				object_type_rid: string | null;
+				origin: string;
+				measure_column: string | null;
+				aggregation: string;
+				unfiltered: boolean;
+			}>(
+				`SELECT api_name, object_type_rid, origin, measure_column, aggregation,
+				        (base_filters IS NULL OR base_filters = '{}'::jsonb) AS unfiltered
+				   FROM platform.kpi_definition WHERE space_id = $1`,
+				[spaceId],
+			)
+		).rows;
 		const takenMetrics = new Set(
-			(
-				await client.query<{ api_name: string; object_type_rid: string | null; origin: string }>(
-					"SELECT api_name, object_type_rid, origin FROM platform.kpi_definition WHERE space_id = $1",
-					[spaceId],
-				)
-			).rows
+			existingMetrics
 				.filter((row) => !(row.origin === "modelled" && planned.some((p) => p.rid === row.object_type_rid)))
 				.map((row) => row.api_name),
+		);
+		// A metric someone approved in place of an automatic one keeps its
+		// place: modelling the type again does not add the automatic twin back.
+		const adopted = new Set(
+			existingMetrics
+				.filter((row) => row.origin !== "modelled" && row.unfiltered)
+				.map((row) => `${row.object_type_rid}|${row.measure_column}|${row.aggregation}`),
 		);
 		for (const plan of planned) {
 			await client.query(
@@ -578,6 +595,7 @@ export async function modelSources(
 					.filter(([, target]) => Boolean(target)),
 			);
 			for (const [order, metric] of metricsFor(plan.apiName, plan.label, plan.pluralLabel, plan.profiles, references).entries()) {
+				if (adopted.has(`${plan.rid}|${metric.measureColumn ?? null}|${metric.aggregation}`)) continue;
 				const apiName = unique(metric.apiName, takenMetrics);
 				await client.query(
 					`INSERT INTO platform.kpi_definition

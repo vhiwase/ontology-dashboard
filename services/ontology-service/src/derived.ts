@@ -1,5 +1,6 @@
 /**
- * Derived properties: arithmetic over the numeric properties of an object.
+ * Derived properties: arithmetic over the numeric properties of an object,
+ * and comparisons of its numbers or dates.
  *
  * "Line total = unit price × quantity × (1 − discount)" is the most common
  * thing a business needs that its tables do not store. It cannot be a metric
@@ -10,6 +11,12 @@
  *   numbers, property names, + - * /, unary minus, parentheses, and the
  *   functions round, abs, coalesce, greatest, least, nullif
  *
+ * and, for dates: days_between(from, to) - whole days from one date to the
+ * other - and comparisons (< <= > >= = <>) of two numbers or two dates, which
+ * give 1 when true, 0 when false and NULL when either side is missing. So
+ * "shipped on time" is `(shipped_date <= required_date) * 100`, and its average
+ * is an on-time percentage.
+ *
  * A name must be one of the numeric columns the caller is allowed to use, and
  * is emitted quoted and qualified by the table it belongs to. A number is
  * emitted as a numeric literal from its parsed value, never from the input
@@ -19,11 +26,14 @@
 
 import { BadRequest, quoteIdentifier } from "./registry";
 
+export type Comparison = "<" | "<=" | ">" | ">=" | "=" | "<>";
+
 export type Node =
 	| { kind: "number"; value: number }
 	| { kind: "column"; name: string }
 	| { kind: "unary"; operand: Node }
 	| { kind: "binary"; op: "+" | "-" | "*" | "/"; left: Node; right: Node }
+	| { kind: "compare"; op: Comparison; left: Node; right: Node }
 	| { kind: "call"; fn: string; args: Node[] };
 
 const FUNCTIONS: Record<string, { min: number; max: number }> = {
@@ -33,6 +43,7 @@ const FUNCTIONS: Record<string, { min: number; max: number }> = {
 	greatest: { min: 2, max: 4 },
 	least: { min: 2, max: 4 },
 	nullif: { min: 2, max: 2 },
+	days_between: { min: 2, max: 2 },
 };
 
 const MAX_LENGTH = 300;
@@ -42,6 +53,7 @@ type Token =
 	| { type: "number"; value: number }
 	| { type: "name"; value: string }
 	| { type: "op"; value: "+" | "-" | "*" | "/" }
+	| { type: "cmp"; value: Comparison }
 	| { type: "paren"; value: "(" | ")" }
 	| { type: "comma" };
 
@@ -68,6 +80,14 @@ export function tokenize(source: string): Token[] {
 			i += match[0].length;
 			continue;
 		}
+		const comparison = /^(<=|>=|<>|!=|==|<|>|=)/.exec(source.slice(i));
+		if (comparison) {
+			const op = comparison[0] === "!=" ? "<>" : comparison[0] === "==" ? "=" : (comparison[0] as Comparison);
+			tokens.push({ type: "cmp", value: op });
+			i += comparison[0].length;
+			if (tokens.length > MAX_TOKENS) throw new BadRequest("That expression is too long.");
+			continue;
+		}
 		if ("+-*/".includes(ch)) {
 			tokens.push({ type: "op", value: ch as "+" | "-" | "*" | "/" });
 		} else if (ch === "(" || ch === ")") {
@@ -75,7 +95,9 @@ export function tokenize(source: string): Token[] {
 		} else if (ch === ",") {
 			tokens.push({ type: "comma" });
 		} else {
-			throw new BadRequest(`'${ch}' is not allowed in an expression. Use numbers, property names, + - * / and parentheses.`);
+			throw new BadRequest(
+				`'${ch}' is not allowed in an expression. Use numbers, property names, + - * /, comparisons and parentheses.`,
+			);
 		}
 		i += 1;
 		if (tokens.length > MAX_TOKENS) throw new BadRequest("That expression is too long.");
@@ -83,12 +105,27 @@ export function tokenize(source: string): Token[] {
 	return tokens;
 }
 
-/** Recursive descent: expr := term (('+'|'-') term)*, term := factor (('*'|'/') factor)*. */
+/**
+ * Recursive descent:
+ *   comparison := expr (cmp expr)?
+ *   expr := term (('+'|'-') term)*, term := factor (('*'|'/') factor)*
+ * One comparison per level: `a < b < c` means nothing in SQL either.
+ */
 export function parse(source: string): Node {
 	const tokens = tokenize(source);
 	let pos = 0;
 	const peek = () => tokens[pos];
 	const take = () => tokens[pos++];
+
+	const comparison = (): Node => {
+		const left = expression();
+		const t = peek();
+		if (t?.type !== "cmp") return left;
+		take();
+		const right = expression();
+		if (peek()?.type === "cmp") throw new BadRequest("Compare two values at a time; use parentheses to combine comparisons.");
+		return { kind: "compare", op: t.value, left, right };
+	};
 
 	const expression = (): Node => {
 		let node = term();
@@ -113,7 +150,7 @@ export function parse(source: string): Node {
 		if (t.type === "op" && t.value === "+") return factor();
 		if (t.type === "number") return { kind: "number", value: t.value };
 		if (t.type === "paren" && t.value === "(") {
-			const inner = expression();
+			const inner = comparison();
 			const close = take();
 			if (close?.type !== "paren" || close.value !== ")") throw new BadRequest("A '(' is not closed.");
 			return inner;
@@ -146,7 +183,7 @@ export function parse(source: string): Node {
 		throw new BadRequest("The expression has an operator or comma where a value should be.");
 	};
 
-	const tree = expression();
+	const tree = comparison();
 	if (pos < tokens.length) throw new BadRequest("The expression has something left over after its end.");
 	return tree;
 }
@@ -159,6 +196,7 @@ export function columnsOf(node: Node): string[] {
 		case "unary":
 			return columnsOf(node.operand);
 		case "binary":
+		case "compare":
 			return [...columnsOf(node.left), ...columnsOf(node.right)];
 		case "call":
 			return node.args.flatMap(columnsOf);
@@ -175,27 +213,62 @@ export function columnsOf(node: Node): string[] {
  * numeric column - which refuses the expression.
  */
 export function compile(node: Node, resolve: (name: string) => string | null): string {
+	return compileTyped(node, resolve, () => null).sql;
+}
+
+type Typed = { sql: string; type: "number" | "date" };
+
+/** Compile with types: numbers take arithmetic, dates take comparison and days_between. */
+export function compileTyped(
+	node: Node,
+	numeric: (name: string) => string | null,
+	dates: (name: string) => string | null,
+): Typed {
+	const number = (child: Node, what: string): string => {
+		const typed = compileTyped(child, numeric, dates);
+		if (typed.type !== "number") throw new BadRequest(`${what} needs numbers; for dates use days_between(from, to) or a comparison.`);
+		return typed.sql;
+	};
 	switch (node.kind) {
 		case "number":
 			if (!Number.isFinite(node.value)) throw new BadRequest("A number in the expression is not finite.");
-			return `${node.value}::numeric`;
+			return { sql: `${node.value}::numeric`, type: "number" };
 		case "column": {
-			const sql = resolve(node.name);
-			if (!sql) throw new BadRequest(`'${node.name}' is not a numeric property that can be used here.`);
-			return sql;
+			const sql = numeric(node.name);
+			if (sql) return { sql, type: "number" };
+			const date = dates(node.name);
+			if (date) return { sql: date, type: "date" };
+			throw new BadRequest(`'${node.name}' is not a numeric or date property that can be used here.`);
 		}
 		case "unary":
-			return `(-${compile(node.operand, resolve)})`;
+			return { sql: `(-${number(node.operand, "A minus sign")})`, type: "number" };
 		case "binary": {
-			const left = compile(node.left, resolve);
-			const right = compile(node.right, resolve);
-			return node.op === "/" ? `(${left} / NULLIF(${right}, 0))` : `(${left} ${node.op} ${right})`;
+			const left = number(node.left, `'${node.op}'`);
+			const right = number(node.right, `'${node.op}'`);
+			return { sql: node.op === "/" ? `(${left} / NULLIF(${right}, 0))` : `(${left} ${node.op} ${right})`, type: "number" };
+		}
+		case "compare": {
+			const left = compileTyped(node.left, numeric, dates);
+			const right = compileTyped(node.right, numeric, dates);
+			if (left.type !== right.type) throw new BadRequest("A comparison needs two numbers or two dates.");
+			// Dates are compared as dates, so a timestamp and a date compare by day.
+			const l = left.type === "date" ? `(${left.sql})::date` : left.sql;
+			const r = right.type === "date" ? `(${right.sql})::date` : right.sql;
+			return {
+				sql: `(CASE WHEN ${l} IS NULL OR ${r} IS NULL THEN NULL WHEN ${l} ${node.op} ${r} THEN 1 ELSE 0 END)::numeric`,
+				type: "number",
+			};
 		}
 		case "call": {
-			const args = node.args.map((arg) => compile(arg, resolve));
+			if (node.fn === "days_between") {
+				const [from, to] = node.args.map((arg) => compileTyped(arg, numeric, dates));
+				if (from!.type !== "date" || to!.type !== "date") throw new BadRequest("days_between takes two dates.");
+				return { sql: `((${to!.sql})::date - (${from!.sql})::date)::numeric`, type: "number" };
+			}
+			const args = node.args.map((arg) => number(arg, `${node.fn}()`));
 			// round(x, n) needs an integer scale, so the second argument is cast.
-			if (node.fn === "round" && args.length === 2) return `round(${args[0]}, (${args[1]})::int)`;
-			return `${node.fn}(${args.join(", ")})`;
+			if (node.fn === "round" && args.length === 2) return { sql: `round(${args[0]}, (${args[1]})::int)`, type: "number" };
+			return { sql: `${node.fn}(${args.join(", ")})`, type: "number" };
 		}
 	}
 }
@@ -204,12 +277,18 @@ export function compile(node: Node, resolve: (name: string) => string | null): s
 export function compileExpression(
 	source: string,
 	allowed: Map<string, string>,
+	dateColumns: Map<string, string> = new Map(),
 ): { sql: string; columns: string[] } {
 	const tree = parse(source);
-	return {
-		sql: compile(tree, (name) => allowed.get(name) ?? allowed.get(name.toLowerCase()) ?? null),
-		columns: [...new Set(columnsOf(tree))],
-	};
+	const typed = compileTyped(
+		tree,
+		(name) => allowed.get(name) ?? allowed.get(name.toLowerCase()) ?? null,
+		(name) => dateColumns.get(name) ?? dateColumns.get(name.toLowerCase()) ?? null,
+	);
+	if (typed.type !== "number") {
+		throw new BadRequest("A derived property must be a number: compare dates, or use days_between(from, to).");
+	}
+	return { sql: typed.sql, columns: [...new Set(columnsOf(tree))] };
 }
 
 /** A plain column name a derived property may be given. */

@@ -157,7 +157,8 @@ function lowerFirst(value: string): string {
 	return value ? value[0]!.toLowerCase() + value.slice(1) : value;
 }
 
-function pascal(value: string): string {
+/** The type name a dataset called `value` is given on approval. */
+export function pascal(value: string): string {
 	return value
 		.split(/[^A-Za-z0-9]+/)
 		.filter(Boolean)
@@ -444,6 +445,25 @@ async function applyMetric(payload: Record<string, unknown>, username: string): 
 	const draft = await draftMetric(payload);
 	const p = draft.payload;
 	const type = resolveObjectType(String(p.objectType));
+	const total = (draft.preview.total as number | null) ?? null;
+
+	// The same figure made automatically when the type was modelled (the
+	// average of on_time_pct, say) is adopted - given this name and format and
+	// kept from then on - rather than measured twice under two names.
+	const twin = automaticTwin(type, p);
+	if (twin) {
+		await withActiveVersion(async (client, { spaceId }) => {
+			await client.query(
+				`UPDATE platform.kpi_definition
+				    SET label = $3, description = COALESCE($4, description), business_question = COALESCE($5, business_question),
+				        unit = $6, value_format = $7, origin = 'proposal'
+				  WHERE space_id = $1 AND api_name = $2`,
+				[spaceId, twin.apiName, p.label, p.description, p.businessQuestion, p.unit, p.format],
+			);
+		});
+		return { metric: twin.apiName, adopted: true, total };
+	}
+
 	await withActiveVersion(async (client, { spaceId }) => {
 		await client.query(
 			`INSERT INTO platform.kpi_definition
@@ -460,7 +480,25 @@ async function applyMetric(payload: Record<string, unknown>, username: string): 
 			],
 		);
 	});
-	return { metric: p.apiName, total: (draft.preview.total as number | null) ?? null };
+	return { metric: p.apiName, total };
+}
+
+/** A metric modelling made on its own that measures exactly what `p` does. */
+function automaticTwin(type: ObjectTypeMeta, p: Record<string, unknown>): KpiMeta | null {
+	const unfiltered = (filters: unknown) => !filters || Object.keys(filters as object).length === 0;
+	if (!unfiltered(p.filters)) return null;
+	return (
+		getRegistry().kpis.find(
+			(k) =>
+				k.origin === "modelled" &&
+				k.objectTypeRid === type.rid &&
+				k.aggregation === p.aggregation &&
+				(k.measureColumn ?? null) === (p.measure ?? null) &&
+				(k.numeratorColumn ?? null) === (p.numerator ?? null) &&
+				(k.denominatorColumn ?? null) === (p.denominator ?? null) &&
+				unfiltered(k.baseFilters),
+		) ?? null
+	);
 }
 
 // ── combination ─────────────────────────────────────────────────────────────
@@ -519,12 +557,12 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 	if (registry.objectTypeByApiName.has(apiName)) throw new BadRequest(`An object type called ${apiName} already exists.`);
 
 	// Output columns: every base column, then the joined fields, then derived.
-	const outputs = new Map<string, { sql: string; numeric: boolean; from: string }>();
+	const outputs = new Map<string, { sql: string; numeric: boolean; temporal?: boolean; from: string }>();
 	// Columns that identify rows in the type they came from keep that role in
 	// the combination: a reference copied into a view is still a reference.
 	const identityColumns: string[] = [];
 	for (const p of base.properties) {
-		outputs.set(p.sqlColumn, { sql: `b.${quoteIdentifier(p.sqlColumn)}`, numeric: isNumeric(p), from: base.apiName });
+		outputs.set(p.sqlColumn, { sql: `b.${quoteIdentifier(p.sqlColumn)}`, numeric: isNumeric(p), temporal: isTemporal(p), from: base.apiName });
 		if (p.semanticRole === "identity" && p.sqlColumn !== base.primaryKeyColumn) identityColumns.push(p.sqlColumn);
 	}
 	const joinSql: string[] = [];
@@ -565,22 +603,28 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 			outputs.set(column, {
 				sql: `${previousAlias}.${quoteIdentifier(property.sqlColumn)}`,
 				numeric: isNumeric(property),
+				temporal: isTemporal(property),
 				from: finalType.apiName,
 			});
 			if (property.semanticRole === "identity") identityColumns.push(column);
 			fieldsUsed.push({ column, from: finalType.apiName, property: property.sqlColumn });
 		}
 	}
-	const derivedUsed: Array<{ name: string; expression: string }> = [];
+	const derivedUsed: Array<{ name: string; expression: string; metric?: DerivedMetric }> = [];
 	for (const entry of derived) {
 		const column = assertDerivedName(String(entry.name ?? ""));
 		if (outputs.has(column)) throw new BadRequest(`'${column}' is already a property of this combination.`);
 		const numericColumns = new Map(
 			[...outputs.entries()].filter(([, value]) => value.numeric).map(([key, value]) => [key, value.sql]),
 		);
-		const { sql } = compileExpression(String(entry.expression ?? ""), numericColumns);
+		// Dates may be compared or subtracted with days_between; never added up.
+		const dateColumns = new Map(
+			[...outputs.entries()].filter(([, value]) => value.temporal).map(([key, value]) => [key, value.sql]),
+		);
+		const { sql } = compileExpression(String(entry.expression ?? ""), numericColumns, dateColumns);
 		outputs.set(column, { sql, numeric: true, from: "derived" });
-		derivedUsed.push({ name: column, expression: String(entry.expression) });
+		const metric = derivedMetric(entry.metric);
+		derivedUsed.push({ name: column, expression: String(entry.expression), ...(metric ? { metric } : {}) });
 	}
 
 	const space = await queryOne<{ space_id: string }>("SELECT space_id::text FROM platform.space WHERE slug = $1", [currentSpace()]);
@@ -604,7 +648,7 @@ async function draftCombination(raw: Record<string, unknown>): Promise<Draft> {
 			`${base.pluralLabel ?? plural(base.label)} with ` +
 			[
 				...fieldsUsed.map((f) => `${f.from}.${f.property}`),
-				...derivedUsed.map((d) => `${d.name} = ${d.expression}`),
+				...derivedUsed.map((d) => `${d.name} = ${d.expression}${d.metric ? ` (measured as "${d.metric.label}")` : ""}`),
 			].join(", ") +
 			`. One row per ${base.label.toLowerCase()} (${rowCount.toLocaleString("en-US")} rows), modelled as the object type ${apiName}.`,
 		payload: {
@@ -665,7 +709,61 @@ async function applyCombination(payload: Record<string, unknown>, username: stri
 		],
 		username,
 	);
-	return { objectType: p.apiName, view: viewName, metrics: model.metrics.map((m) => m.apiName), links: model.links.map((l) => l.apiName) };
+	// The figures the derived columns were made for get the names they were
+	// asked for: the automatic metric is adopted, or one is made. The dataset
+	// stands either way, so a figure that cannot be made is reported, not fatal.
+	const named: string[] = [];
+	const notes: string[] = [];
+	// Its rows are still the base type's: counted as "Orders", not "Enriched Orders".
+	try {
+		const counted = await applyMetric(
+			{ objectType: p.apiName, aggregation: "count", label: base.pluralLabel ?? plural(base.label) },
+			username,
+		);
+		named.push(String(counted.metric));
+	} catch (error) {
+		notes.push(`The row count keeps its automatic name: ${(error as Error).message}`);
+	}
+	for (const entry of (p.derived as Array<{ name: string; metric?: DerivedMetric }>) ?? []) {
+		if (!entry.metric) continue;
+		try {
+			const made = await applyMetric({ objectType: p.apiName, measure: entry.name, ...entry.metric }, username);
+			named.push(String(made.metric));
+		} catch (error) {
+			notes.push(`"${entry.metric.label}" was not made: ${(error as Error).message}`);
+		}
+	}
+	return {
+		objectType: p.apiName,
+		view: viewName,
+		metrics: model.metrics.map((m) => m.apiName),
+		links: model.links.map((l) => l.apiName),
+		...(named.length ? { named } : {}),
+		...(notes.length ? { notes } : {}),
+	};
+}
+
+/** The metric a derived column is made for: "On-time rate" = avg(on_time_pct). */
+export interface DerivedMetric {
+	aggregation: "sum" | "avg" | "min" | "max";
+	label: string;
+	format?: "number" | "integer" | "currency" | "percent";
+}
+
+export function derivedMetric(raw: unknown): DerivedMetric | null {
+	if (raw === undefined || raw === null) return null;
+	const entry = raw as Record<string, unknown>;
+	const aggregation = String(entry.aggregation ?? "").toLowerCase();
+	if (!["sum", "avg", "min", "max"].includes(aggregation)) {
+		throw new BadRequest("A derived property's metric adds up (sum), averages (avg) or takes the min or max.");
+	}
+	const label = str(entry.label, "derived[].metric.label");
+	if (label.length > 60) throw new BadRequest("A metric's name is at most 60 characters.");
+	const format = entry.format === undefined ? undefined : String(entry.format);
+	if (format !== undefined && !["number", "integer", "currency", "percent"].includes(format)) {
+		throw new BadRequest("format must be number, integer, currency or percent.");
+	}
+	return { aggregation, label, ...(format ? { format } : {}) } as DerivedMetric;
 }
 
 // ── action_type ─────────────────────────────────────────────────────────────

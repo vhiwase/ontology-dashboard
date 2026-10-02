@@ -524,7 +524,7 @@ export async function executeKpiWith(
 		description: kpi.description,
 		total,
 		dimension,
-		dimensionLabel: dimension ? humanizeColumn(dimension) : null,
+		dimensionLabel: dimension ? dimensionLabelOf(dimension) : null,
 		series,
 		rowCount: series.length,
 		dependsOnSimulation: kpi.dependsOnSimulation,
@@ -538,6 +538,18 @@ export async function executeKpiWith(
 		dataThrough,
 		partialPeriod,
 	};
+}
+
+/** "Shipper Company Name" reads "Shipper": a linked type's name stands for the type. */
+export function dimensionLabelOf(dimension: string): string {
+	const label = humanizeColumn(dimension);
+	const match = /^(.+?) (Company Name|Last Name|Full Name|Name)$/.exec(label);
+	if (!match) return label;
+	const prefix = match[1]!.toLowerCase();
+	const isType = getRegistry().objectTypes.some(
+		(type) => type.origin !== "combination" && [type.label, type.pluralLabel ?? ""].some((name) => name.toLowerCase() === prefix),
+	);
+	return isType ? match[1]! : label;
 }
 
 export function humanizeColumn(dimension: string): string {

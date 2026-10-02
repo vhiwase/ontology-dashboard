@@ -17,9 +17,9 @@ vi.hoisted(() => {
 import { effectiveRole, personalSpaceRefusal, validateRegistration, type Principal, type SpaceAccess } from "./auth";
 import { isLinkLocal, isLoopback, isPrivateAddress } from "./connectionPolicy";
 import { assertDerivedName, compileExpression } from "./derived";
-import { detectIntent, parseQuestion, tokens, widgetTitle } from "./feasibility";
+import { asksAboutPunctuality, detectIntent, parseQuestion, sliceName, tokens, widgetTitle } from "./feasibility";
 import { humanize, inferRoles, plural, singular, typeApiName, type ColumnInfo, type ColumnStats } from "./profiling";
-import { parseFollowUp } from "./proposals";
+import { derivedMetric, parseFollowUp } from "./proposals";
 import type { KpiMeta } from "./registry";
 import { __testing as vaultTesting, decrypt, encrypt, isVaultRef } from "./vault";
 
@@ -146,6 +146,19 @@ describe("widgetTitle", () => {
 		expect(widgetTitle(kpi, "shipped_date:week")).toBe("Total Revenue per week (shipped date)");
 		expect(widgetTitle(kpi, "customer_country")).toBe("Total Revenue by customer country");
 		expect(widgetTitle(kpi, null)).toBe("Total Revenue");
+	});
+});
+
+describe("sliceName", () => {
+	const types = (phrase: string) => ["shipper", "employee", "customer", "category"].includes(phrase);
+	it("lets a linked type's name stand for the type", () => {
+		expect(sliceName("shipper_company_name", types)).toEqual({ text: "shipper", isType: true });
+		expect(sliceName("employee_last_name", types)).toEqual({ text: "employee", isType: true });
+		expect(sliceName("category_name", types)).toEqual({ text: "category", isType: true });
+	});
+	it("leaves other columns as they are", () => {
+		expect(sliceName("ship_name", types)).toEqual({ text: "ship name", isType: false });
+		expect(sliceName("customer_country", types)).toEqual({ text: "customer country", isType: false });
 	});
 });
 
@@ -303,4 +316,73 @@ describe("vault", () => {
 		expect(isVaultRef("env:DATABASE_URL")).toBe(false);
 		expect(isVaultRef(null)).toBe(false);
 	});
+});
+
+// ── derived dates: on time, days late ───────────────────────────────────────
+
+describe("derived expressions over dates", () => {
+	const numbers = new Map([["quantity", 'b."quantity"']]);
+	const dates = new Map([
+		["shipped_date", 'b."shipped_date"'],
+		["required_date", 'b."required_date"'],
+	]);
+
+	it("compares two dates into a 0/1 flag that leaves missing dates out", () => {
+		const { sql, columns } = compileExpression("(shipped_date <= required_date) * 100", numbers, dates);
+		expect(sql).toContain(`WHEN (b."shipped_date")::date IS NULL OR (b."required_date")::date IS NULL THEN NULL`);
+		expect(sql).toContain(`WHEN (b."shipped_date")::date <= (b."required_date")::date THEN 1 ELSE 0`);
+		expect(columns.sort()).toEqual(["required_date", "shipped_date"]);
+	});
+
+	it("counts days between two dates", () => {
+		const { sql } = compileExpression("days_between(required_date, shipped_date)", numbers, dates);
+		expect(sql).toBe(`((b."shipped_date")::date - (b."required_date")::date)::numeric`);
+	});
+
+	it.each([
+		["shipped_date", /must be a number/],
+		["shipped_date - required_date", /days_between/],
+		["shipped_date <= quantity", /two numbers or two dates/],
+		["days_between(quantity, shipped_date)", /two dates/],
+		["a < b < c", /two values at a time/],
+	])("refuses %s", (source, message) => {
+		expect(() => compileExpression(source, new Map([...numbers, ["a", "a"], ["b", "b"], ["c", "c"]]), dates)).toThrow(message);
+	});
+
+	it("still accepts plain arithmetic and != / ==", () => {
+		expect(compileExpression("quantity * 2", numbers).sql).toBe(`(b."quantity" * 2::numeric)`);
+		expect(compileExpression("quantity != 0", numbers).sql).toContain("<> 0::numeric");
+		expect(compileExpression("quantity == 0", numbers).sql).toContain("= 0::numeric");
+	});
+});
+
+describe("punctuality questions", () => {
+	it.each(["on-time delivery rate", "orders shipped late", "average delay", "overdue invoices", "Late orders", "On-time rate"])(
+		"reads %s as being about punctuality",
+		(phrase) => expect(asksAboutPunctuality(phrase)).toBe(true),
+	);
+	it.each(["latest orders", "revenue by month", "translated titles", "plate count"])("does not read %s that way", (phrase) =>
+		expect(asksAboutPunctuality(phrase)).toBe(false),
+	);
+});
+
+describe("derivedMetric", () => {
+	it("is optional", () => {
+		expect(derivedMetric(undefined)).toBeNull();
+		expect(derivedMetric(null)).toBeNull();
+	});
+	it("names the figure a derived column is made for", () => {
+		expect(derivedMetric({ aggregation: "AVG", label: "On-time rate", format: "percent" })).toEqual({
+			aggregation: "avg",
+			label: "On-time rate",
+			format: "percent",
+		});
+		expect(derivedMetric({ aggregation: "sum", label: "Late orders" })).toEqual({ aggregation: "sum", label: "Late orders" });
+	});
+	it.each([
+		[{ aggregation: "count", label: "x" }, /sum|avg/],
+		[{ aggregation: "sum" }, /label is required/],
+		[{ aggregation: "sum", label: "x".repeat(61) }, /at most 60/],
+		[{ aggregation: "avg", label: "x", format: "stars" }, /format must be/],
+	])("refuses %j", (raw, message) => expect(() => derivedMetric(raw)).toThrow(message));
 });

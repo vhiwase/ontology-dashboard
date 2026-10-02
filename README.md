@@ -120,12 +120,20 @@ ontology first:
 | Answer | What happens |
 |---|---|
 | **Ready** | An existing metric answers it. The chart, KPI, dashboard or report is built. |
-| **Needs approval** | One more building block is needed - a **link** (found by column name or by values, or named by you), a **combined dataset** (rows of one type with fields from the types they point at, plus derived columns such as `revenue = unit_price * quantity * (1 - discount)`), a **metric**, or an **action type**. It is drafted and measured - match ratio, preview value, sample rows - and waits in *Approvals*. Nothing changes until you approve. |
+| **Needs approval** | One more building block is needed - a **link** (found by column name or by values, or named by you), a **combined dataset** (rows of one type with fields from the types they point at, plus derived columns such as `revenue = unit_price * quantity * (1 - discount)`, `days_between(order_date, shipped_date)` or `(shipped_date <= required_date) * 100`), a **metric**, or an **action type**. It is drafted and measured - match ratio, preview value, sample rows - and waits in *Approvals*. Nothing changes until you approve. |
 | **Not possible** | The data does not hold what is needed. You are told what is missing and offered the nearest questions it can answer. |
 
 A dashboard asked for on data that cannot support a good one (no timeline,
 little to slice, or not the figure asked for) becomes a proposal for one wide,
 analysis-ready dataset - and the board is **built the moment you approve it**.
+
+Being on time is a figure no column holds but two dates do. "On-time delivery
+rate by month" or "how many orders shipped late" on rows with a promised date
+and an actual one (`required_date` and `shipped_date`, say) proposes a
+*Timing* dataset: each row flagged on time or late, with its days late and
+days to complete, measured as **On-time rate** and **Late orders** and
+sliceable by whatever the rows point at. Rows with no actual date yet count as
+neither. Data without both dates is told so - it is never estimated.
 
 ### Dashboards and reports
 

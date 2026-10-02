@@ -23,7 +23,7 @@
 import type { Widget } from "./dashboards";
 import { measureLinkNow } from "./modeling";
 import { humanize, plural, singular, snake } from "./profiling";
-import { dimensionsOf } from "./proposals";
+import { dimensionsOf, pascal } from "./proposals";
 import {
 	getRegistry,
 	type KpiMeta,
@@ -105,6 +105,13 @@ const SYNONYMS: Record<string, string[]> = {
 };
 const GROUP_OF = new Map<string, string>();
 for (const [group, words] of Object.entries(SYNONYMS)) for (const word of words) GROUP_OF.set(word, group);
+
+// Punctuality compares a promised date with an actual one on the same row; the
+// start date, when there is one, gives the time taken.
+const PROMISED_DATE = /(required|due|promised|expected|planned|deadline|target)/;
+const ACTUAL_DATE = /(shipped|delivered|actual|completed|closed|arrived|paid|resolved|fulfilled|finished)/;
+const START_DATE = /(order|created|placed|opened|start|booked|requested|date$)/;
+const PUNCTUAL = /\b(on.?time|late|lateness|delays?|delayed|punctual|punctuality|overdue)\b/;
 
 export function words(text: string): string[] {
 	return text
@@ -328,10 +335,35 @@ function revenueRecipe(): { type: ObjectTypeMeta; expression: string; name: stri
 // ── deciding one request ────────────────────────────────────────────────────
 
 /** "Orders per month", "Revenue by customer country". */
+/**
+ * What a slice is called in a title: a linked type's name column stands for
+ * the type - "shipper_company_name" reads "shipper", "employee_last_name"
+ * "employee" - and anything else reads as its column.
+ */
+export function sliceName(column: string, namesType: (phrase: string) => boolean = registryNamesType): { text: string; isType: boolean } {
+	const text = humanize(column).toLowerCase();
+	const match = /^(.+?) (company name|last name|full name|name)$/.exec(text);
+	return match && namesType(match[1]!) ? { text: match[1]!, isType: true } : { text, isType: false };
+}
+
+function registryNamesType(phrase: string): boolean {
+	try {
+		return getRegistry().objectTypes.some((type) => type.origin !== "combination" && namesTypeExactly(phrase, type));
+	} catch {
+		return false;
+	}
+}
+
+/** "Top customers", "Top ship name": a ranking names what is ranked. */
+function rankedName(column: string): string {
+	const slice = sliceName(column);
+	return slice.isType ? plural(slice.text) : slice.text;
+}
+
 export function widgetTitle(kpi: KpiMeta, dimension: string | null): string {
 	if (!dimension) return kpi.label;
 	const [column = "", grain] = dimension.split(":");
-	if (!grain) return `${kpi.label} by ${humanize(column).toLowerCase()}`;
+	if (!grain) return `${kpi.label} by ${sliceName(column).text}`;
 	// The metric's own date needs no naming; any other date does.
 	return kpi.timeColumn && kpi.timeColumn !== column
 		? `${kpi.label} per ${grain} (${humanize(column).toLowerCase()})`
@@ -392,6 +424,131 @@ async function proposeJoinKey(source: ObjectTypeMeta, target: ObjectTypeMeta): P
 	return null;
 }
 
+/** "On-time rate", "orders shipped late", "delays" - but not "latest orders". */
+export function asksAboutPunctuality(phrase: string): boolean {
+	return PUNCTUAL.test(phrase.toLowerCase());
+}
+
+/** The metric a punctuality question is answered from, once it exists. */
+function punctualityKpi(counting: boolean): KpiMeta | null {
+	const [measure, aggregation] = counting ? ["is_late", "sum"] : ["on_time_pct", "avg"];
+	return getRegistry().kpis.find((k) => k.measureColumn === measure && k.aggregation === aggregation) ?? null;
+}
+
+/**
+ * "On-time rate", "late orders": answered from a promised and an actual date
+ * on the same rows. The flags are derived once, in a dataset that also carries
+ * what the rows are sliced by, and the figure is a metric over them - the rate
+ * an average of 0 or 100 per row, the count a sum of 0 or 1 - so a row with no
+ * actual date yet counts as neither on time nor late.
+ */
+function punctuality(request: FeasibilityRequest, counting: boolean): FeasibilityItem {
+	const registry = getRegistry();
+	const dateLike = (t: ObjectTypeMeta, pattern: RegExp, not?: PropertyMeta) =>
+		t.properties.find((p) => p.semanticRole === "temporal" && p !== not && pattern.test(p.sqlColumn));
+	const promisedOf = (t: ObjectTypeMeta) => dateLike(t, PROMISED_DATE);
+	const actualOf = (t: ObjectTypeMeta) => dateLike(t, ACTUAL_DATE, promisedOf(t));
+	const dated = registry.objectTypes.find((t) => t.origin !== "combination" && promisedOf(t) && actualOf(t));
+	if (!dated) {
+		return {
+			request,
+			status: "not_possible",
+			explanation:
+				"Being on time needs a promised date and an actual date for the same thing (a due date and a shipped date, say), " +
+				"and no type in this workspace has both.",
+			missing: ["a promised date and an actual date on the same rows"],
+			alternatives: registry.kpis
+				.filter((k) => k.dimensions.some((d) => d.endsWith(":month")))
+				.slice(0, 4)
+				.map((k) => `${k.label} per month`),
+		};
+	}
+	const promised = promisedOf(dated)!.sqlColumn;
+	const actual = actualOf(dated)!.sqlColumn;
+	const many = dated.pluralLabel?.toLowerCase() ?? plural(dated.label.toLowerCase());
+	const metric = counting
+		? { measure: "is_late", aggregation: "sum", format: "integer", label: `Late ${many}` }
+		: { measure: "on_time_pct", aggregation: "avg", format: "percent", label: "On-time rate" };
+	const metricSummary = counting
+		? `The number of ${many} with ${actual} after ${promised}.`
+		: `The share of ${many} with ${actual} on or before ${promised}.`;
+
+	// The flags were derived by an earlier approval: only the metric is new.
+	const timing = registry.objectTypes.find(
+		(t) => t.origin === "combination" && t.properties.some((p) => p.sqlColumn === metric.measure),
+	);
+	if (timing) {
+		return {
+			request,
+			status: "needs_approval",
+			explanation:
+				`${timing.pluralLabel ?? timing.label} already carry \`${metric.measure}\` for each ${dated.label.toLowerCase()}. ` +
+				`Approve the metric "${metric.label}" over it and it can be charted by month or by anything those rows carry.`,
+			proposals: [
+				{
+					kind: "metric",
+					title: `New metric: ${metric.label}`,
+					summary: metricSummary,
+					payload: { objectType: timing.apiName, ...metric },
+					dependsOn: [],
+				},
+			],
+		};
+	}
+
+	const start = dated.properties.find(
+		(p) => p.semanticRole === "temporal" && p.sqlColumn !== promised && p.sqlColumn !== actual && START_DATE.test(p.sqlColumn),
+	);
+	// Both figures are named here, whichever was asked for: approving the
+	// dataset makes them, and the next question about lateness is answered.
+	const derived = [
+		{
+			name: "on_time_pct",
+			expression: `(${actual} <= ${promised}) * 100`,
+			metric: { aggregation: "avg", label: "On-time rate", format: "percent" },
+		},
+		{
+			name: "is_late",
+			expression: `(${actual} > ${promised})`,
+			metric: { aggregation: "sum", label: `Late ${many}`, format: "integer" },
+		},
+		{
+			// Late rows only: an early shipment is not "-3 days late".
+			name: "days_late",
+			expression: `nullif(greatest(days_between(${promised}, ${actual}), 0), 0)`,
+			metric: { aggregation: "avg", label: "Average days late", format: "number" },
+		},
+		...(start ? [{ name: "days_to_complete", expression: `days_between(${start.sqlColumn}, ${actual})` }] : []),
+	];
+	// What the rows point at comes along, so the rate can be sliced by it.
+	const joins = analysisJoins(dated);
+	const carried = joins.map((j) => `${j.target.label.toLowerCase()} (${j.fields.map((f) => humanize(f).toLowerCase()).join(", ")})`);
+	const name = freeDatasetName(`${dated.label} Timing`);
+	return {
+		request,
+		status: "needs_approval",
+		explanation:
+			`${dated.pluralLabel ?? dated.label} carry a promised date (${promised}) and an actual one (${actual}). ` +
+			`Approve and each ${dated.label.toLowerCase()} is flagged on time (\`${actual} <= ${promised}\`) or late, with how many days late the late ones were` +
+			(start ? ` and days to complete from ${start.sqlColumn}` : "") +
+			`; "On-time rate" and "Late ${many}" are measured from the flags` +
+			(carried.length ? ` and can be charted by month or by ${joins.map((j) => j.target.label.toLowerCase()).join(", ")}` : " and can be charted by month") +
+			`. ${dated.pluralLabel ?? dated.label} without ${actual} yet count as neither on time nor late.`,
+		proposals: [
+			{
+				kind: "combination",
+				title: `New dataset: ${name}`,
+				summary:
+					`${dated.pluralLabel ?? dated.label} with ${derived.map((d) => `${d.name} = \`${d.expression}\``).join(", ")}` +
+					(carried.length ? `, and ${carried.join("; ")}` : "") +
+					`. Measured as "On-time rate" and "Late ${many}".`,
+				payload: { name, base: dated.apiName, joins: joins.map((j) => ({ path: j.path, fields: j.fields })), derived },
+				dependsOn: [],
+			},
+		],
+	};
+}
+
 async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 	const registry = getRegistry();
 	const subjectHint = request.objectType ? registry.objectTypeByApiName.get(request.objectType) ?? matchType(request.objectType) : null;
@@ -421,6 +578,18 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 		) ?? null;
 	} else if (kpiMatch) {
 		kpi = kpiMatch.kpi;
+	}
+
+	// 1b. Punctuality - "on-time rate", "how many orders shipped late" - is a
+	// figure no column holds, but two dates on the same row do. The count of
+	// orders that merely matched the noun answers a different question, so it
+	// does not stand in.
+	if (asksAboutPunctuality(measurePhrase) && !(kpi && asksAboutPunctuality(kpi.label))) {
+		const counting = aggregation === "count" || /\b(how many|number of|count of)\b/.test(request.text ?? measurePhrase);
+		const measured = punctualityKpi(counting);
+		if (!measured) return punctuality(request, counting);
+		kpi = measured;
+		measureProperty = null;
 	}
 
 	let measureType = kpi
@@ -576,26 +745,6 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 				],
 			};
 		}
-	}
-
-	// 4a. Punctuality needs a promised and an actual date; say what exists.
-	if (!kpi && !measureProperty && /\b(on.?time|late|lateness|delay|delayed|punctual)/.test(measurePhrase)) {
-		const dated = registry.objectTypes.find(
-			(t) =>
-				t.properties.some((p) => p.semanticRole === "temporal" && /(required|due|promised|expected|planned|deadline)/.test(p.sqlColumn)) &&
-				t.properties.some((p) => p.semanticRole === "temporal" && /(shipped|delivered|actual|completed|closed|arrived)/.test(p.sqlColumn)),
-		);
-		return {
-			request,
-			status: "not_possible",
-			explanation: dated
-				? `There is no on-time measure yet. ${dated.pluralLabel ?? dated.label} carry a promised date and an actual date ` +
-					`(${dated.properties.filter((p) => p.semanticRole === "temporal").map((p) => p.sqlColumn).join(", ")}), so one could be ` +
-					"defined by comparing them - comparisons between dates are not something this workspace can derive automatically yet."
-				: "Punctuality needs a promised date and an actual date for the same thing, and no type in this workspace has both.",
-			missing: dated ? ["a derived on-time flag (date comparison)"] : ["a promised date and an actual date"],
-			alternatives: registry.kpis.slice(0, 5).map((k) => k.label),
-		};
 	}
 
 	// 4. Nothing to measure.
@@ -806,7 +955,7 @@ async function decide(request: FeasibilityRequest): Promise<FeasibilityItem> {
 //  a combination like any other, so it waits for approval, and the board the
 //  person asked for is built from it the moment it is approved.
 
-const CONTACT_LIKE = /(address|street|postal|zip|phone|fax|url|email|homepage|photo|picture|notes|password|token|extension)/i;
+const CONTACT_LIKE = /(address|street|postal|zip|phone|fax|url|email|homepage|photo|picture|notes|password|token|extension|contact_|job_title|title_of_courtesy|salutation)/i;
 
 function dimensionRank(property: PropertyMeta): number {
 	const column = property.sqlColumn.toLowerCase();
@@ -870,6 +1019,26 @@ export function analysisJoins(base: ObjectTypeMeta, maxHops = 2): Array<{ path: 
 	return joins.slice(0, 8);
 }
 
+/** "Enriched Order": the wide dataset an earlier approval made of `type`. */
+function enrichedOf(type: ObjectTypeMeta): ObjectTypeMeta | null {
+	return (
+		getRegistry().objectTypes.find(
+			(t) => t.origin === "combination" && /^enriched\s/i.test(t.label) && namesTypeExactly(t.label.replace(/^enriched\s+/i, ""), type),
+		) ?? null
+	);
+}
+
+/**
+ * A dataset name no type has taken yet - "Order Timing", then "Order Timing 2" -
+ * checked against the type name approving it would create.
+ */
+function freeDatasetName(base: string): string {
+	const taken = getRegistry().objectTypeByApiName;
+	let name = base.slice(0, 60);
+	for (let n = 2; taken.has(pascal(name)); n += 1) name = `${base.slice(0, 56)} ${n}`;
+	return name;
+}
+
 function titleCase(text: string): string {
 	return text.replace(/\b([a-z])/g, (_, letter: string) => letter.toUpperCase());
 }
@@ -884,16 +1053,21 @@ function analysisDataset(
 	boardTitle: string,
 	sourcePrompt: string,
 ): { item: FeasibilityItem } | null {
-	const registry = getRegistry();
 	const topicTokens = tokens(topic);
 	const recipe = topicTokens.includes("revenue") ? revenueRecipe() : null;
 	const measureMatch = recipe ? null : topic ? matchProperty(topic, ["measure"], null) : null;
+	const named = topic ? matchType(topic) : null;
+	// The type a topic names outranks a property that merely shares a word
+	// with it: "orders" is Order, not Product's units on order.
+	const namedWins = named !== null && (!measureMatch || overlap(topicTokens, typeTokens(named)) >= measureMatch.score);
 	const base =
 		recipe?.type ??
+		(namedWins ? named : null) ??
 		(measureMatch && measureMatch.type.origin !== "combination" ? measureMatch.type : null) ??
-		(topic ? matchType(topic) : null) ??
+		named ??
 		pickSubject("");
-	if (!base) return null;
+	// Already enriched by an earlier approval: the board is built on that.
+	if (!base || (!recipe && enrichedOf(base))) return null;
 	const joins = analysisJoins(base);
 	const hasOwnDate = base.properties.some((p) => p.semanticRole === "temporal");
 	const joinedDate = joins.some((j) => j.target.properties.some((p) => j.fields.includes(p.sqlColumn) && p.semanticRole === "temporal"));
@@ -902,10 +1076,7 @@ function analysisDataset(
 	// "Sales Order Detail" for a figure; "Enriched Product" when the topic is
 	// the type itself (or there is none).
 	const topicIsType = !topic || overlap(tokens(topic), typeTokens(base)) > 0;
-	let name = (topicIsType ? `Enriched ${base.label}` : `${titleCase(topic)} ${base.label}`).slice(0, 60);
-	for (let n = 2; registry.objectTypeByApiName.has(name.replace(/[^A-Za-z0-9]+/g, " ").split(" ").filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("")); n += 1) {
-		name = `${name.replace(/ \d+$/, "")} ${n}`;
-	}
+	const name = freeDatasetName(topicIsType ? `Enriched ${base.label}` : `${titleCase(topic)} ${base.label}`);
 	const measure = recipe?.name ?? measureMatch?.property.sqlColumn ?? null;
 	const carried = joins.map((j) => `${j.target.label.toLowerCase()} (${j.fields.map((f) => humanize(f).toLowerCase()).join(", ")})`);
 	const proposal: DraftProposal = {
@@ -1210,11 +1381,7 @@ export async function combinationRequest(text: string): Promise<FeasibilityItem>
 			missing: ["a link to bring the other type in"],
 		};
 	}
-	const registry = getRegistry();
-	let name = `Enriched ${base.label}`.slice(0, 60);
-	for (let n = 2; registry.objectTypeByApiName.has(name.replace(/[^A-Za-z0-9]+/g, " ").split(" ").filter(Boolean).map((w) => w[0]!.toUpperCase() + w.slice(1)).join("")); n += 1) {
-		name = `Enriched ${base.label} ${n}`.slice(0, 60);
-	}
+	const name = freeDatasetName(`Enriched ${base.label}`);
 	const carried = joins.map((j) => `${j.target.label.toLowerCase()} (${j.fields.map((f) => humanize(f).toLowerCase()).join(", ")})`);
 	proposals.push({
 		kind: "combination",
@@ -1283,12 +1450,22 @@ export async function planBoard(
 		? metrics.find((k) => k.measureColumn === options.measure && k.aggregation === "sum") ??
 			metrics.find((k) => k.measureColumn === options.measure)
 		: undefined;
+	// Figures someone named when approving them (an on-time rate, late
+	// orders) come before the ones modelling made on its own.
+	const named = metrics.filter(
+		(k) => k !== lead && k !== count && k.origin === "proposal" && Object.keys(k.baseFilters ?? {}).length === 0,
+	);
+	// A rate leads with its companions (other averages) before totals.
+	const rateLed = lead !== undefined && !isAdditive(lead);
 	const sums = [
 		...(lead ? [lead] : []),
-		...metrics.filter((k) => k !== lead && (k.aggregation === "sum" || k.aggregation === "avg")),
-	].slice(0, 3);
+		...named,
+		...metrics
+			.filter((k) => k !== lead && !named.includes(k) && (k.aggregation === "sum" || k.aggregation === "avg"))
+			.sort((a, b) => (rateLed ? Number(a.aggregation !== lead!.aggregation) - Number(b.aggregation !== lead!.aggregation) : 0)),
+	].slice(0, 4);
 	const distinct = lead ? metrics.find((k) => k.aggregation === "count_distinct") : undefined;
-	const headline = (lead ? [lead, distinct ?? count, ...sums.slice(1)] : [count, ...sums])
+	const headline = (lead ? [lead, ...named, rateLed ? undefined : distinct ?? count, ...sums.slice(1)] : [count, ...sums])
 		.filter((k, index, all): k is KpiMeta => Boolean(k) && all.indexOf(k) === index)
 		.slice(0, 4);
 	for (const kpi of headline) {
@@ -1303,7 +1480,9 @@ export async function planBoard(
 	}
 	if (layout.length % 4 !== 0) layout[layout.length - 1]!.width = 1 + (4 - (layout.length % 4));
 
-	const primary = lead ?? sums.find((k) => k.aggregation === "sum") ?? count;
+	// Without a figure asked for, the board is about the things themselves:
+	// "Orders per month", "Orders by country" - not whichever total comes first.
+	const primary = lead ?? count ?? sums.find((k) => k.aggregation === "sum");
 	if (primary?.timeColumn) {
 		const dimension = `${primary.timeColumn}:month`;
 		if (primary.dimensions.includes(dimension)) {
@@ -1315,14 +1494,24 @@ export async function planBoard(
 		const measured = await Promise.all(
 			categorical.slice(0, 24).map(async (d) => ({ d, n: await cardinality(subject, d), family: family(d) })),
 		);
-		const useful = measured.filter((x) => x.n >= 2);
+		// Contact details (a contact's job title, a phone) slice nothing useful.
+		const useful = measured.filter((x) => x.n >= 2 && !CONTACT_LIKE.test(x.d));
 		// A share of a small whole reads best as a donut: who carried it, which
 		// channel - a place is better ranked than pied.
+		// An average is not a share of anything, so it is compared in bars.
 		const donut = useful
 			.filter((x) => x.n <= 4)
 			.sort((a, b) => Number(a.family === "where") - Number(b.family === "where") || a.n - b.n)[0];
 		if (donut) {
-			layout.push({ type: "chart", kpi: primary.apiName, dimension: donut.d, chart: "donut", title: `${primary.label} by ${humanize(donut.d).toLowerCase()}`, width: 2 });
+			layout.push({
+				type: "chart",
+				kpi: primary.apiName,
+				dimension: donut.d,
+				chart: isAdditive(primary) ? "donut" : "hbar",
+				sort: isAdditive(primary) ? undefined : "value_desc",
+				title: `${primary.label} by ${sliceName(donut.d).text}`,
+				width: 2,
+			});
 		}
 		// Then one ranked slice per kind of question - where, what, who - so a
 		// wide dataset does not fill the board with three versions of country.
@@ -1343,18 +1532,34 @@ export async function planBoard(
 			if (pick) shown.push(pick);
 		}
 		for (const { d } of shown) {
-			layout.push({ type: "chart", kpi: primary.apiName, dimension: d, chart: "hbar", sort: "value_desc", limit: 10, title: `${primary.label} by ${humanize(d).toLowerCase()}`, width: 2 });
+			layout.push({ type: "chart", kpi: primary.apiName, dimension: d, chart: "hbar", sort: "value_desc", limit: 10, title: `${primary.label} by ${sliceName(d).text}`, width: 2 });
 		}
-		// The table ranks the finest dimension: the top customers, the top products.
+		// The table ranks the finest dimension - the top customers, the top
+		// products - by a figure that adds up: an average over a handful of
+		// rows would put whoever had one good order on top.
+		const ranked = isAdditive(primary) ? primary : named.find(isAdditive) ?? count;
 		const tableDimension = [...useful]
-			.filter((x) => x !== donut && !shown.includes(x) && x.family !== "where")
-			.sort((a, b) => b.n - a.n)[0];
-		if (tableDimension) {
+			.filter((x) => x !== donut && !shown.includes(x) && x.family !== "where" && ranked?.dimensions.includes(x.d))
+			.sort((a, b) => whoRank(a.d) - whoRank(b.d) || b.n - a.n)[0];
+		if (tableDimension && ranked) {
 			const used = layout.reduce((sum, w) => sum + (w.width ?? 1), 0) % 4;
-			layout.push({ type: "table", kpi: primary.apiName, dimension: tableDimension.d, sort: "value_desc", limit: 15, title: `Top ${humanize(tableDimension.d).toLowerCase()} by ${primary.label.toLowerCase()}`, width: used === 2 ? 2 : 4 });
+			layout.push({ type: "table", kpi: ranked.apiName, dimension: tableDimension.d, sort: "value_desc", limit: 15, title: `Top ${rankedName(tableDimension.d)} by ${ranked.label.toLowerCase()}`, width: used === 2 ? 2 : 4 });
 		}
 	}
 	return { layout, items };
+}
+
+/** Totals and counts add up across rows; averages and ratios do not. */
+function isAdditive(kpi: KpiMeta): boolean {
+	return ["sum", "count", "count_distinct"].includes(kpi.aggregation);
+}
+
+/** For a ranking table: customers before staff, staff before anything else. */
+function whoRank(column: string): number {
+	const lowered = column.toLowerCase();
+	if (/customer|client|company|account/.test(lowered)) return 0;
+	if (/employee|staff|rep|agent|owner|manager|supplier|vendor|product/.test(lowered)) return 1;
+	return 2;
 }
 
 function nameRank(column: string): number {
@@ -1389,6 +1594,10 @@ function boardSubject(topic: string, measure: string | null): ObjectTypeMeta | n
 		(type) => (want.length > 0 && overlap(want, typeTokens(type)) > 0) || (measure !== null && type.propertyBySqlColumn.has(measure)),
 	);
 	if (candidates.length === 0) return pickSubject(topic);
+	// "An orders dashboard" is about orders, however much richer a dataset
+	// that merely mentions them is.
+	const exact = candidates.find((type) => namesTypeExactly(topic, type));
+	if (exact) return enrichedOf(exact) ?? exact;
 	const richness = (type: ObjectTypeMeta): number => {
 		const metrics = registry.kpis.filter((k) => k.objectTypeRid === type.rid);
 		const timeline = metrics.some((k) => k.dimensions.some((d) => d.includes(":"))) ? 3 : 0;
@@ -1454,7 +1663,8 @@ export async function assess(input: { text?: string; requests?: FeasibilityReque
 	} else if ((intent === "dashboard" || intent === "report") && !(input.requests?.length) && !/\s(by|per)\s/.test(` ${text.toLowerCase()} `)) {
 		const topic = text
 			.replace(
-				/\b(build|create|make|write|generate|prepare|draft|give|show|me|us|i|we|can|could|want|need|share|send|a|an|the|new|dashboard|dashboards|report|reports|board|overview|for|about|on|of|with|my|our|please|that|to)\b/gi,
+				// Whole words only: the "on" of "on-time" stays.
+				/(?<![\p{L}\p{N}-])(build|create|make|write|generate|prepare|draft|give|show|me|us|i|we|can|could|want|need|share|send|a|an|the|new|dashboard|dashboards|report|reports|board|overview|for|about|on|of|with|my|our|please|that|to)(?![\p{L}\p{N}-])/giu,
 				" ",
 			)
 			.replace(/[^\p{L}\p{N} -]+/gu, " ")
@@ -1465,35 +1675,57 @@ export async function assess(input: { text?: string; requests?: FeasibilityReque
 		if (subject) {
 			// Named for what was asked ("Sales dashboard") when the topic is a
 			// figure rather than one of the types; otherwise for the type.
-			const namesType =
-				Boolean(topic) &&
-				[subject.label, subject.pluralLabel ?? "", subject.apiName].some((name) => name.toLowerCase() === topic.toLowerCase());
+			const namedType = topic ? getRegistry().objectTypes.find((type) => namesTypeExactly(topic, type)) : undefined;
+			const namesType = namedType !== undefined;
+			// "Orders overview" whether it is built on Order or on the dataset
+			// that enriches it.
+			const about = namedType ?? subject;
 			title =
 				topic && !namesType
 					? `${topic.charAt(0).toUpperCase()}${topic.slice(1)} ${intent === "report" ? "report" : "dashboard"}`
-					: `${subject.pluralLabel ?? plural(subject.label)} ${intent === "report" ? "report" : "overview"}`;
+					: `${about.pluralLabel ?? plural(about.label)} ${intent === "report" ? "report" : "overview"}`;
 			// "A sales dashboard" asks for sales: the board leads with that
 			// figure when one exists, on whichever type holds it.
 			const topical = topic && !matchType(topic) ? await decide({ text: topic, measure: topic }) : null;
+			// A board about being on time needs its flags first: that proposal,
+			// with the board built from it the moment it is approved.
+			const makes = asksAboutPunctuality(topic) && topical?.status === "needs_approval" ? topical.proposals?.at(-1) : undefined;
+			if (makes) {
+				const derived = (makes.payload.derived as Array<{ name: string; metric?: unknown }> | undefined) ?? [];
+				makes.followUp = {
+					build: intent,
+					title,
+					measure: derived.find((d) => d.metric)?.name ?? (typeof makes.payload.measure === "string" ? makes.payload.measure : null),
+					sourcePrompt: text,
+				};
+				items.push({
+					...topical!,
+					request: { text, measure: topic },
+					explanation: `${topical!.explanation} Approve it and the ${intent} "${title}" is built from it straight away.`,
+				});
+			}
 			const leadKpi = topical?.status === "ready" && topical.kpi ? getRegistry().kpiByApiName.get(topical.kpi) : undefined;
 			if (leadKpi?.objectTypeRid && leadKpi.objectTypeRid !== subject.rid) {
 				subject = getRegistry().objectTypeByRid.get(leadKpi.objectTypeRid) ?? subject;
 			}
 			const measure = leadKpi?.measureColumn ?? (recipe && subject.propertyBySqlColumn.has(recipe.name) ? recipe.name : null);
-			const plan = await planBoard(subject, { measure });
-			const charts = plan.layout.filter((w) => w.type !== "stat");
-			const thin = !charts.some((w) => w.dimension?.includes(":")) || charts.length < 3;
-			const topicMissing = Boolean(topic) && !namesType && measure === null;
-			// A board with no timeline or almost nothing to slice, or one that
-			// cannot show what it was asked about, is better built on one wide
-			// dataset: proposed, and built the moment it is approved.
-			const wide = thin || topicMissing ? analysisDataset(topic, intent, title, text) : null;
-			if (wide) {
-				items.push(wide.item);
-			} else {
-				layout = plan.layout;
-				items.push(...plan.items);
-				if (topical && topical.status !== "ready") items.push(topical);
+			const plan = makes ? null : await planBoard(subject, { measure });
+			if (plan) {
+				const charts = plan.layout.filter((w) => w.type !== "stat");
+				const slices = charts.filter((w) => w.type === "chart" && !w.dimension?.includes(":")).length;
+				const thin = !charts.some((w) => w.dimension?.includes(":")) || slices < 2;
+				const topicMissing = Boolean(topic) && !namesType && measure === null;
+				// A board with no timeline or almost nothing to slice, or one that
+				// cannot show what it was asked about, is better built on one wide
+				// dataset: proposed, and built the moment it is approved.
+				const wide = thin || topicMissing ? analysisDataset(topic, intent, title, text) : null;
+				if (wide) {
+					items.push(wide.item);
+				} else {
+					layout = plan.layout;
+					items.push(...plan.items);
+					if (topical && topical.status !== "ready") items.push(topical);
+				}
 			}
 		} else {
 			items.push(...(await capabilities()));
