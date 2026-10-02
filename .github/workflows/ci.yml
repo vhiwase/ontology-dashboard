@@ -114,9 +114,13 @@ jobs:
 
       # nginx -t parses the config, so a typo in a proxy_pass or a missing
       # directive fails here rather than when the container will not start.
+      # It also resolves every upstream, and the compose service names do not
+      # exist outside compose, so they are pointed at the loopback address.
       - name: Validate
         run: |
           docker run --rm \
+            --add-host ontology-service:127.0.0.1 \
+            --add-host ai-fde:127.0.0.1 \
             -v "$PWD/services/ui/nginx.conf:/etc/nginx/conf.d/default.conf:ro" \
             -v "$PWD/services/ui/security-headers.conf:/etc/nginx/snippets/security-headers.conf:ro" \
             --entrypoint sh nginx:1.27-alpine -c '
@@ -141,7 +145,7 @@ jobs:
         # validates the file and the paths must resolve.
         run: |
           mkdir -p secrets
-          for name in jwt_secret postgres_password database_url azure_openai_key; do
+          for name in jwt_secret postgres_password database_url azure_openai_key credential_key; do
             printf 'ci-placeholder-value-at-least-32-characters' > "secrets/$name"
           done
 
