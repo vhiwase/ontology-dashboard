@@ -344,6 +344,31 @@ export function Assistant() {
 										artifacts: [{ kind: "dashboard", slug: built.slug, title: built.title, widgets: built.widgets, boardKind: built.kind }],
 									},
 								]);
+								return;
+							}
+							// Nothing to open: the question that asked for this can be
+							// answered now, one click away rather than retyped.
+							const asked = turns
+								.slice(0, index)
+								.reverse()
+								.find((entry) => entry.role === "user")?.content;
+							const applied = settled.filter((entry) => entry.status === "applied").map((entry) => entry.title);
+							if (asked && applied.length > 0) {
+								setTurns((current) => [
+									...current,
+									{
+										role: "assistant",
+										content: `Approved: ${applied.join(", ")}.`,
+										artifacts: [
+											{
+												kind: "clarification",
+												question: `Approved: ${applied.join(", ")}. Ask again now?`,
+												options: [{ label: asked, detail: "answered from what you just approved" }],
+												allowFreeText: false,
+											},
+										],
+									},
+								]);
 							}
 						}}
 					/>

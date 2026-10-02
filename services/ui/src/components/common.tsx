@@ -368,13 +368,35 @@ function inline(text: string): string {
 		},
 	);
 
+	// Code is literal: `a * b * c` keeps its stars rather than turning italic,
+	// so code spans are set aside before any emphasis is read.
+	const code: string[] = [];
 	const rendered = escapeHtml(withPlaceholders)
-		.replace(/`([^`]+)`/g, "<code>$1</code>")
+		.replace(/`([^`]+)`/g, (_m, body: string) => {
+			code.push(`<code>${body}</code>`);
+			return `\u0001${code.length - 1}\u0001`;
+		})
 		.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
 		.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
-		.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>');
+		// _italic_ only as a whole word, so snake_case names stay as written.
+		.replace(/(^|[\s(])_([^_\n]+)_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
+		.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label: string, href: string) =>
+			safeHref(href) ? `<a href="${href}">${label}</a>` : whole,
+		);
 
-	return rendered.replace(/\[\[CHIP(\d+)\]\]/g, (_m, i) => chips[Number(i)] ?? "");
+	return rendered
+		.replace(/\u0001(\d+)\u0001/g, (_m, i) => code[Number(i)] ?? "")
+		.replace(/\[\[CHIP(\d+)\]\]/g, (_m, i) => chips[Number(i)] ?? "");
+}
+
+/**
+ * Links an answer may carry: web pages, mail, and places in this app. The
+ * text can echo what is in someone's data, so a `javascript:` or `data:`
+ * target is shown as text, never made clickable.
+ */
+function safeHref(href: string): boolean {
+	const decoded = href.replace(/&amp;/g, "&").trim().toLowerCase();
+	return /^(https?:|mailto:)/.test(decoded) || (/^[/#?]/.test(decoded) && !decoded.startsWith("//"));
 }
 
 export function renderMarkdown(source: string): string {
