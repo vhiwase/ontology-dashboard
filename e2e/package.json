@@ -1,0 +1,12 @@
+{
+  "name": "ontology-dashboard-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser tests of the whole workspace journey against a running stack.",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-timeout=300000 ./*.e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}
