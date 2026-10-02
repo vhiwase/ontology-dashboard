@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
 	type AssistantHealth,
@@ -7,27 +7,34 @@ import {
 	session,
 	setUnauthorizedHandler,
 } from "./api";
-import { useDebounced } from "./components/common";
-import { Actions } from "./pages/Actions";
-import { Functions } from "./pages/Functions";
+import { Spinner, useDebounced } from "./components/common";
 import { BROWSE_KINDS } from "./components/spaces/resourceKinds";
 import { ResourceProvider, useResources } from "./ResourceContext";
-import { ResourceBrowser } from "./pages/ResourceBrowser";
 import { Login } from "./pages/Login";
 import { Assistant } from "./pages/Assistant";
-import { CostAnalysis } from "./pages/CostAnalysis";
-import { DashboardHistory } from "./pages/DashboardHistory";
-import { DashboardDetail, DashboardList } from "./pages/Dashboards";
-import { GraphView } from "./pages/GraphView";
-import { ObjectExplorer } from "./pages/ObjectExplorer";
-import { Spaces } from "./pages/Spaces";
 import { SpaceProvider, envTone, useSpace } from "./SpaceContext";
-import { OntologyManager } from "./pages/OntologyManager";
-import { Overview } from "./pages/Overview";
 import { Home } from "./pages/Home";
-import { DataSources } from "./pages/DataSources";
-import { Proposals } from "./pages/Proposals";
-import { Schedules } from "./pages/Schedules";
+
+// Pages past the first screen load on demand, so signing in and the home
+// page do not wait for the graph canvas, the ontology editor and the rest.
+function page<K extends string>(load: () => Promise<Record<K, React.ComponentType>>, name: K) {
+	return lazy(() => load().then((module) => ({ default: module[name] })));
+}
+const Actions = page(() => import("./pages/Actions"), "Actions");
+const Functions = page(() => import("./pages/Functions"), "Functions");
+const ResourceBrowser = page(() => import("./pages/ResourceBrowser"), "ResourceBrowser");
+const CostAnalysis = page(() => import("./pages/CostAnalysis"), "CostAnalysis");
+const DashboardHistory = page(() => import("./pages/DashboardHistory"), "DashboardHistory");
+const DashboardDetail = page(() => import("./pages/Dashboards"), "DashboardDetail");
+const DashboardList = page(() => import("./pages/Dashboards"), "DashboardList");
+const GraphView = page(() => import("./pages/GraphView"), "GraphView");
+const ObjectExplorer = page(() => import("./pages/ObjectExplorer"), "ObjectExplorer");
+const Spaces = page(() => import("./pages/Spaces"), "Spaces");
+const OntologyManager = page(() => import("./pages/OntologyManager"), "OntologyManager");
+const Overview = page(() => import("./pages/Overview"), "Overview");
+const DataSources = page(() => import("./pages/DataSources"), "DataSources");
+const Proposals = page(() => import("./pages/Proposals"), "Proposals");
+const Schedules = page(() => import("./pages/Schedules"), "Schedules");
 
 interface HealthPayload {
 	status: string;
@@ -402,6 +409,7 @@ function Shell({
 						className="content-wide"
 						style={{ height: location.pathname === "/assistant" ? "100%" : undefined }}
 					>
+						<Suspense fallback={<Spinner />}>
 						<Routes>
 							<Route path="/" element={isPersonal ? <Home /> : <Overview />} />
 							<Route path="/home" element={<Home />} />
@@ -425,6 +433,7 @@ function Shell({
 							<Route path="/assistant/cost" element={<CostAnalysis />} />
 							<Route path="*" element={<Navigate to="/" replace />} />
 						</Routes>
+						</Suspense>
 					</div>
 				</div>
 			</div>

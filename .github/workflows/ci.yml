@@ -59,7 +59,7 @@ jobs:
         run: npm run build
 
   ui:
-    name: ui (typecheck, build)
+    name: ui (typecheck, test, build)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,6 +77,10 @@ jobs:
       - name: Typecheck
         working-directory: services/ui
         run: npx tsc -p tsconfig.json --noEmit
+
+      - name: Test
+        working-directory: services/ui
+        run: npm test
 
       - name: Build
         working-directory: services/ui
