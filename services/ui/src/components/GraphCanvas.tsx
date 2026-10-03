@@ -18,6 +18,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { shortLabel } from "../api";
+import { Icon } from "./icons";
 
 export interface GraphNode {
 	id: string;
@@ -158,7 +159,14 @@ export function GraphCanvas({
 	}, [nodes]);
 
 	if (nodes.length === 0) {
-		return <div className="empty">No nodes to draw.</div>;
+		return (
+			<div className="empty">
+				<span className="empty-icon" aria-hidden>
+					<Icon name="graph" size={18} />
+				</span>
+				No nodes to draw.
+			</div>
+		);
 	}
 
 	return (
@@ -169,17 +177,20 @@ export function GraphCanvas({
 						className="btn sm"
 						onClick={() => setTransform((c) => ({ ...c, k: Math.min(3, c.k * 1.2) }))}
 						aria-label="Zoom in"
+						title="Zoom in"
 					>
-						+
+						<Icon name="zoomIn" size={15} />
 					</button>
 					<button
 						className="btn sm"
 						onClick={() => setTransform((c) => ({ ...c, k: Math.max(0.35, c.k / 1.2) }))}
 						aria-label="Zoom out"
+						title="Zoom out"
 					>
-						−
+						<Icon name="zoomOut" size={15} />
 					</button>
-					<button className="btn sm" onClick={() => setTransform({ x: 0, y: 0, k: 1 })}>
+					<button className="btn sm" onClick={() => setTransform({ x: 0, y: 0, k: 1 })} title="Reset the view">
+						<Icon name="reset" size={14} />
 						Reset
 					</button>
 				</div>

@@ -162,7 +162,7 @@ export function setUnauthorizedHandler(handler: UnauthorizedHandler): void {
 	onUnauthorized = handler;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(path: string, init?: RequestInit, alsoRead: number[] = []): Promise<T> {
 	const token = session.token();
 	const response = await fetch(withSpace(path), {
 		...init,
@@ -172,7 +172,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 			...(init?.headers ?? {}),
 		},
 	});
-	if (!response.ok) {
+	// `alsoRead` names the statuses whose body is the answer rather than an
+	// error to throw. Never 401: an ended session is always handled below.
+	if (!response.ok && !(alsoRead.includes(response.status) && response.status !== 401)) {
 		let message = `${response.status} ${response.statusText}`;
 		let requestId: string | undefined;
 		try {
@@ -206,6 +208,13 @@ export const api = {
 	get: <T>(path: string) => request<T>(path),
 	post: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
 		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}), signal }),
+	/**
+	 * A POST whose refusal is itself the answer. Running an action returns
+	 * the same outcome body whether it ran (200), was refused for the role
+	 * (403) or failed validation (422); those are read rather than thrown.
+	 */
+	postReading: <T>(path: string, body: unknown, statuses: number[]) =>
+		request<T>(path, { method: "POST", body: JSON.stringify(body ?? {}) }, statuses),
 	patch: <T>(path: string, body?: unknown) =>
 		request<T>(path, { method: "PATCH", body: JSON.stringify(body ?? {}) }),
 	/** Saving a repository file: the path identifies it, so writing one is a PUT. */
@@ -312,6 +321,8 @@ export interface ActionSummary {
 	requiresApproval: boolean;
 	allowedRoles: string[];
 	parameters: Array<Record<string, unknown>>;
+	/** The object types it acts on, by rid. Present on the full action list. */
+	targetObjectTypes?: string[];
 }
 
 export interface ObjectTypeDetail extends ObjectTypeSummary {

@@ -8,14 +8,17 @@ and a turn can fail over from a free local model to a paid hosted one.
 RATES ARE CONFIGURATION, NOT CONSTANTS. The defaults below are list prices and
 are the thing most likely to be out of date in this file: Azure pricing varies
 by region, by commitment and over time, and an enterprise agreement usually
-does not pay list. Set the real ones in .env and check them against an actual
-invoice before anyone makes a decision on these numbers.
+does not pay list. An administrator can set the real ones in the admin
+console; .env is the fallback, then the list price. Check them against an
+actual invoice before anyone makes a decision on these numbers.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+from . import settings
 
 
 def _rate(name: str, default: float) -> float:
@@ -42,13 +45,26 @@ class Rate:
 
 
 def rates() -> dict[str, Rate]:
-    """Per-provider rates, read at call time so a restart picks up a change."""
+    """Per-provider rates, read at call time so a change applies to the next turn.
+
+    The admin console's price wins over .env, which wins over the list price.
+    Each half of the Azure rate falls back on its own, so setting only the
+    output price leaves the input price where it was.
+    """
+    admin_input = settings.number("pricing.azureInputPerMillion")
+    admin_output = settings.number("pricing.azureOutputPerMillion")
+    if admin_input is not None or admin_output is not None:
+        source = "set by an administrator"
+    elif os.environ.get("COST_AZURE_INPUT_PER_M"):
+        source = "configured"
+    else:
+        source = "list price (verify)"
     return {
         # Azure OpenAI list price for gpt-4.1 at the time of writing.
         "azure_openai": Rate(
-            input_per_m=_rate("COST_AZURE_INPUT_PER_M", 2.00),
-            output_per_m=_rate("COST_AZURE_OUTPUT_PER_M", 8.00),
-            source="configured" if os.environ.get("COST_AZURE_INPUT_PER_M") else "list price (verify)",
+            input_per_m=admin_input if admin_input is not None else _rate("COST_AZURE_INPUT_PER_M", 2.00),
+            output_per_m=admin_output if admin_output is not None else _rate("COST_AZURE_OUTPUT_PER_M", 8.00),
+            source=source,
         ),
         # The built-in planner calls no model, so a turn it answers costs nothing.
         "builtin": Rate(input_per_m=0.0, output_per_m=0.0, source="no model"),

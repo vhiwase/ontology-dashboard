@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { type ObjectTypeSummary, type ObjectTypeDetail, api } from "../../api";
 import { ErrorBanner, Spinner } from "../common";
+import { Icon } from "../icons";
 
 const CARDINALITIES = ["MANY_TO_ONE", "ONE_TO_MANY", "ONE_TO_ONE", "MANY_TO_MANY"];
 
@@ -115,14 +116,14 @@ export function LinkBuilder({
 			<div className="rp fn-window" role="dialog" aria-modal="true" aria-label="Draw a link">
 				<header className="rp-head">
 					<span className="rp-glyph" aria-hidden>
-						↔
+						<Icon name="link" size={18} />
 					</span>
 					<div className="rp-heading">
 						<div className="rp-kind">LINK TYPE</div>
 						<h3 className="rp-title">Draw a link</h3>
 					</div>
 					<button className="icon-button" onClick={close} aria-label="Close">
-						×
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 
@@ -267,11 +268,11 @@ export function LinkBuilder({
 						Recorded in the ontology's change history, where it can be undone.
 					</div>
 					<div className="row" style={{ gap: 8 }}>
-						<button className="ghost" onClick={close} disabled={busy}>
+						<button className="btn ghost" onClick={close} disabled={busy}>
 							{result ? "Done" : "Cancel"}
 						</button>
 						{!result && (
-							<button className="primary" onClick={create} disabled={busy || !ready}>
+							<button className="btn primary" onClick={create} disabled={busy || !ready}>
 								{busy ? "Measuring…" : "Create link"}
 							</button>
 						)}

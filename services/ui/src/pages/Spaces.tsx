@@ -16,7 +16,8 @@ import { ApiError, api, session } from "../api";
 import { ConnectionDialog } from "../components/spaces/ConnectionDialog";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { RESOURCE_SPECS, type ResourceKind } from "../components/spaces/resourceKinds";
-import { ErrorBanner, Spinner } from "../components/common";
+import { ErrorBanner, PageLoader } from "../components/common";
+import { Icon } from "../components/icons";
 import { useSpace } from "../SpaceContext";
 
 interface Project {
@@ -205,10 +206,10 @@ export function Spaces() {
 					}}
 				>
 					<span className="tree-caret" aria-hidden>
-						{children.length > 0 ? (isOpen ? "▾" : "▸") : "·"}
+						{children.length > 0 ? <Icon name={isOpen ? "chevronDown" : "chevronRight"} size={12} /> : "·"}
 					</span>
 					<span className="tree-glyph" aria-hidden>
-						{isOpen ? "▼" : "▶"}
+						<Icon name={isOpen ? "folderOpen" : "folder"} size={14} />
 					</span>
 					<span className="tree-name">{folder.name}</span>
 					{count > 0 && <span className="tree-count">{count}</span>}
@@ -219,7 +220,7 @@ export function Spaces() {
 	}
 
 	if (error) return <ErrorBanner error={error} />;
-	if (spacesLoading) return <Spinner label="Loading spaces" />;
+	if (spacesLoading) return <PageLoader label="Loading spaces" />;
 
 	const space = spaces.find((s) => s.slug === spaceSlug);
 
@@ -269,10 +270,12 @@ export function Spaces() {
 								style={{ marginLeft: 10 }}
 								onClick={() => setDialog("project")}
 							>
+								<Icon name="plus" size={13} />
 								New project
 							</button>
 							{spaceSlug === "sandbox" && projects.length === 0 && (
 								<button className="btn sm primary" onClick={seedSandbox} disabled={busy}>
+									<Icon name="wand" size={13} />
 									Set up the sandbox
 								</button>
 							)}
@@ -288,7 +291,7 @@ export function Spaces() {
 							: " Create one to hold its connections and datasets."}
 					</p>
 				) : (
-					<div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+					<div className="project-pills">
 						{projects.map((project) => (
 							<button
 								key={project.slug}
@@ -321,11 +324,12 @@ export function Spaces() {
 
 							{canWrite && (
 								<button
-									className="btn sm"
+									className="icon-btn"
 									onClick={() => setDialog("folder")}
 									title="New folder"
+									aria-label="New folder"
 								>
-									+
+									<Icon name="plus" size={15} />
 								</button>
 							)}
 						</div>
@@ -340,7 +344,7 @@ export function Spaces() {
 								·
 							</span>
 							<span className="tree-glyph" aria-hidden>
-								▣
+								<Icon name="layers" size={14} />
 							</span>
 							<span className="tree-name">Project root</span>
 						</button>
@@ -364,6 +368,7 @@ export function Spaces() {
 							{canWrite && (
 								<>
 									<button className="btn sm" onClick={() => setDialog("connection")}>
+										<Icon name="plus" size={13} />
 										New connection
 									</button>
 								</>
@@ -394,7 +399,7 @@ export function Spaces() {
 											<tr key={resource.id} onClick={() => setPreviewId(resource.id)}>
 												<td>
 													<span className="tree-glyph" style={{ color: spec.accent }} aria-hidden>
-														{spec.glyph}
+														<Icon name={spec.icon} size={14} />
 													</span>{" "}
 													{resource.name}
 												</td>
@@ -568,8 +573,8 @@ function CreateDialog({
 					<div className="rp-heading">
 						<h2 className="rp-title">{title}</h2>
 					</div>
-					<button className="btn sm" onClick={onClose} aria-label="Close">
-						✕
+					<button className="icon-btn" onClick={onClose} aria-label="Close">
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 

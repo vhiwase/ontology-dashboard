@@ -21,4 +21,9 @@ RUN useradd --create-home --uid 10002 aifde && chown -R aifde:aifde /app
 USER aifde
 
 EXPOSE 4100
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "4100"]
+# Listens on PORT, which compose sets from AI_FDE_PORT - the same value it
+# publishes, health-checks and tells nginx about. The port used to be written
+# here as 4100, so changing AI_FDE_PORT left the service where it was and
+# everything else looking for it somewhere else. `exec`, so uvicorn is PID 1
+# and receives the stop signal itself.
+CMD ["sh", "-c", "exec python -m uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-4100}\""]

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
 	type AssistantHealth,
@@ -7,8 +7,10 @@ import {
 	session,
 	setUnauthorizedHandler,
 } from "./api";
-import { Spinner, useDebounced } from "./components/common";
+import { PageLoader, useDebounced } from "./components/common";
+import { BrandMark, Icon, type IconName } from "./components/icons";
 import { BROWSE_KINDS } from "./components/spaces/resourceKinds";
+import { ChatProvider } from "./ChatContext";
 import { ResourceProvider, useResources } from "./ResourceContext";
 import { Login } from "./pages/Login";
 import { Assistant } from "./pages/Assistant";
@@ -21,6 +23,7 @@ function page<K extends string>(load: () => Promise<Record<K, React.ComponentTyp
 	return lazy(() => load().then((module) => ({ default: module[name] })));
 }
 const Actions = page(() => import("./pages/Actions"), "Actions");
+const Admin = page(() => import("./pages/Admin"), "Admin");
 const Functions = page(() => import("./pages/Functions"), "Functions");
 const ResourceBrowser = page(() => import("./pages/ResourceBrowser"), "ResourceBrowser");
 const CostAnalysis = page(() => import("./pages/CostAnalysis"), "CostAnalysis");
@@ -58,7 +61,7 @@ type NavEntry =
 	| {
 			to: string;
 			label: string;
-			glyph: string;
+			icon: IconName;
 			exact?: boolean;
 			browse?: ResourceKindName;
 			badge?: "approvals";
@@ -72,44 +75,54 @@ type ResourceKindName = (typeof BROWSE_KINDS)[number]["kind"];
  * functions read tables by name and are not offered there.
  */
 const PERSONAL_NAV: NavEntry[] = [
-	{ to: "/", label: "Home", glyph: "⌂", exact: true },
-	{ to: "/assistant", label: "Ask AI", glyph: "✦", exact: true },
-	{ to: "/dashboards", label: "Dashboards & reports", glyph: "▦" },
-	{ to: "/approvals", label: "Approvals", glyph: "✓", badge: "approvals" },
+	{ to: "/", label: "Home", icon: "home", exact: true },
+	{ to: "/assistant", label: "Ask AI", icon: "sparkles", exact: true },
+	{ to: "/dashboards", label: "Dashboards & reports", icon: "dashboard" },
+	{ to: "/approvals", label: "Approvals", icon: "checkCircle", badge: "approvals" },
 	{ section: "Your data" },
-	{ to: "/data", label: "Data sources", glyph: "⛁" },
-	{ to: "/schedules", label: "Refresh schedules", glyph: "⏱" },
-	{ to: "/ontology", label: "Business objects", glyph: "◇" },
-	{ to: "/graph", label: "Relationships", glyph: "◉" },
-	{ to: "/explorer", label: "Explore records", glyph: "▤" },
-	{ to: "/functions", label: "SQL functions", glyph: "ƒ" },
-	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ to: "/data", label: "Data sources", icon: "database" },
+	{ to: "/schedules", label: "Refresh schedules", icon: "clock" },
+	{ to: "/ontology", label: "Business objects", icon: "box" },
+	{ to: "/graph", label: "Relationships", icon: "graph" },
+	{ to: "/explorer", label: "Explore records", icon: "compass" },
+	{ to: "/functions", label: "SQL functions", icon: "fn" },
+	{ to: "/actions", label: "Actions", icon: "zap" },
 	{ section: "Account" },
-	{ to: "/assistant/cost", label: "AI usage & cost", glyph: "$" },
+	{ to: "/assistant/cost", label: "AI usage & cost", icon: "dollar" },
 ];
 
 const NAV: NavEntry[] = [
 	{ section: "Data" },
-	{ to: "/browse/connections", label: "Connections", glyph: "⛁", browse: "connection" },
-	{ to: "/browse/datasets", label: "Datasets", glyph: "▤", browse: "dataset" },
-	{ to: "/schedules", label: "Schedules", glyph: "⏱" },
+	{ to: "/browse/connections", label: "Connections", icon: "database", browse: "connection" },
+	{ to: "/browse/datasets", label: "Datasets", icon: "table", browse: "dataset" },
+	{ to: "/schedules", label: "Schedules", icon: "clock" },
 	{ section: "Ontology" },
-	{ to: "/", label: "Overview", glyph: "◈", exact: true },
-	{ to: "/ontology", label: "Object types", glyph: "◇" },
-	{ to: "/graph", label: "Graph", glyph: "◉" },
-	{ to: "/explorer", label: "Object explorer", glyph: "▦" },
+	{ to: "/", label: "Overview", icon: "gauge", exact: true },
+	{ to: "/ontology", label: "Object types", icon: "box" },
+	{ to: "/graph", label: "Graph", icon: "graph" },
+	{ to: "/explorer", label: "Object explorer", icon: "compass" },
 	{ section: "Logic" },
-	{ to: "/browse/metrics", label: "Metrics", glyph: "Σ", browse: "kpi" },
-	{ to: "/functions", label: "Functions", glyph: "ƒ" },
-	{ to: "/actions", label: "Actions", glyph: "▶" },
+	{ to: "/browse/metrics", label: "Metrics", icon: "sigma", browse: "kpi" },
+	{ to: "/functions", label: "Functions", icon: "fn" },
+	{ to: "/actions", label: "Actions", icon: "zap" },
 	{ section: "Apps" },
-	{ to: "/dashboards", label: "Dashboards", glyph: "▥" },
-	{ to: "/approvals", label: "Approvals", glyph: "✓", badge: "approvals" },
+	{ to: "/dashboards", label: "Dashboards", icon: "dashboard" },
+	{ to: "/approvals", label: "Approvals", icon: "checkCircle", badge: "approvals" },
 	{ section: "Assistant" },
-	{ to: "/assistant", label: "AI-FDE", glyph: "✦", exact: true },
-	{ to: "/assistant/cost", label: "Cost analysis", glyph: "$" },
+	{ to: "/assistant", label: "AI-FDE", icon: "bot", exact: true },
+	{ to: "/assistant/cost", label: "Cost analysis", icon: "dollar" },
 	{ section: "Workspace" },
-	{ to: "/spaces", label: "Spaces", glyph: "▣" },
+	{ to: "/spaces", label: "Spaces", icon: "layers" },
+];
+
+/**
+ * Added for a platform administrator, in whichever space they are in. Hiding
+ * the link is a courtesy, not the control: every /api/admin route refuses
+ * anyone else on the server.
+ */
+const ADMIN_NAV: NavEntry[] = [
+	{ section: "Administration" },
+	{ to: "/admin", label: "Admin console", icon: "shieldCheck" },
 ];
 
 const TITLES: Record<string, string> = {
@@ -128,7 +141,32 @@ const TITLES: Record<string, string> = {
 	"/schedules": "Schedules",
 	"/assistant": "AI-FDE assistant",
 	"/assistant/cost": "Assistant cost analysis",
+	"/admin": "Admin console",
 };
+
+/**
+ * The nav section a page sits under, for the breadcrumb in the top bar.
+ * The longest matching entry wins, so /dashboards/history reads as Apps
+ * rather than matching nothing.
+ */
+function sectionFor(nav: NavEntry[], pathname: string): string | null {
+	let section: string | null = null;
+	let found: string | null = null;
+	let best = -1;
+	for (const entry of nav) {
+		if ("section" in entry) {
+			section = entry.section;
+			continue;
+		}
+		const matches =
+			entry.to === pathname || (entry.to !== "/" && pathname.startsWith(`${entry.to}/`));
+		if (matches && entry.to.length > best) {
+			best = entry.to.length;
+			found = section;
+		}
+	}
+	return found;
+}
 
 export function App() {
 	return <AppShell />;
@@ -173,25 +211,25 @@ function SpaceSwitcher() {
 function RailBrand({ connected }: { connected: boolean }) {
 	const { space, loading, isPersonal } = useSpace();
 	const ontology = space?.ontology ?? null;
+	const status =
+		!connected || loading
+			? "connecting…"
+			: isPersonal
+				? ontology && ontology.objectTypes > 0
+					? `${space?.name ?? "Your workspace"} · ${ontology.objectTypes} objects`
+					: `${space?.name ?? "Your workspace"} · no data yet`
+				: ontology
+					? `${space?.name ?? ""} · v${ontology.version} · ${ontology.objectTypes} object types`
+					: `${space?.name ?? "This space"} · nothing published`;
 	return (
 		<div className="rail-brand">
-			<h1>
-				<span className="brand-mark" aria-hidden>
-					◈
-				</span>
-				Ontology Dashboard
-			</h1>
-			<p>
-				{!connected || loading
-					? "connecting…"
-					: isPersonal
-						? ontology && ontology.objectTypes > 0
-							? `${space?.name ?? "Your workspace"} · ${ontology.objectTypes} objects`
-							: `${space?.name ?? "Your workspace"} · no data yet`
-						: ontology
-							? `${space?.name ?? ""} · v${ontology.version} · ${ontology.objectTypes} object types`
-							: `${space?.name ?? "This space"} · nothing published`}
-			</p>
+			<span className="brand-mark" aria-hidden>
+				<BrandMark size={20} />
+			</span>
+			<div className="rail-brand-text">
+				<h1>Ontology Dashboard</h1>
+				<p title={status}>{status}</p>
+			</div>
 		</div>
 	);
 }
@@ -282,14 +320,19 @@ function AppShell() {
 	return (
 		<SpaceProvider>
 			<ResourceProvider>
-				<Shell
-					user={user}
-					health={health}
-					assistantHealth={assistantHealth}
-					theme={theme}
-					setTheme={setTheme}
-					signOut={signOut}
-				/>
+				{/* Above the pages, so a conversation is still there after looking
+				    at a dataset or a schedule - and gone on sign-out, since this
+				    whole tree unmounts with the session. */}
+				<ChatProvider>
+					<Shell
+						user={user}
+						health={health}
+						assistantHealth={assistantHealth}
+						theme={theme}
+						setTheme={setTheme}
+						signOut={signOut}
+					/>
+				</ChatProvider>
 			</ResourceProvider>
 		</SpaceProvider>
 	);
@@ -312,8 +355,24 @@ function Shell({
 }) {
 	const location = useLocation();
 	const { isPersonal } = useSpace();
-	const nav = isPersonal ? PERSONAL_NAV : NAV;
+	const isAdmin = user.role === "admin";
+	const nav = [...(isPersonal ? PERSONAL_NAV : NAV), ...(isAdmin ? ADMIN_NAV : [])];
 	// From here on there is a token, so the space provider can load.
+
+	// The rail is a drawer on a narrow screen. It closes on navigation, on
+	// Escape and on a tap outside it, the three ways people expect to leave one.
+	const [navOpen, setNavOpen] = useState(false);
+	useEffect(() => {
+		setNavOpen(false);
+	}, [location.pathname]);
+	useEffect(() => {
+		if (!navOpen) return;
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setNavOpen(false);
+		};
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
+	}, [navOpen]);
 
 	const browseKind = location.pathname.startsWith("/browse/")
 		? BROWSE_KINDS.find((item) => item.slug === location.pathname.slice("/browse/".length))
@@ -322,10 +381,35 @@ function Shell({
 		(location.pathname === "/" && isPersonal ? "Home" : TITLES[location.pathname]) ??
 		browseKind?.label ??
 		(location.pathname.startsWith("/dashboards/") ? "Dashboard" : "Ontology Dashboard");
+	const section = sectionFor(nav, location.pathname);
+	const isChat = location.pathname === "/assistant";
+
+	const modelStatus = assistantHealth
+		? assistantHealth.llm.reachable
+			? assistantHealth.llm.modelPresent === false
+				? "model not pulled"
+				: assistantHealth.provider === "builtin"
+					? "AI: built-in planner"
+					: "AI model ready"
+			: "model offline"
+		: "checking…";
+	const initials = user.username.slice(0, 2).toUpperCase();
+	const nextTheme = theme === "dark" ? "light" : "dark";
 
 	return (
-		<div className="shell">
-			<nav className="rail">
+		<div className={`shell ${navOpen ? "nav-open" : ""}`}>
+			<a
+				className="skip-link"
+				href="#main-content"
+				onClick={(event) => {
+					event.preventDefault();
+					document.getElementById("main-content")?.focus();
+				}}
+			>
+				Skip to content
+			</a>
+
+			<nav className="rail" id="app-rail" aria-label="Main navigation">
 				<RailBrand connected={health !== null} />
 
 				<div className="rail-nav">
@@ -342,7 +426,7 @@ function Shell({
 								className={({ isActive }) => `rail-link ${isActive ? "active" : ""}`}
 							>
 								<span className="glyph" aria-hidden>
-									{entry.glyph}
+									<Icon name={entry.icon} size={17} />
 								</span>
 								<span>{entry.label}</span>
 								<RailCount entry={entry} />
@@ -353,90 +437,104 @@ function Shell({
 				</div>
 
 				<div className="rail-foot">
-					<div className="row" style={{ gap: 6 }}>
-						<span
-							className="chip"
-							style={{
-								color: assistantHealth?.llm.reachable
-									? "var(--status-good)"
-									: "var(--status-critical)",
-							}}
-							title={
-								assistantHealth?.llm.reachable
-									? `Model ready: ${assistantHealth.model}`
-									: (assistantHealth?.llm.detail ?? "Model unavailable")
-							}
-						>
-							<span className="dot" aria-hidden />
-							{assistantHealth
-								? assistantHealth.llm.reachable
-									? assistantHealth.llm.modelPresent === false
-										? "model not pulled"
-										: assistantHealth.provider === "builtin"
-											? "AI: built-in planner"
-											: "AI model ready"
-									: "model offline"
-								: "checking…"}
-						</span>
-					</div>
-					{assistantHealth && <span className="mono">{assistantHealth.model}</span>}
-					<button
-						className="btn sm"
-						onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+					<div
+						className="rail-status"
+						title={
+							assistantHealth?.llm.reachable
+								? `Model ready: ${assistantHealth.model}`
+								: (assistantHealth?.llm.detail ?? "Model unavailable")
+						}
 					>
-						{theme === "dark" ? "Light theme" : "Dark theme"}
-					</button>
+						<span
+							className={`status-dot ${assistantHealth ? (assistantHealth.llm.reachable ? "ok" : "bad") : ""}`}
+							aria-hidden
+						/>
+						<span>{modelStatus}</span>
+						{assistantHealth && <span className="mono">{assistantHealth.model}</span>}
+					</div>
 					<div className="rail-user">
-						<span className="mono" title={`Ontology role: ${user.ontologyRole}`}>
-							{user.username} · {user.role}
+						<span className="avatar-circle" aria-hidden>
+							{initials}
 						</span>
-						<button className="btn sm" onClick={signOut}>
-							Sign out
+						<div className="rail-user-text">
+							<div className="rail-user-name">{user.username}</div>
+							<div className="rail-user-role" title={`Ontology role: ${user.ontologyRole}`}>
+								{user.role}
+							</div>
+						</div>
+						<button className="icon-btn" onClick={signOut} title="Sign out" aria-label="Sign out">
+							<Icon name="logOut" size={17} />
 						</button>
 					</div>
 				</div>
 			</nav>
+			<div className="rail-backdrop" aria-hidden onClick={() => setNavOpen(false)} />
 
 			<div className="main">
 				<header className="topbar">
-					<h2>{title}</h2>
+					<button
+						className="icon-btn nav-toggle"
+						onClick={() => setNavOpen(true)}
+						aria-label="Open navigation"
+						aria-expanded={navOpen}
+						aria-controls="app-rail"
+					>
+						<Icon name="menu" size={19} />
+					</button>
+					<div className="topbar-title">
+						{section && (
+							<>
+								<span className="topbar-section">{section}</span>
+								<Icon name="chevronRight" size={14} />
+							</>
+						)}
+						<h2>{title}</h2>
+					</div>
 					<SpaceSwitcher />
 					<div className="spacer" />
-					<GlobalSearch />
+					<div className="topbar-actions">
+						<GlobalSearch />
+						<button
+							className="icon-btn bordered"
+							onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+							title={`Switch to the ${nextTheme} theme`}
+							aria-label={`Switch to the ${nextTheme} theme`}
+						>
+							<Icon name={theme === "dark" ? "sun" : "moon"} size={16} />
+						</button>
+					</div>
 				</header>
 
-				<div className="content">
-					<div
-						className="content-wide"
-						style={{ height: location.pathname === "/assistant" ? "100%" : undefined }}
-					>
-						<Suspense fallback={<Spinner />}>
-						<Routes>
-							<Route path="/" element={isPersonal ? <Home /> : <Overview />} />
-							<Route path="/home" element={<Home />} />
-							<Route path="/data" element={<DataSources />} />
-							<Route path="/approvals" element={<Proposals />} />
-							<Route path="/ontology" element={<OntologyManager />} />
-							<Route path="/graph" element={<GraphView />} />
-							<Route path="/spaces" element={<Spaces />} />
-							<Route path="/explorer" element={<ObjectExplorer />} />
-							<Route path="/dashboards" element={<DashboardList />} />
-							{/* Before /dashboards/:slug, or "history" is read as a slug. */}
-							<Route path="/dashboards/history" element={<DashboardHistory />} />
-							<Route path="/dashboards/:slug" element={<DashboardDetail />} />
-							<Route path="/actions" element={<Actions />} />
-							<Route path="/functions" element={<Functions />} />
-							<Route path="/schedules" element={<Schedules />} />
-							<Route path="/browse/:kind" element={<ResourceBrowser />} />
-							<Route path="/assistant" element={<Assistant />} />
-							{/* Before nothing else, but listed after /assistant so the exact
-							    match on the nav link does not highlight both. */}
-							<Route path="/assistant/cost" element={<CostAnalysis />} />
-							<Route path="*" element={<Navigate to="/" replace />} />
-						</Routes>
+				<main className={`content ${isChat ? "is-chat" : ""}`} id="main-content" tabIndex={-1}>
+					<div className="content-wide" style={{ height: isChat ? "100%" : undefined }}>
+						<Suspense fallback={<PageLoader label="Loading" />}>
+							<Routes>
+								<Route path="/" element={isPersonal ? <Home /> : <Overview />} />
+								<Route path="/home" element={<Home />} />
+								<Route path="/data" element={<DataSources />} />
+								<Route path="/approvals" element={<Proposals />} />
+								<Route path="/ontology" element={<OntologyManager />} />
+								<Route path="/graph" element={<GraphView />} />
+								<Route path="/spaces" element={<Spaces />} />
+								<Route path="/explorer" element={<ObjectExplorer />} />
+								<Route path="/dashboards" element={<DashboardList />} />
+								{/* Before /dashboards/:slug, or "history" is read as a slug. */}
+								<Route path="/dashboards/history" element={<DashboardHistory />} />
+								<Route path="/dashboards/:slug" element={<DashboardDetail />} />
+								<Route path="/actions" element={<Actions />} />
+								<Route path="/functions" element={<Functions />} />
+								<Route path="/schedules" element={<Schedules />} />
+								<Route path="/browse/:kind" element={<ResourceBrowser />} />
+								<Route path="/assistant" element={<Assistant />} />
+								{/* Before nothing else, but listed after /assistant so the exact
+								    match on the nav link does not highlight both. */}
+								<Route path="/assistant/cost" element={<CostAnalysis />} />
+								<Route path="/admin" element={isAdmin ? <Admin /> : <Navigate to="/" replace />} />
+								<Route path="*" element={<Navigate to="/" replace />} />
+							</Routes>
 						</Suspense>
 					</div>
-				</div>
+				</main>
 			</div>
 		</div>
 	);
@@ -455,6 +553,21 @@ function GlobalSearch() {
 	const [results, setResults] = useState<SearchGroup[] | null>(null);
 	const [open, setOpen] = useState(false);
 	const debounced = useDebounced(term, 300);
+	const inputRef = useRef<HTMLInputElement>(null);
+	const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+
+	// Ctrl+K (Cmd+K on a Mac) jumps to the search from anywhere in the app.
+	useEffect(() => {
+		const onKey = (event: KeyboardEvent) => {
+			if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+				event.preventDefault();
+				inputRef.current?.focus();
+				inputRef.current?.select();
+			}
+		};
+		window.addEventListener("keydown", onKey);
+		return () => window.removeEventListener("keydown", onKey);
+	}, []);
 
 	useEffect(() => {
 		const trimmed = debounced.trim();
@@ -474,41 +587,36 @@ function GlobalSearch() {
 	}, [debounced]);
 
 	return (
-		<div style={{ position: "relative" }}>
+		<div className="search-box">
+			<Icon name="search" size={15} />
 			<input
+				ref={inputRef}
 				placeholder="Search your records…"
 				value={term}
 				onChange={(event) => setTerm(event.target.value)}
 				onFocus={() => setOpen(true)}
 				onBlur={() => setTimeout(() => setOpen(false), 160)}
-				style={{ width: 280 }}
+				onKeyDown={(event) => {
+					if (event.key === "Escape") {
+						setOpen(false);
+						event.currentTarget.blur();
+					}
+				}}
 				aria-label="Global search"
 			/>
+			<span className="search-kbd" aria-hidden>
+				<kbd>{isMac ? "⌘" : "Ctrl"}</kbd>
+				<kbd>K</kbd>
+			</span>
 			{open && results && results.length > 0 && (
-				<div
-					className="card"
-					style={{
-						position: "absolute",
-						top: "calc(100% + 6px)",
-						right: 0,
-						width: 360,
-						zIndex: 30,
-						padding: 8,
-						maxHeight: 420,
-						overflowY: "auto",
-						boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
-					}}
-				>
+				<div className="search-popover">
 					{results.map((group) => (
 						<div key={group.objectType}>
-							<div className="rail-section" style={{ padding: "6px 8px 3px" }}>
-								{group.label}
-							</div>
+							<div className="search-group-label">{group.label}</div>
 							{group.hits.map((hit) => (
 								<button
 									key={hit.key}
 									className="rail-link"
-									style={{ width: "100%", textAlign: "left" }}
 									onClick={() => {
 										setTerm("");
 										setOpen(false);
@@ -517,7 +625,7 @@ function GlobalSearch() {
 								>
 									<span
 										className="glyph"
-										style={{ color: group.color ?? "var(--ink-muted)", fontSize: 13 }}
+										style={{ color: group.color ?? "var(--ink-muted)", fontSize: 11 }}
 										aria-hidden
 									>
 										●
@@ -527,19 +635,15 @@ function GlobalSearch() {
 							))}
 						</div>
 					))}
-					<div className="muted" style={{ fontSize: 11, padding: "7px 8px 3px" }}>
-						Opens the explorer for that object type.
-					</div>
+					<div className="search-hint">Opens the explorer for that object type.</div>
 				</div>
 			)}
 			{open && results && results.length === 0 && debounced.trim().length >= 2 && (
-				<div
-					className="card"
-					style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, width: 360, zIndex: 30 }}
-				>
-					<span className="muted" style={{ fontSize: 12 }}>
+				<div className="search-popover">
+					<div className="search-empty">
+						<Icon name="search" size={15} />
 						Nothing matches “{debounced.trim()}”.
-					</span>
+					</div>
 				</div>
 			)}
 		</div>

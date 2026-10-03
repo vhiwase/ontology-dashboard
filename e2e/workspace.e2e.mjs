@@ -138,20 +138,22 @@ test("a dashboard request is built, or proposed and built on approval", { skip: 
 test("syncing again keeps what was approved on top of the data", { skip: !configured && "E2E_SOURCE_* not set" }, async () => {
 	// A refresh (by hand or on a schedule) must not trip over the datasets an
 	// approval built on the synced tables.
-	const login = await fetch(`${BASE}/api/auth/login`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ username: user, password }),
-	});
-	assert.equal(login.status, 200);
+	//
+	// Asked through the browser context rather than Node's fetch: the stack
+	// serves a self-signed certificate until a real one is mounted, the context
+	// was told to accept it (ignoreHTTPSErrors), and fetch has no such setting -
+	// against the documented https://127.0.0.1:3000 it failed before sending.
+	const api = page.request;
+	const login = await api.post(`${BASE}/api/auth/login`, { data: { username: user, password } });
+	assert.equal(login.status(), 200);
 	const { token } = await login.json();
-	const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
-	const syncs = await (await fetch(`${BASE}/api/syncs`, { headers })).json();
+	const headers = { authorization: `Bearer ${token}` };
+	const syncs = await (await api.get(`${BASE}/api/syncs`, { headers })).json();
 	assert.ok(syncs.length > 0, "the import created syncs");
 	for (const sync of syncs) {
-		const response = await fetch(`${BASE}/api/syncs/${sync.id}/run`, { method: "POST", headers, body: "{}" });
+		const response = await api.post(`${BASE}/api/syncs/${sync.id}/run`, { headers, data: {} });
 		const body = await response.json();
-		assert.equal(response.status, 200, `${sync.name}: ${JSON.stringify(body)}`);
+		assert.equal(response.status(), 200, `${sync.name}: ${JSON.stringify(body)}`);
 		assert.equal(body.run.status, "success", `${sync.name}: ${body.run.errorMessage}`);
 	}
 });

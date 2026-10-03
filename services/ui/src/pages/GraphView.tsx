@@ -10,8 +10,9 @@ import {
 	DataTable,
 	ErrorBanner,
 	NoOntologyHere,
-	Spinner,
+	PageLoader,
 } from "../components/common";
+import { Icon } from "../components/icons";
 
 export function GraphView() {
 	const [types, setTypes] = useState<ObjectTypeSummary[] | null>(null);
@@ -91,7 +92,7 @@ export function GraphView() {
 	if (missing)
 		return <NoOntologyHere what="object graph" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
-	if (!types || !links) return <Spinner label="Loading ontology graph" />;
+	if (!types || !links) return <PageLoader label="Loading ontology graph" />;
 	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
@@ -134,6 +135,7 @@ export function GraphView() {
 						<h3>{selectedType.label}</h3>
 						<span className="sub">{selectedType.rowCount.toLocaleString()} objects</span>
 						<Link className="btn sm" to="/explorer" style={{ marginLeft: 10 }}>
+							<Icon name="compass" size={13} />
 							Explore
 						</Link>
 					</div>
@@ -177,9 +179,10 @@ export function GraphView() {
 							className="btn sm"
 							onClick={() => void navigator.clipboard?.writeText(exported)}
 							style={{ marginLeft: "auto" }}
-						>
-							Copy
-						</button>
+							>
+								<Icon name="copy" size={13} />
+								Copy
+							</button>
 					)}
 				</div>
 				{exported && (

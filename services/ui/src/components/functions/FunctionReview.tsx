@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { type FunctionRecord, type FunctionResult, api, formatValue } from "../../api";
 import { DataTable, ErrorBanner, Spinner } from "../common";
+import { Icon } from "../icons";
 
 /** Fields the reviewer may change before approving. */
 interface Draft {
@@ -47,10 +48,13 @@ export function FunctionReview({
 	apiName,
 	onClose,
 	onApproved,
+	onDelete,
 }: {
 	apiName: string | null;
 	onClose: () => void;
 	onApproved?: (fn: FunctionRecord) => void;
+	/** Offered only where the page can ask about it and carry it out. */
+	onDelete?: (fn: FunctionRecord) => void;
 }) {
 	const [fn, setFn] = useState<FunctionRecord | null>(null);
 	const [draft, setDraft] = useState<Draft | null>(null);
@@ -167,7 +171,7 @@ export function FunctionReview({
 			<div className="rp fn-window" role="dialog" aria-modal="true" aria-label="Review function">
 				<header className="rp-head">
 					<span className="rp-glyph" aria-hidden>
-						ƒ
+						<Icon name="fn" size={18} />
 					</span>
 					<div className="rp-heading">
 						<div className="rp-kind">
@@ -176,16 +180,14 @@ export function FunctionReview({
 						<h3 className="rp-title">{fn?.name ?? "Loading…"}</h3>
 					</div>
 					<button className="icon-button" onClick={close} aria-label="Close">
-						×
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 
 				{!fn || !draft ? (
-					error ? (
-						<ErrorBanner error={error} />
-					) : (
-						<Spinner label="Loading function" />
-					)
+					<div className="fn-body">
+						{error ? <ErrorBanner error={error} /> : <Spinner label="Loading function" />}
+					</div>
 				) : (
 					<div className="fn-body">
 						{fn.status === "proposed" && (
@@ -375,26 +377,39 @@ export function FunctionReview({
 							)}
 						</div>
 						<div className="row" style={{ gap: 8 }}>
-							<button className="ghost" onClick={runPreview} disabled={busy !== null}>
+							{onDelete && (
+								<button
+									className="btn ghost danger"
+									onClick={() => onDelete(fn)}
+									disabled={busy !== null}
+									title="Remove this function for good, with the record of its runs"
+								>
+									<Icon name="trash" size={13} />
+									Delete
+								</button>
+							)}
+							<button className="btn ghost" onClick={runPreview} disabled={busy !== null}>
+								{busy === "preview" ? <span className="spinner" aria-hidden /> : <Icon name="play" size={13} />}
 								{busy === "preview" ? "Running…" : "Test run"}
 							</button>
 							{fn.status === "proposed" && (
 								<>
 									<button
-										className="ghost danger"
+										className="btn ghost danger"
 										onClick={() => decide("reject")}
 										disabled={busy !== null}
 									>
 										Reject
 									</button>
-									<button className="primary" onClick={approve} disabled={busy !== null}>
+									<button className="btn primary" onClick={approve} disabled={busy !== null}>
+										{busy === "approve" ? <span className="spinner" aria-hidden /> : <Icon name="check" size={15} />}
 										{busy === "approve" ? "Approving…" : "Approve & create"}
 									</button>
 								</>
 							)}
 							{fn.status === "active" && (
 								<button
-									className="ghost danger"
+									className="btn ghost danger"
 									onClick={() => decide("archive")}
 									disabled={busy !== null}
 								>

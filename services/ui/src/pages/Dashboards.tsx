@@ -26,11 +26,19 @@ import {
 	formatPeriod,
 	formatValue,
 	grainOf,
-	session,
 	toCsv,
 } from "../api";
 import { Chart, type ChartKind } from "../components/Chart";
-import { CoverageBanner, DataTable, Empty, ErrorBanner, Markdown, Spinner, StatTile } from "../components/common";
+import { CoverageBanner, DataTable, Empty, ErrorBanner, Markdown, PageLoader, Spinner, StatTile } from "../components/common";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import {
+	DeleteButton,
+	DeleteDialog,
+	type RemovableKind,
+	deletedNotice,
+	useCanDelete,
+} from "../components/DeleteDialog";
+import { Icon } from "../components/icons";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { useSpace } from "../SpaceContext";
 
@@ -46,7 +54,16 @@ export function DashboardList() {
 	const [query, setQuery] = useState("");
 	const [tab, setTab] = useState<"all" | "dashboard" | "report">("all");
 	const [creating, setCreating] = useState(false);
-	const { spaceSlug, isPersonal } = useSpace();
+	// What is being deleted from this page: a board, or one of the metrics below.
+	const [removing, setRemoving] = useState<{
+		kind: RemovableKind;
+		target: string;
+		label: string;
+		noun?: string;
+	} | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
+	const canDelete = useCanDelete();
+	const { spaceSlug, isPersonal, reload } = useSpace();
 
 	const load = () => {
 		setError(null);
@@ -69,7 +86,7 @@ export function DashboardList() {
 	useEffect(load, [spaceSlug]);
 
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
-	if (!dashboards) return <Spinner label="Loading dashboards" />;
+	if (!dashboards) return <PageLoader label="Loading dashboards" />;
 
 	const needle = query.trim().toLowerCase();
 	const visible = dashboards.filter(
@@ -102,17 +119,26 @@ export function DashboardList() {
 				<div className="row" style={{ gap: 8 }}>
 					{!isPersonal && (
 						<Link className="btn" to="/dashboards/history">
+							<Icon name="history" size={15} />
 							History &amp; backup
 						</Link>
 					)}
 					<button className="btn" onClick={() => setCreating(true)} disabled={kpis.length === 0}>
+						<Icon name="plus" size={15} />
 						New board
 					</button>
 					<Link className="btn primary" to={`/assistant?q=${encodeURIComponent("Build me a dashboard about ")}`}>
+						<Icon name="sparkles" size={15} />
 						Describe one to the assistant
 					</Link>
 				</div>
 			</header>
+
+			{notice && (
+				<p className="rb-notice" role="status">
+					{notice}
+				</p>
+			)}
 
 			<div className="row" style={{ gap: 10 }}>
 				<div className="tabs" role="tablist">
@@ -142,7 +168,7 @@ export function DashboardList() {
 			{visible.length === 0 ? (
 				<div className="empty-state">
 					<div className="empty-state-mark" aria-hidden>
-						▦
+						<Icon name="dashboard" size={24} />
 					</div>
 					<h3>{dashboards.length === 0 ? "No boards yet" : `Nothing matches “${query}”`}</h3>
 					<p>
@@ -153,13 +179,20 @@ export function DashboardList() {
 			) : (
 				<div className="board-grid">
 					{visible.map((dashboard) => (
-						<Link key={dashboard.slug} to={`/dashboards/${dashboard.slug}`} className="board-card">
+						// The card is a link, and a button cannot sit inside one: the
+						// bin is beside it, laid over its corner.
+						<div key={dashboard.slug} className="board-card-wrap">
+						<Link to={`/dashboards/${dashboard.slug}`} className="board-card">
 							<div className="board-card-top">
 								<span className={`board-kind ${dashboard.kind === "report" ? "report" : ""}`} aria-hidden>
-									{dashboard.kind === "report" ? "▤" : "▦"}
+									<Icon name={dashboard.kind === "report" ? "fileText" : "dashboard"} size={16} />
 								</span>
 								<span className="chip">{dashboard.kind === "report" ? "Report" : "Dashboard"}</span>
-								{dashboard.isAiGenerated && <span className="chip">✦ AI built</span>}
+								{dashboard.isAiGenerated && (
+									<span className="chip accent">
+										<Icon name="sparkles" size={11} /> AI built
+									</span>
+								)}
 								{dashboard.isPinned && <span className="chip">pinned</span>}
 							</div>
 							<h3>{dashboard.title}</h3>
@@ -169,6 +202,23 @@ export function DashboardList() {
 								{dashboard.layout.length} widgets · updated {new Date(dashboard.updatedAt).toLocaleDateString()}
 							</div>
 						</Link>
+						{canDelete && (
+							<span className="board-card-delete">
+								<DeleteButton
+									iconOnly
+									title={`Delete the ${dashboard.kind === "report" ? "report" : "dashboard"} ${dashboard.title}`}
+									onClick={() =>
+										setRemoving({
+											kind: "dashboard",
+											target: dashboard.slug,
+											label: dashboard.title,
+											noun: dashboard.kind === "report" ? "report" : "dashboard",
+										})
+									}
+								/>
+							</span>
+						)}
+						</div>
 					))}
 				</div>
 			)}
@@ -199,6 +249,19 @@ export function DashboardList() {
 									...kpi,
 									dimensionList: sliceList(kpi.dimensions),
 								}))}
+								actions={
+									canDelete
+										? (row) => (
+												<DeleteButton
+													iconOnly
+													title={`Delete the metric ${String(row.label)}`}
+													onClick={() =>
+														setRemoving({ kind: "metric", target: String(row.apiName), label: String(row.label) })
+													}
+												/>
+											)
+										: undefined
+								}
 							/>
 						</div>
 					))
@@ -206,6 +269,23 @@ export function DashboardList() {
 			</section>
 
 			{creating && <NewBoardDialog onClose={() => setCreating(false)} />}
+
+			{removing && (
+				<DeleteDialog
+					kind={removing.kind}
+					target={removing.target}
+					label={removing.label}
+					noun={removing.noun}
+					onClose={() => setRemoving(null)}
+					onDeleted={(plan) => {
+						setNotice(deletedNotice({ ...plan, name: removing.label }, removing.noun));
+						setRemoving(null);
+						load();
+						// A metric is counted in the navigation and listed elsewhere.
+						if (removing.kind === "metric") reload();
+					}}
+				/>
+			)}
 		</div>
 	);
 }
@@ -282,8 +362,8 @@ function NewBoardDialog({ onClose }: { onClose: () => void }) {
 			<div className="modal" role="dialog" aria-label="New board" style={{ maxWidth: 520 }}>
 				<header className="modal-head">
 					<h2>New board</h2>
-					<button className="btn sm ghost" onClick={onClose} aria-label="Close">
-						✕
+					<button className="icon-btn" onClick={onClose} aria-label="Close">
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 				<div className="modal-body">
@@ -319,6 +399,7 @@ function NewBoardDialog({ onClose }: { onClose: () => void }) {
 							Cancel
 						</button>
 						<button className="btn primary" disabled={busy || !objectType} onClick={() => void create()}>
+							{busy && <span className="spinner" aria-hidden />}
 							{busy ? "Building…" : `Create ${kind}`}
 						</button>
 					</footer>
@@ -342,6 +423,13 @@ export function DashboardDetail() {
 	const [lineageId, setLineageId] = useState<number | null>(null);
 	const [view, setView] = useState<"board" | "report" | null>(null);
 	const [copied, setCopied] = useState(false);
+	// Deleting is asked about first, in the page's own window.
+	const [confirmingDelete, setConfirmingDelete] = useState(false);
+	const [deleting, setDeleting] = useState(false);
+	// The same rule as the server's: an administrator, or anyone in their own
+	// workspace. It used to offer Delete on any AI-built board, to people the
+	// server then refused.
+	const canDelete = useCanDelete();
 
 	// A new board starts unfiltered.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset per board
@@ -394,19 +482,21 @@ export function DashboardDetail() {
 	}
 
 	if (error && !dashboard) return <ErrorBanner error={error} />;
-	if (!dashboard) return <Spinner label="Running the board's metrics" />;
+	if (!dashboard) return <PageLoader label="Running the board's metrics" />;
 
 	const mode = view ?? (dashboard.kind === "report" ? "report" : "board");
-	const user = session.user();
-	const canDelete = dashboard.isAiGenerated || isPersonal || user?.role === "admin";
 
 	const remove = async () => {
-		if (!window.confirm(`Delete "${dashboard.title}"? This cannot be undone.`)) return;
+		setDeleting(true);
 		try {
 			await api.del(`/api/dashboards/${dashboard.slug}?space=${spaceSlug}`);
 			navigate("/dashboards");
 		} catch (exc) {
+			// The board is still here, so the reason is shown on it.
 			setError((exc as Error).message);
+			setConfirmingDelete(false);
+		} finally {
+			setDeleting(false);
 		}
 	};
 
@@ -427,11 +517,16 @@ export function DashboardDetail() {
 				<div className="board-head-text">
 					<div className="row" style={{ gap: 6 }}>
 						<Link to="/dashboards" className="muted crumb">
+							<Icon name="chevronLeft" size={14} />
 							Dashboards & reports
 						</Link>
 						<span className="muted">/</span>
 						<span className="chip">{dashboard.kind === "report" ? "Report" : "Dashboard"}</span>
-						{dashboard.isAiGenerated && <span className="chip">✦ AI built</span>}
+						{dashboard.isAiGenerated && (
+							<span className="chip accent">
+								<Icon name="sparkles" size={11} /> AI built
+							</span>
+						)}
 						{loading && <span className="spinner" aria-label="Updating" />}
 					</div>
 					<h1>{dashboard.title}</h1>
@@ -453,10 +548,12 @@ export function DashboardDetail() {
 					</div>
 					{mode === "report" && (
 						<button className="btn primary" onClick={() => window.print()}>
+							<Icon name="printer" size={15} />
 							Print / save PDF
 						</button>
 					)}
 					<button className="btn" onClick={exportAll} title="Every widget's numbers as one CSV">
+						<Icon name="download" size={15} />
 						Export CSV
 					</button>
 					<button
@@ -468,15 +565,18 @@ export function DashboardDetail() {
 							});
 						}}
 					>
+						<Icon name={copied ? "check" : "link"} size={15} />
 						{copied ? "Link copied" : "Copy link"}
 					</button>
 					{!isPersonal && (
 						<button className="btn" onClick={() => void showLineage(dashboard.slug)}>
+							<Icon name="lineage" size={15} />
 							Lineage
 						</button>
 					)}
 					{canDelete && (
-						<button className="btn ghost danger" onClick={() => void remove()}>
+						<button className="btn ghost danger" onClick={() => setConfirmingDelete(true)}>
+							<Icon name="trash" size={15} />
 							Delete
 						</button>
 					)}
@@ -501,6 +601,32 @@ export function DashboardDetail() {
 			)}
 
 			<ResourcePreview resourceId={lineageId} onClose={() => setLineageId(null)} />
+
+			{confirmingDelete && (
+				<ConfirmDialog
+					title={`Delete “${dashboard.title}”?`}
+					icon="trash"
+					cancelLabel="Keep it"
+					busy={deleting}
+					onCancel={() => setConfirmingDelete(false)}
+					choices={[
+						{
+							label: deleting ? "Deleting…" : `Delete this ${dashboard.kind === "report" ? "report" : "dashboard"}`,
+							tone: "danger",
+							onSelect: () => void remove(),
+						},
+					]}
+				>
+					<p>
+						The {dashboard.kind === "report" ? "report" : "dashboard"} and its layout are removed for everyone who can
+						open this space, and its address stops working. The metrics and the data it shows are not touched.
+					</p>
+					<p>
+						This cannot be undone here. To keep a copy first, use <strong>Back up to file</strong> on the dashboard
+						history page.
+					</p>
+				</ConfirmDialog>
+			)}
 		</div>
 	);
 }
@@ -553,7 +679,10 @@ function FilterBar({
 
 	return (
 		<div className="filter-bar no-print">
-			<span className="filter-label">Filter</span>
+			<span className="filter-label">
+				<Icon name="filter" size={13} />
+				Filter
+			</span>
 			{time && (
 				<div className="filter-time">
 					<select
@@ -637,7 +766,8 @@ function FilterBar({
 							title="Remove this filter"
 						>
 							{key.replace(/_/g, " ")}:{" "}
-							{typeof value === "string" ? value : `${value.gte ?? "…"} – ${value.lte ?? "…"}`} ✕
+							{typeof value === "string" ? value : `${value.gte ?? "…"} – ${value.lte ?? "…"}`}
+							<Icon name="x" size={12} />
 						</button>
 					))}
 					<button className="btn sm ghost" onClick={() => onChange({})}>
@@ -742,11 +872,22 @@ function WidgetCard({
 					</span>
 				</div>
 				<div className="widget-tools no-print">
-					<button className="icon-btn" title="Download CSV" onClick={() => downloadWidget(widget)}>
-						⤓
+					<button
+						className="icon-btn"
+						title="Download CSV"
+						aria-label="Download CSV"
+						onClick={() => downloadWidget(widget)}
+					>
+						<Icon name="download" size={15} />
 					</button>
-					<button className="icon-btn" title="How this is computed" onClick={() => setShowSql((value) => !value)}>
-						{"</>"}
+					<button
+						className="icon-btn"
+						title="How this is computed"
+						aria-label="How this is computed"
+						aria-pressed={showSql}
+						onClick={() => setShowSql((value) => !value)}
+					>
+						<Icon name="code" size={15} />
 					</button>
 				</div>
 			</div>

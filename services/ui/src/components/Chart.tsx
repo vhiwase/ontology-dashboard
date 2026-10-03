@@ -15,6 +15,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { formatValue, round, shortLabel } from "../api";
+import { Icon } from "./icons";
 
 export type ChartKind = "bar" | "hbar" | "line" | "area" | "donut";
 
@@ -46,6 +47,11 @@ interface ChartProps {
 	 * so its centre stays empty rather than showing a sum of averages.
 	 */
 	additive?: boolean;
+}
+
+/** Entrance stagger for the n-th mark, capped so a long series settles quickly. */
+function stagger(index: number): React.CSSProperties {
+	return { animationDelay: `${Math.min(index * 35, 420)}ms` };
 }
 
 /** Opacity for a mark: everything full until something is selected. */
@@ -138,7 +144,10 @@ export function Chart(props: ChartProps) {
 
 	if (points.length === 0) {
 		return (
-			<div className="empty" style={{ padding: "26px 16px", fontSize: 12 }}>
+			<div className="empty" style={{ padding: "26px 16px", fontSize: 12.5 }}>
+				<span className="empty-icon" aria-hidden>
+					<Icon name="barChart" size={18} />
+				</span>
 				No data for this metric yet.
 			</div>
 		);
@@ -240,7 +249,8 @@ function HorizontalBars({
 								{shortLabel(formatLabel(point.label), Math.max(8, Math.floor(labelWidth / 6.2)))}
 							</text>
 							<rect
-								className={`chart-mark${onSelect ? " selectable" : ""}`}
+								className={`chart-mark bar-h${value < 0 ? " neg" : ""}${onSelect ? " selectable" : ""}`}
+								style={stagger(index)}
 								x={x}
 								y={y + gap}
 								width={Math.max(barLength, 2)}
@@ -299,8 +309,13 @@ function VerticalBars({
 	const scaleY = (value: number) => padding.top + plotHeight - ((value - min) / span) * plotHeight;
 
 	const slot = plotWidth / points.length;
-	const barWidth = Math.max(Math.min(slot - 4, 58), 3);
+	// Capped at 24px: a bar never fills its band, the leftover is air.
+	const barWidth = Math.max(Math.min(slot - 4, 24), 3);
 	const ticks = niceTicks(min, max, 4);
+	// Every bar is named while there is room for the names. Past that, every
+	// n-th one: thirty days of bars with no dates under them say how much but
+	// not when, and a label on each would collide.
+	const labelEvery = points.length <= 12 ? 1 : Math.ceil(points.length / 8);
 
 	return (
 		<>
@@ -339,7 +354,8 @@ function VerticalBars({
 					return (
 						<g key={`${point.label}-${index}`}>
 							<rect
-								className={`chart-mark${onSelect ? " selectable" : ""}`}
+								className={`chart-mark bar-v${value < 0 ? " neg" : ""}${onSelect ? " selectable" : ""}`}
+								style={stagger(index)}
 								x={x}
 								y={y}
 								width={barWidth}
@@ -361,15 +377,16 @@ function VerticalBars({
 							>
 								<title>{`${formatLabel(point.label)}: ${formatValue(value, format, unit)}`}</title>
 							</rect>
-							{/* Labels only when they will not collide. */}
-							{points.length <= 12 && (
+							{/* Only the labels that will not collide: each has the room of
+							    the bars between it and the next one. */}
+							{index % labelEvery === 0 && (
 								<text
 									x={x + barWidth / 2}
 									y={height - padding.bottom + 15}
 									textAnchor="middle"
 									className="chart-axis"
 								>
-									{shortLabel(formatLabel(point.label), Math.max(6, Math.floor(slot / 7)))}
+									{shortLabel(formatLabel(point.label), Math.max(6, Math.floor((slot * labelEvery) / 7)))}
 								</text>
 							)}
 						</g>
@@ -510,8 +527,17 @@ function LineChart({
 					/>
 				)}
 
-				{areaPath && <path d={areaPath} fill={`url(#${gradientId})`} />}
-				<path d={path} fill="none" stroke="var(--series-1)" strokeWidth={2} strokeLinejoin="round" />
+				{areaPath && <path className="area-fade" d={areaPath} fill={`url(#${gradientId})`} />}
+				<path
+					className="line-draw"
+					d={path}
+					pathLength={1}
+					fill="none"
+					stroke="var(--series-1)"
+					strokeWidth={2}
+					strokeLinejoin="round"
+					strokeLinecap="round"
+				/>
 				{partialPath && (
 					<path d={partialPath} fill="none" stroke="var(--series-1)" strokeWidth={2} strokeDasharray="4 4" opacity={0.7} />
 				)}
@@ -610,7 +636,10 @@ function Donut({
 	const total = slices.reduce((sum, slice) => sum + (slice.value as number), 0);
 	if (total <= 0) {
 		return (
-			<div className="empty" style={{ padding: "26px 16px", fontSize: 12 }}>
+			<div className="empty" style={{ padding: "26px 16px", fontSize: 12.5 }}>
+				<span className="empty-icon" aria-hidden>
+					<Icon name="barChart" size={18} />
+				</span>
 				Every value is zero, so there are no shares to show.
 			</div>
 		);
@@ -646,7 +675,8 @@ function Donut({
 						return (
 							<path
 								key={arc.label}
-								className={`chart-mark${selectable ? " selectable" : ""}`}
+								className={`chart-mark slice${selectable ? " selectable" : ""}`}
+								style={stagger(index * 2)}
 								d={arc.path}
 								fill={arc.color}
 								opacity={markOpacity(arc.label, selected)}

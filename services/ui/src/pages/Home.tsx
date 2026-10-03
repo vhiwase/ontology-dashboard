@@ -19,7 +19,8 @@ import {
 } from "../api";
 import { ConnectWizard } from "../components/ConnectWizard";
 import { ProposalCard } from "../components/ProposalCard";
-import { ErrorBanner, Spinner } from "../components/common";
+import { ErrorBanner, PageLoader } from "../components/common";
+import { Icon, type IconName } from "../components/icons";
 import { useSpace } from "../SpaceContext";
 
 interface Starter {
@@ -83,7 +84,7 @@ export function Home() {
 	}
 
 	if (error && !summary) return <ErrorBanner error={error} />;
-	if (!summary) return <Spinner label="Opening your workspace" />;
+	if (!summary) return <PageLoader label="Opening your workspace" />;
 
 	const empty = summary.counts.objectTypes === 0;
 	const submit = (event: FormEvent) => {
@@ -95,7 +96,10 @@ export function Home() {
 		<div className="page home">
 			<section className="hero">
 				<div className="hero-text">
-					<p className="hero-kicker">{space?.name ?? "Your workspace"}</p>
+					<p className="hero-kicker">
+						<Icon name="layers" size={13} />
+						{space?.name ?? "Your workspace"}
+					</p>
 					<h1>
 						{greeting()}
 						{name ? `, ${name}` : ""}.
@@ -108,7 +112,7 @@ export function Home() {
 				</div>
 				<form className="ask-box" onSubmit={submit}>
 					<span className="ask-spark" aria-hidden>
-						✦
+						<Icon name="sparkles" size={19} />
 					</span>
 					<input
 						value={question}
@@ -119,6 +123,7 @@ export function Home() {
 					/>
 					<button className="btn primary" type="submit" disabled={empty || !question.trim()}>
 						Ask
+						<Icon name="arrowRight" size={15} />
 					</button>
 				</form>
 			</section>
@@ -146,6 +151,7 @@ export function Home() {
 					</div>
 					<div className="onboarding-cta">
 						<button className="btn primary lg" onClick={() => setWizard(true)}>
+							<Icon name="plug" size={17} />
 							Connect your database
 						</button>
 						<p className="muted">Takes about a minute. Nothing is ever written to your database.</p>
@@ -154,19 +160,21 @@ export function Home() {
 			) : (
 				<>
 					<section className="metric-strip" aria-label="Workspace at a glance">
-						<Glance label="Tables imported" value={summary.counts.datasets} to="/data" />
-						<Glance label="Business objects" value={summary.counts.objectTypes} to="/ontology" />
-						<Glance label="Links" value={summary.counts.linkTypes} to="/graph" />
-						<Glance label="Metrics" value={summary.counts.metrics} to="/dashboards#metrics" />
+						<Glance label="Tables imported" value={summary.counts.datasets} to="/data" icon="table" />
+						<Glance label="Business objects" value={summary.counts.objectTypes} to="/ontology" icon="box" />
+						<Glance label="Links" value={summary.counts.linkTypes} to="/graph" icon="graph" />
+						<Glance label="Metrics" value={summary.counts.metrics} to="/dashboards#metrics" icon="sigma" />
 						<Glance
 							label="Dashboards & reports"
 							value={summary.counts.dashboards + summary.counts.reports}
 							to="/dashboards"
+							icon="dashboard"
 						/>
 						<Glance
 							label="Waiting for approval"
 							value={summary.counts.pendingProposals}
 							to="/approvals"
+							icon="checkCircle"
 							tone={summary.counts.pendingProposals > 0 ? "attention" : undefined}
 						/>
 					</section>
@@ -182,7 +190,7 @@ export function Home() {
 									{starters.map((starter) => (
 										<button key={starter.label} className="suggestion" onClick={() => ask(starter.prompt)}>
 											<span className="suggestion-spark" aria-hidden>
-												✦
+												<Icon name="sparkles" size={14} />
 											</span>
 											{starter.label}
 										</button>
@@ -195,9 +203,11 @@ export function Home() {
 									<h2>Dashboards & reports</h2>
 									<div className="row" style={{ marginLeft: "auto", gap: 6 }}>
 										<button className="btn sm" disabled={building !== null} onClick={() => void build("dashboard")}>
+											{building === "dashboard" ? <span className="spinner" aria-hidden /> : <Icon name="plus" size={13} />}
 											{building === "dashboard" ? "Building…" : "New dashboard"}
 										</button>
 										<button className="btn sm" disabled={building !== null} onClick={() => void build("report")}>
+											{building === "report" ? <span className="spinner" aria-hidden /> : <Icon name="plus" size={13} />}
 											{building === "report" ? "Writing…" : "New report"}
 										</button>
 									</div>
@@ -212,7 +222,7 @@ export function Home() {
 										{boards.slice(0, 6).map((board) => (
 											<Link key={board.slug} to={`/dashboards/${board.slug}`} className="board-row">
 												<span className={`board-kind ${board.kind === "report" ? "report" : ""}`} aria-hidden>
-													{board.kind === "report" ? "▤" : "▦"}
+													<Icon name={board.kind === "report" ? "fileText" : "dashboard"} size={16} />
 												</span>
 												<span className="board-title">{board.title}</span>
 												<span className="muted board-meta">
@@ -254,6 +264,7 @@ export function Home() {
 								<header className="panel-head">
 									<h2>Your data model</h2>
 									<button className="btn sm" style={{ marginLeft: "auto" }} onClick={() => setWizard(true)}>
+										<Icon name="plug" size={13} />
 										Connect another database
 									</button>
 								</header>
@@ -310,10 +321,25 @@ function OnboardingStep({
 	);
 }
 
-function Glance({ label, value, to, tone }: { label: string; value: number; to: string; tone?: "attention" }) {
+function Glance({
+	label,
+	value,
+	to,
+	icon,
+	tone,
+}: {
+	label: string;
+	value: number;
+	to: string;
+	icon: IconName;
+	tone?: "attention";
+}) {
 	return (
 		<Link to={to} className={`glance ${tone ?? ""}`}>
-			<span className="glance-value num">{value.toLocaleString("en-US")}</span>
+			<span className="glance-icon" aria-hidden>
+				<Icon name={icon} size={16} />
+			</span>
+			<span className="glance-value">{value.toLocaleString("en-US")}</span>
 			<span className="glance-label">{label}</span>
 		</Link>
 	);

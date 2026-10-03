@@ -1,9 +1,16 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en" data-theme="light">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Reports and dashboards on your own data, built by asking." />
+    <meta name="theme-color" content="#4f46e5" />
     <title>TMS Ontology Workbench</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Applies the saved theme before the first paint, so a dark-theme user
+         does not see a flash of the light one. An external file rather than an
+         inline script: the CSP allows scripts from this origin only. -->
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>

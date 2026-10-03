@@ -243,7 +243,48 @@ export async function createProject(
 	return created;
 }
 
+// ── the stored password of a connection that is deleted ─────────────────────
+//  A password typed into the connect form is kept in the vault, under a
+//  reference only its connection holds. A connection can go three ways - by
+//  itself, with its folder, with its project - and its password used to stay
+//  behind each time: encrypted and unreachable, but still on the server after
+//  the person had deleted what it was for. Each of the three removes it now.
+
+/** The vault references held by the connections a condition selects. */
+async function vaultRefsHeld(condition: string, parameters: unknown[]): Promise<string[]> {
+	const rows = await query<{ ref: string }>(
+		`SELECT r.properties->>'secretRef' AS ref
+		   FROM platform.resource r
+		  WHERE r.kind = 'connection' AND r.properties->>'secretRef' LIKE 'vault:%' AND ${condition}`,
+		parameters,
+	);
+	return rows.map((row) => row.ref);
+}
+
+/**
+ * Remove the stored passwords behind these references, where no connection
+ * refers to one any more. Called after the delete, so "any more" is true.
+ */
+async function forgetCredentials(refs: string[]): Promise<void> {
+	if (refs.length === 0) return;
+	await query(
+		`DELETE FROM platform.credential c
+		  WHERE 'vault:' || c.credential_id = ANY($1::text[])
+		    AND NOT EXISTS (
+		          SELECT 1 FROM platform.resource r
+		           WHERE r.kind = 'connection'
+		             AND r.properties->>'secretRef' = 'vault:' || c.credential_id)`,
+		[refs],
+	);
+}
+
 export async function deleteProject(spaceSlug: string, projectSlug: string): Promise<void> {
+	const refs = await vaultRefsHeld(
+		`r.project_id IN (SELECT p.project_id
+		                    FROM platform.project p JOIN platform.space s ON s.space_id = p.space_id
+		                   WHERE s.slug = $1 AND p.slug = $2)`,
+		[spaceSlug, projectSlug],
+	);
 	const row = await queryOne<{ project_id: number }>(
 		`DELETE FROM platform.project p
 		  USING platform.space s
@@ -252,6 +293,7 @@ export async function deleteProject(spaceSlug: string, projectSlug: string): Pro
 		[spaceSlug, projectSlug],
 	);
 	if (!row) throw new NotFound(`No project '${projectSlug}' in '${spaceSlug}'.`);
+	await forgetCredentials(refs);
 }
 
 async function requireProject(
@@ -324,11 +366,22 @@ export async function createFolder(
 }
 
 export async function deleteFolder(folderId: number): Promise<void> {
+	// The folder takes everything under it, however deep.
+	const refs = await vaultRefsHeld(
+		`r.folder_id IN (
+		   WITH RECURSIVE tree AS (
+		     SELECT folder_id FROM platform.folder WHERE folder_id = $1
+		     UNION ALL
+		     SELECT f.folder_id FROM platform.folder f JOIN tree t ON f.parent_id = t.folder_id)
+		   SELECT folder_id FROM tree)`,
+		[folderId],
+	);
 	const row = await queryOne<{ folder_id: number }>(
 		"DELETE FROM platform.folder WHERE folder_id = $1 RETURNING folder_id",
 		[folderId],
 	);
 	if (!row) throw new NotFound(`No folder ${folderId}.`);
+	await forgetCredentials(refs);
 }
 
 // ── the tree ────────────────────────────────────────────────────────────────
@@ -519,11 +572,13 @@ export async function createResource(
 }
 
 export async function deleteResource(resourceId: number): Promise<void> {
-	const row = await queryOne<{ resource_id: number }>(
-		"DELETE FROM platform.resource WHERE resource_id = $1 RETURNING resource_id",
+	const row = await queryOne<{ resource_id: number; kind: string; properties: Record<string, unknown> | null }>(
+		"DELETE FROM platform.resource WHERE resource_id = $1 RETURNING resource_id, kind, properties",
 		[resourceId],
 	);
 	if (!row) throw new NotFound(`No resource ${resourceId}.`);
+	const ref = row.kind === "connection" ? row.properties?.secretRef : null;
+	if (typeof ref === "string" && ref.startsWith("vault:")) await forgetCredentials([ref]);
 }
 
 export async function renameResource(
@@ -1147,9 +1202,16 @@ export async function previewResource(resourceId: number): Promise<ResourcePrevi
  *
  * Idempotent: it adds only what is missing, so it runs on every boot. Datasets
  * are not seeded: a dataset is what a sync lands, so they appear when one runs.
+ *
+ * The connection is part of the first setup, not something kept in place: it
+ * is added together with its /Connections folder and not again. It used to be
+ * added whenever the sandbox had none, so deleting it lasted until the next
+ * restart, when it came back without its syncs. `restore` asks for it back on
+ * purpose - the "set up the sandbox" button.
  */
 export async function seedSandbox(
 	createdBy = "system",
+	options: { restore?: boolean } = {},
 ): Promise<{ created: boolean; added: number }> {
 	const existing = await listProjects("sandbox");
 	const hadProject = existing.length > 0;
@@ -1165,6 +1227,7 @@ export async function seedSandbox(
 	if (!project) throw new BadRequest("The sandbox project could not be resolved.");
 
 	let added = 0;
+	let firstSetup = !hadProject;
 	const ensureFolder = async (name: string) => {
 		const found = await queryOne<{ folder_id: number }>(
 			"SELECT folder_id FROM platform.folder WHERE project_id = $1 AND path = $2",
@@ -1172,6 +1235,9 @@ export async function seedSandbox(
 		);
 		if (found) return Number(found.folder_id);
 		added += 1;
+		// The folder the connection lives in is made on the first setup only,
+		// so making it now means this is that setup.
+		if (name === "Connections") firstSetup = true;
 		return (await createFolder("sandbox", project.slug, name, null, createdBy)).id;
 	};
 
@@ -1184,7 +1250,7 @@ export async function seedSandbox(
 		"SELECT 1 FROM platform.resource WHERE project_id = $1 AND kind = 'connection'",
 		[project.id],
 	);
-	if (!hasConnection) {
+	if (!hasConnection && (firstSetup || options.restore)) {
 		const info = await databaseInfo();
 		await createResource(
 			"sandbox",

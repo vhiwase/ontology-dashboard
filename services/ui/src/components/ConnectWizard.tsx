@@ -14,6 +14,7 @@ import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { type RemoteRelation, api } from "../api";
 import { useSpace } from "../SpaceContext";
+import { Icon } from "./icons";
 
 interface ConnectionTest {
 	ok: boolean;
@@ -210,8 +211,8 @@ export function ConnectWizard({
 							})}
 						</ol>
 					</div>
-					<button className="btn sm ghost" onClick={onClose} aria-label="Close" disabled={step === "importing"}>
-						✕
+					<button className="icon-btn" onClick={onClose} aria-label="Close" disabled={step === "importing"}>
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 
@@ -286,7 +287,7 @@ export function ConnectWizard({
 							</p>
 						)}
 						{relations && relations.length === 0 && (
-							<div className="banner">
+							<div className="banner warn">
 								This user cannot read any tables in that database. Grant it SELECT on the tables you want to
 								report on, then try again.
 							</div>
@@ -358,7 +359,7 @@ export function ConnectWizard({
 					<div className="modal-body">
 						<div className="done-hero">
 							<span className="done-mark" aria-hidden>
-								✓
+								<Icon name="check" size={22} strokeWidth={2.4} />
 							</span>
 							<div>
 								<h3>Your data is ready</h3>

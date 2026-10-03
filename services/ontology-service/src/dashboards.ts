@@ -522,13 +522,15 @@ export async function dashboardHistory(
 			session_user: string | null;
 			session_messages: number | null;
 			session_created: Date | null;
+			session_deleted: Date | null;
 		}
 	>(
 		`SELECT d.*, sp.slug AS space_slug,
 		        s.title          AS session_title,
 		        s.user_id        AS session_user,
 		        s.message_count  AS session_messages,
-		        s.created_at     AS session_created
+		        s.created_at     AS session_created,
+		        s.deleted_at     AS session_deleted
 		   FROM platform.dashboard d
 		   JOIN platform.space sp ON sp.space_id = d.space_id
 		   LEFT JOIN platform.chat_session s
@@ -572,8 +574,10 @@ export async function dashboardHistory(
 						userId: row.session_user ?? "unknown",
 						messageCount: row.session_messages ?? 0,
 						createdAt: row.session_created?.toISOString() ?? "",
-						// The join missed, so the conversation has been purged.
-						available: row.session_user !== null,
+						// The join missed, so the conversation has been purged - or it
+						// is still a row, kept for what it cost, and was deleted by
+						// its owner. Either way there is nothing to open.
+						available: row.session_user !== null && row.session_deleted === null,
 					},
 		renames: renamesById.get(row.dashboard_id) ?? [],
 	}));

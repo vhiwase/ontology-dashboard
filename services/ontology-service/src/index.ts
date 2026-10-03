@@ -12,25 +12,37 @@ import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { executeAction, listAudit, resolveAction, validateParameters } from "./actions";
 import {
+	adminOverview,
+	createUser,
+	deleteUser,
+	getSettings,
+	listEvents,
+	listUsers,
+	registrationPolicy,
+	resetPassword,
+	revokeSessions,
+	updateSettings,
+	updateUser,
+} from "./admin";
+import {
 	authenticate,
 	authorizeRoute,
 	createSelfRegisteredUser,
 	login,
 	me,
 	recordRegistration,
-	REGISTRATION_ROLE,
 	requestId,
-	SELF_REGISTRATION,
 	signToken,
 	tooManyRegistrations,
 	validateRegistration,
 } from "./auth";
 import { importTables, remodelConnection } from "./importer";
 import { removeModelledType } from "./modeling";
+import { planRemoval, removableKind, removalTargetOf, removeThing } from "./removal";
 import { assess, pickSubject, planBoard } from "./feasibility";
 import { approveProposal, createProposal, getProposal, listProposals, rejectProposal } from "./proposals";
 import { runFollowUps } from "./followups";
-import { deleteCredential, storeCredential } from "./vault";
+import { deleteCredential, storeCredential, vaultStatus } from "./vault";
 import {
 	accessibleSpaces,
 	addMember,
@@ -258,15 +270,22 @@ app.get("/health", (_req, res) => {
 app.post("/api/auth/login", handle(login));
 
 // Whether the sign-in page should offer "Create account". Public, like login.
-app.get("/api/auth/config", (_req, res) => {
-	res.json({ selfRegistration: SELF_REGISTRATION, registrationRole: REGISTRATION_ROLE });
-});
+// An administrator can open or close registration from the admin console;
+// the environment's setting applies until they do.
+app.get(
+	"/api/auth/config",
+	handle(async (_req, res) => {
+		const policy = await registrationPolicy();
+		res.json({ selfRegistration: policy.enabled, registrationRole: policy.role });
+	}),
+);
 
 // Self-registration: a new account and its own private workspace, signed in.
 app.post(
 	"/api/auth/register",
 	handle(async (req, res) => {
-		if (!SELF_REGISTRATION) {
+		const policy = await registrationPolicy();
+		if (!policy.enabled) {
 			res.status(403).json({ error: "Registration is closed on this server. Ask an administrator for an account." });
 			return;
 		}
@@ -279,7 +298,7 @@ app.post(
 			res.status(400).json({ error: errors.join(" "), errors });
 			return;
 		}
-		const user = await createSelfRegisteredUser(input);
+		const user = await createSelfRegisteredUser(input, policy.role);
 		if (!user) {
 			res.status(409).json({ error: "That username or email is already registered." });
 			return;
@@ -325,6 +344,61 @@ app.get(
 		const personal = await ensurePersonalSpace(principal);
 		res.json({ ...principal, personalSpace: personal.slug });
 	}),
+);
+
+// ── administration ──────────────────────────────────────────────────────────
+//  Accounts, AI credit, platform settings. auth.ts already refuses these
+//  routes to anyone without the PLATFORM admin role; the check here is the
+//  second lock on the same door, so a later change to the route table cannot
+//  quietly open it.
+
+app.use("/api/admin", (req, res, next) => {
+	if (req.principal?.role !== "admin") {
+		res.status(403).json({ error: "Requires the admin role." });
+		return;
+	}
+	next();
+});
+
+// The id is made a number here: it is a BIGINT in the database, which reaches
+// the token as text, and "is this your own account" compares it with the id
+// in the path. As text it never matched, so the rule against deleting or
+// demoting yourself held only while there was a single administrator.
+const actorOf = (req: Request) => ({
+	userId: Number(req.principal!.userId),
+	username: req.principal!.username,
+});
+
+app.get("/api/admin/overview", handle(async (_req, res) => res.json(await adminOverview())));
+app.get("/api/admin/users", handle(async (_req, res) => res.json(await listUsers())));
+app.post(
+	"/api/admin/users",
+	handle(async (req, res) => res.status(201).json(await createUser(req.body, actorOf(req)))),
+);
+app.patch(
+	"/api/admin/users/:id",
+	handle(async (req, res) => res.json(await updateUser(Number(req.params.id), req.body, actorOf(req)))),
+);
+app.post(
+	"/api/admin/users/:id/password",
+	handle(async (req, res) => res.json(await resetPassword(Number(req.params.id), req.body, actorOf(req)))),
+);
+app.post(
+	"/api/admin/users/:id/revoke",
+	handle(async (req, res) => res.json(await revokeSessions(Number(req.params.id), actorOf(req)))),
+);
+app.delete(
+	"/api/admin/users/:id",
+	handle(async (req, res) => res.json(await deleteUser(Number(req.params.id), actorOf(req)))),
+);
+app.get("/api/admin/settings", handle(async (_req, res) => res.json(await getSettings())));
+app.put(
+	"/api/admin/settings",
+	handle(async (req, res) => res.json(await updateSettings(req.body, req.principal!.username))),
+);
+app.get(
+	"/api/admin/events",
+	handle(async (req, res) => res.json({ events: await listEvents(Number(req.query.limit ?? 50) || 50) })),
 );
 
 app.post(
@@ -1361,9 +1435,11 @@ app.get("/api/spaces/database", handle(async (_req, res) => res.json(await datab
 
 // Sets the sandbox up: folders and the platform-database connection. Runs at
 // boot as well; idempotent, so calling it again only adds what is missing.
+// Asked for by a person, it also puts back the built-in connection if that was
+// deleted - which the run at boot deliberately does not.
 app.post(
 	"/api/spaces/sandbox/seed",
-	handle(async (req, res) => res.json(await seedSandbox(req.principal?.username ?? "unknown"))),
+	handle(async (req, res) => res.json(await seedSandbox(req.principal?.username ?? "unknown", { restore: true }))),
 );
 
 // Resources, syncs and folders are addressed by a global id, which on its own
@@ -1610,11 +1686,56 @@ app.post(
 	),
 );
 
+// What deleting a card's subject would take with it - asked before, shown in
+// the confirmation, and changing nothing.
+app.get(
+	"/api/resources/:id/removal",
+	handle(async (req, res) => {
+		const target = await removalTargetOf(Number(req.params.id));
+		if (!target) throw new BadRequest("This card stands for nothing that can be deleted; it can only be removed from the list.");
+		res.json(await planRemoval(target.kind, target.ref));
+	}),
+);
+
+// Deletes what the card stands for, not only the card: a metric's card is
+// rebuilt from the ontology on every change, so removing the card alone was
+// undone by the next edit. ?cascade=true includes what is built on it.
 app.delete(
 	"/api/resources/:id",
 	handle(async (req, res) => {
-		await deleteResource(Number(req.params.id));
+		const id = Number(req.params.id);
+		const target = await removalTargetOf(id);
+		if (target) {
+			await removeThing(target.kind, target.ref, req.principal?.username ?? "unknown", {
+				cascade: String(req.query.cascade ?? "") === "true",
+			});
+		} else {
+			await deleteResource(id);
+		}
 		res.status(204).end();
+	}),
+);
+
+// ── deleting, by kind ───────────────────────────────────────────────────────
+//  One pair of routes for everything that can be deleted, whichever page it
+//  is deleted from: the plan (what goes with it, what is built on it, what is
+//  affected) and the delete itself. See removal.ts.
+
+app.get(
+	"/api/removal/:kind/:ref",
+	handle(async (req, res) => {
+		res.json(await planRemoval(removableKind(String(req.params.kind)), String(req.params.ref)));
+	}),
+);
+
+app.delete(
+	"/api/removal/:kind/:ref",
+	handle(async (req, res) => {
+		res.json(
+			await removeThing(removableKind(String(req.params.kind)), String(req.params.ref), req.principal?.username ?? "unknown", {
+				cascade: String(req.query.cascade ?? "") === "true",
+			}),
+		);
 	}),
 );
 
@@ -1681,15 +1802,20 @@ app.get(
 /**
  * Set how often a sync runs: {"every": "2h"}, or {"every": "manual"} to stop
  * it running on its own. Creates, changes or removes its one schedule.
+ * {"every": "3d", "startAt": "2026-10-06T02:00:00+05:30"} also says when the
+ * first run is; the runs after it keep that rhythm.
  */
 app.post(
 	"/api/syncs/:id/schedule",
 	handle(async (req, res) => {
+		const body = req.body ?? {};
 		res.json({
 			schedule: await setSyncSchedule(
 				Number(req.params.id),
-				(req.body ?? {}).every ?? null,
+				body.every ?? null,
 				req.principal?.username ?? "unknown",
+				currentSpace(),
+				body.startAt ?? null,
 			),
 		});
 	}),
@@ -1778,6 +1904,10 @@ app.use((_req, res) => {
 
 app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
 	const status = (error as BadRequest | NotFound & { status?: number }).status ?? 500;
+	// The few 5xx this code raises on purpose, with a message written for the
+	// caller - "this server's credential key is not set up" - say so with
+	// `expose`. Everything else at 5xx is an accident and stays in the log.
+	const exposed = (error as { expose?: boolean }).expose === true;
 
 	// A 4xx was raised deliberately by this code and its message is written for
 	// the caller ("No such object type: Foo"), so it is safe to return.
@@ -1795,12 +1925,15 @@ app.use((error: Error, req: Request, res: Response, _next: NextFunction) => {
 				path: req.originalUrl,
 				user: req.principal?.username ?? null,
 				error: error.message,
+				// What an operator needs, where the error carries it apart from
+				// what the caller is told.
+				reason: (error as { reason?: string }).reason,
 				type: error.constructor.name,
 				stack: error.stack,
 			}),
 		);
-		res.status(500).json({
-			error: "Internal server error.",
+		res.status(exposed ? status : 500).json({
+			error: exposed ? error.message : "Internal server error.",
 			requestId: req.requestId,
 		});
 		return;
@@ -1821,6 +1954,21 @@ async function start(): Promise<void> {
 	if (seeded.added > 0) console.log(`[boot] sandbox set up: ${seeded.added} item(s) added.`);
 
 	startScheduler();
+
+	// The credential vault's key is otherwise read the first time someone types
+	// a password into the connect form. Saying now whether it is usable puts a
+	// missing or unreadable key in the startup log rather than in that person's
+	// way. Not fatal: everything that does not store a password still works.
+	const vault = vaultStatus();
+	if (vault.usable) {
+		console.log(
+			`[boot] credential vault ready (${vault.derived ? "key derived from the JWT secret" : "its own key"}).`,
+		);
+	} else {
+		console.error(
+			`[boot] CREDENTIAL VAULT NOT USABLE - connection passwords cannot be stored or read. ${vault.reason}`,
+		);
+	}
 
 	// Report the validation state at boot: if an ontology has a structural
 	// problem, the log says so before anyone hits an endpoint.

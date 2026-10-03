@@ -86,6 +86,14 @@ class Config:
     )
     azure_timeout: float = field(default_factory=lambda: _num("AZURE_OPENAI_TIMEOUT", 120))
 
+    # The idle window after which the pipeline's retention pass removes a
+    # conversation that is not pinned; 0 means there is none. Nothing here
+    # enforces it - the pass is pipeline.retention - it is read so the history
+    # can say what will happen to a conversation rather than promise to keep it.
+    chat_retention_days: int = field(
+        default_factory=lambda: max(0, int(_num("CHAT_RETENTION_DAYS", 0)))
+    )
+
     @property
     def model_name(self) -> str:
         return self.azure_deployment

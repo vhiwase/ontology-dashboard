@@ -22,6 +22,7 @@ import {
 	useState,
 } from "react";
 import { api, setActiveSpace } from "./api";
+import { BrandMark } from "./components/icons";
 
 export interface Space {
 	id: number;
@@ -150,9 +151,14 @@ export function SpaceProvider({ children }: { children: ReactNode }) {
 	// wrong space (or refused, for an account that cannot open the sandbox).
 	if (loading && spaces.length === 0) {
 		return (
-			<div className="boot-screen">
-				<span className="spinner" aria-hidden />
-				<span>Opening your workspace…</span>
+			<div className="boot-screen" role="status">
+				<span className="brand-mark" aria-hidden>
+					<BrandMark size={28} />
+				</span>
+				<span className="loading-inline">
+					<span className="spinner" aria-hidden />
+					Opening your workspace…
+				</span>
 			</div>
 		);
 	}

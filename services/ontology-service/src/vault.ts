@@ -53,6 +53,59 @@ function jwtSecret(): string {
 	return process.env.AUTH_JWT_SECRET ?? "";
 }
 
+/**
+ * The vault has no usable key, so no password can be stored or read.
+ *
+ * A fault of the deployment, not of the request - but one the person at the
+ * connect form should be told about in words rather than as "Internal server
+ * error", because nothing they retype will change it. `expose` lets the error
+ * handler return the message although the status is 5xx; the message is
+ * written for that person and names no path. `reason` is for whoever runs the
+ * server, and goes to the log.
+ */
+export class VaultUnavailable extends Error {
+	readonly status = 503;
+	readonly expose = true;
+
+	constructor(readonly reason: string) {
+		super(
+			"This server cannot store or read connection passwords yet: its credential key is not set up. " +
+				"Whoever runs the server needs to run scripts/init-secrets.sh and recreate the ontology service's container.",
+		);
+	}
+}
+
+/** The key file's contents, or why they cannot be had - said for an operator. */
+function readKeyFile(file: string): string {
+	let raw: string;
+	try {
+		raw = readFileSync(file, "utf8");
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		throw new VaultUnavailable(
+			code === "EISDIR"
+				? // What Docker leaves behind when a secret is mounted before its
+					// file exists: a directory at the file's path. Recreate, not
+					// restart: a container that started with the directory mounted
+					// cannot start again once the path is a file, and while it is
+					// still running Docker shows the directory to every new one.
+					`CREDENTIAL_KEY_FILE (${file}) is a directory, not a file. Docker creates one when the secret ` +
+						"is mounted before its file exists. Run scripts/init-secrets.sh, which writes the key, then " +
+						"recreate this container - `docker compose up -d --force-recreate ontology-service`; " +
+						"restarting it is not enough."
+				: code === "ENOENT"
+					? `CREDENTIAL_KEY_FILE (${file}) does not exist. Run scripts/init-secrets.sh, then recreate this container.`
+					: `CREDENTIAL_KEY_FILE (${file}) could not be read: ${(error as Error).message}`,
+		);
+	}
+	if (!raw.trim()) {
+		throw new VaultUnavailable(
+			`CREDENTIAL_KEY_FILE (${file}) is empty. Run scripts/init-secrets.sh, which writes a key into an empty file, then recreate this container.`,
+		);
+	}
+	return raw;
+}
+
 let loaded: VaultKey | null = null;
 
 /** The key, loaded once. Exposed for tests through __testing. */
@@ -62,7 +115,7 @@ function vaultKey(): VaultKey {
 	let derived = false;
 	const file = process.env.CREDENTIAL_KEY_FILE;
 	if (file) {
-		key = decodeKeyMaterial(readFileSync(file, "utf8"));
+		key = decodeKeyMaterial(readKeyFile(file));
 	} else if (process.env.CREDENTIAL_KEY) {
 		key = decodeKeyMaterial(process.env.CREDENTIAL_KEY);
 	} else {
@@ -83,6 +136,25 @@ function vaultKey(): VaultKey {
 	}
 	loaded = { key, id: createHash("sha256").update(key).digest("hex").slice(0, 16), derived };
 	return loaded;
+}
+
+/**
+ * Whether the vault can be used, checked at startup.
+ *
+ * The key is otherwise loaded on first use - which is the first time someone
+ * types a password into the connect form, long after the container came up
+ * looking healthy. Asking at boot puts the reason in the log where a
+ * deployment is checked, before anyone meets it.
+ */
+export function vaultStatus(): { usable: true; derived: boolean } | { usable: false; reason: string } {
+	try {
+		return { usable: true, derived: vaultKey().derived };
+	} catch (error) {
+		return {
+			usable: false,
+			reason: error instanceof VaultUnavailable ? error.reason : (error as Error).message,
+		};
+	}
 }
 
 export function isVaultRef(ref: string | null | undefined): boolean {

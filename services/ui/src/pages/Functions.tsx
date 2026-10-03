@@ -4,13 +4,17 @@
  * The list leads with proposals, because a proposal is the only thing here
  * that is waiting on a person. An active function is finished work; a proposal
  * is a question addressed to whoever opens this page.
+ *
+ * Archive retires a function and keeps it in the list. Delete removes it for
+ * good, with the record of its runs, and frees its name.
  */
 
 import { useCallback, useEffect, useState } from "react";
 import { type FunctionRecord, type FunctionRun, api, isMissingOntology } from "../api";
 import { useSpace } from "../SpaceContext";
 import { FunctionReview } from "../components/functions/FunctionReview";
-import { DataTable, Empty, ErrorBanner, NoOntologyHere, Spinner } from "../components/common";
+import { DataTable, Empty, ErrorBanner, NoOntologyHere, PageLoader, Spinner } from "../components/common";
+import { DeleteButton, DeleteDialog, deletedNotice, useCanDelete } from "../components/DeleteDialog";
 
 const STATUS_TONE: Record<string, string> = {
 	proposed: "warn",
@@ -26,6 +30,9 @@ export function Functions() {
 	const [open, setOpen] = useState<string | null>(null);
 	const [selected, setSelected] = useState<FunctionRecord | null>(null);
 	const [runs, setRuns] = useState<FunctionRun[] | null>(null);
+	const [removing, setRemoving] = useState<FunctionRecord | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
+	const canDelete = useCanDelete();
 	const { spaceSlug, space } = useSpace();
 
 	const load = useCallback(() => {
@@ -59,12 +66,17 @@ export function Functions() {
 	if (missing)
 		return <NoOntologyHere what="functions" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
-	if (!functions) return <Spinner label="Loading functions" />;
+	if (!functions) return <PageLoader label="Loading functions" />;
 
 	const proposals = functions.filter((f) => f.status === "proposed");
 
 	return (
 		<div className="col" style={{ gap: 12 }}>
+			{notice && (
+				<p className="rb-notice" role="status">
+					{notice}
+				</p>
+			)}
 			{proposals.length > 0 && (
 				<div className="card">
 					<div className="card-head">
@@ -104,49 +116,61 @@ export function Functions() {
 						have and it will draft one for you to approve.
 					</Empty>
 				) : (
-					<table className="dense">
-						<thead>
-							<tr>
-								<th>Name</th>
-								<th>API name</th>
-								<th>Returns</th>
-								<th>Language</th>
-								<th>Status</th>
-								<th>Proposed by</th>
-								<th>Approved by</th>
-							</tr>
-						</thead>
-						<tbody>
-							{functions.map((fn) => (
-								<tr
-									key={fn.apiName}
-									className={selected?.apiName === fn.apiName ? "active" : ""}
-									onClick={() => setSelected(fn)}
-								>
-									<td>
-										<button className="link-button" onClick={() => setOpen(fn.apiName)}>
-											{fn.name}
-										</button>
-									</td>
-									<td className="mono">{fn.apiName}</td>
-									<td className="mono">{fn.returns}</td>
-									<td className="mono">
-										{fn.language}
-										{!fn.isExecutable && (
-											<span className="chip" title={fn.notExecutableReason ?? ""}>
-												not run here
-											</span>
-										)}
-									</td>
-									<td>
-										<span className={`chip ${STATUS_TONE[fn.status] ?? ""}`}>{fn.status}</span>
-									</td>
-									<td className="muted">{fn.proposedBy}</td>
-									<td className="muted">{fn.approvedBy ?? "—"}</td>
+					<div className="table-wrap">
+						<table className="dense">
+							<thead>
+								<tr>
+									<th>Name</th>
+									<th>API name</th>
+									<th>Returns</th>
+									<th>Language</th>
+									<th>Status</th>
+									<th>Proposed by</th>
+									<th>Approved by</th>
+									{canDelete && <th aria-label="Delete" />}
 								</tr>
-							))}
-						</tbody>
-					</table>
+							</thead>
+							<tbody>
+								{functions.map((fn) => (
+									<tr
+										key={fn.apiName}
+										className={selected?.apiName === fn.apiName ? "active" : ""}
+										onClick={() => setSelected(fn)}
+									>
+										<td>
+											<button className="link-button" onClick={() => setOpen(fn.apiName)}>
+												{fn.name}
+											</button>
+										</td>
+										<td className="mono">{fn.apiName}</td>
+										<td className="mono">{fn.returns}</td>
+										<td className="mono">
+											{fn.language}
+											{!fn.isExecutable && (
+												<span className="chip" title={fn.notExecutableReason ?? ""}>
+													not run here
+												</span>
+											)}
+										</td>
+										<td>
+											<span className={`chip ${STATUS_TONE[fn.status] ?? ""}`}>{fn.status}</span>
+										</td>
+										<td className="muted">{fn.proposedBy}</td>
+										<td className="muted">{fn.approvedBy ?? "—"}</td>
+										{canDelete && (
+											<td
+												style={{ textAlign: "right" }}
+												// The row's own click selects the function; the bin is not that.
+												onClick={(event) => event.stopPropagation()}
+											>
+												<DeleteButton iconOnly title={`Delete the function ${fn.name}`} onClick={() => setRemoving(fn)} />
+											</td>
+										)}
+									</tr>
+								))}
+							</tbody>
+						</table>
+					</div>
 				)}
 			</div>
 
@@ -184,7 +208,31 @@ export function Functions() {
 					load();
 				}}
 				onApproved={() => load()}
+				onDelete={
+					canDelete
+						? (fn) => {
+								// One window at a time: the review closes, the question opens.
+								setOpen(null);
+								setRemoving(fn);
+							}
+						: undefined
+				}
 			/>
+
+			{removing && (
+				<DeleteDialog
+					kind="function"
+					target={removing.apiName}
+					label={removing.name}
+					onClose={() => setRemoving(null)}
+					onDeleted={(plan) => {
+						if (selected?.apiName === removing.apiName) setSelected(null);
+						setRemoving(null);
+						setNotice(deletedNotice({ ...plan, name: removing.name }));
+						load();
+					}}
+				/>
+			)}
 		</div>
 	);
 }

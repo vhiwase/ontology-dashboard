@@ -279,6 +279,19 @@ export async function relationColumns(relation: string): Promise<ColumnInfo[]> {
 }
 
 /**
+ * What min() and max() are taken over for a column of this kind.
+ *
+ * A text-kind column is compared as text. Most already are, but the kind also
+ * covers uuid, and PostgreSQL before 18 has no min(uuid): one uuid column -
+ * and a key very often is one - failed the whole statement, and with it the
+ * import of every table chosen alongside. Numbers and dates keep their own
+ * ordering, which as text would be wrong ("10" before "9").
+ */
+export function rangeOperand(kind: ValueKind, quotedColumn: string): string {
+	return kind === "text" ? `${quotedColumn}::text` : quotedColumn;
+}
+
+/**
  * Count, completeness, cardinality and range of every column, in ONE scan.
  *
  * Identifiers come from the catalogue and are quoted, so nothing from a
@@ -303,7 +316,7 @@ export async function profileRelation(
 			if (kind === "boolean") {
 				parts.push(`NULL::text AS mn_${index}`, `NULL::text AS mx_${index}`);
 			} else {
-				parts.push(`min(${col})::text AS mn_${index}`, `max(${col})::text AS mx_${index}`);
+				parts.push(`min(${rangeOperand(kind, col)})::text AS mn_${index}`, `max(${rangeOperand(kind, col)})::text AS mx_${index}`);
 			}
 		}
 	});

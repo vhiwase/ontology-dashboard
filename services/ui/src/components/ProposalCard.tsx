@@ -18,12 +18,13 @@ import {
 	formatCell,
 	formatValue,
 } from "../api";
+import { Icon, type IconName } from "./icons";
 
-const KIND: Record<ProposalKind, { label: string; glyph: string; tone: string }> = {
-	link_type: { label: "Link", glyph: "⇄", tone: "series-3" },
-	combination: { label: "Dataset", glyph: "⊞", tone: "series-1" },
-	metric: { label: "Metric", glyph: "Σ", tone: "series-7" },
-	action_type: { label: "Action", glyph: "▶", tone: "series-2" },
+const KIND: Record<ProposalKind, { label: string; icon: IconName; tone: string }> = {
+	link_type: { label: "Link", icon: "link", tone: "series-3" },
+	combination: { label: "Dataset", icon: "table", tone: "series-1" },
+	metric: { label: "Metric", icon: "sigma", tone: "series-7" },
+	action_type: { label: "Action", icon: "zap", tone: "series-2" },
 };
 
 export function proposalKindLabel(kind: ProposalKind): string {
@@ -33,18 +34,25 @@ export function proposalKindLabel(kind: ProposalKind): string {
 export function ProposalCard({
 	proposal: initial,
 	onSettled,
+	onDelete,
 	compact = false,
 }: {
 	proposal: ProposalRecord;
 	/** Called with every proposal the decision settled (dependencies included). */
 	onSettled?: (settled: ProposalRecord[]) => void;
+	/**
+	 * Asks for the proposal to be deleted. Given only by the approvals inbox,
+	 * which is where the record is kept; a card inside a conversation or on the
+	 * home page offers the decision, not the removal of the record.
+	 */
+	onDelete?: (proposal: ProposalRecord) => void;
 	compact?: boolean;
 }) {
 	const [proposal, setProposal] = useState(initial);
 	const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [showDetail, setShowDetail] = useState(!compact);
-	const kind = KIND[proposal.kind] ?? { label: proposal.kind, glyph: "•", tone: "series-1" };
+	const kind = KIND[proposal.kind] ?? { label: proposal.kind, icon: "box" as IconName, tone: "series-1" };
 	const built = builtBoard(proposal);
 	const buildError =
 		proposal.result?.built && "error" in proposal.result.built ? String(proposal.result.built.error) : null;
@@ -81,24 +89,42 @@ export function ProposalCard({
 		<article className={`proposal-card status-${proposal.status}`}>
 			<div className="proposal-head">
 				<span className="proposal-glyph" style={{ color: `var(--${kind.tone})` }} aria-hidden>
-					{kind.glyph}
+					<Icon name={kind.icon} size={18} />
 				</span>
 				<div className="proposal-title">
 					<div className="row" style={{ gap: 6 }}>
 						<span className="chip">{kind.label}</span>
 						<StatusChip status={proposal.status} />
-						{proposal.createdVia !== "user" && <span className="chip">drafted by the assistant</span>}
+						{proposal.createdVia !== "user" && (
+							<span className="chip accent">
+								<Icon name="sparkles" size={11} /> drafted by the assistant
+							</span>
+						)}
 					</div>
 					<h4>{proposal.title}</h4>
 				</div>
-				{pending && (
+				{(pending || onDelete) && (
 					<div className="proposal-actions">
-						<button className="btn primary" disabled={busy !== null} onClick={() => void decide("approve")}>
-							{busy === "approve" ? "Applying…" : proposal.status === "failed" ? "Retry" : "Approve"}
-						</button>
+						{pending && (
+							<button className="btn primary" disabled={busy !== null} onClick={() => void decide("approve")}>
+								{busy === "approve" ? <span className="spinner" aria-hidden /> : <Icon name="check" size={15} />}
+								{busy === "approve" ? "Applying…" : proposal.status === "failed" ? "Retry" : "Approve"}
+							</button>
+						)}
 						{proposal.status === "pending" && (
 							<button className="btn ghost" disabled={busy !== null} onClick={() => void decide("reject")}>
 								{busy === "reject" ? "Rejecting…" : "Reject"}
+							</button>
+						)}
+						{onDelete && (
+							<button
+								className="icon-btn row-delete"
+								disabled={busy !== null}
+								onClick={() => onDelete(proposal)}
+								title={`Delete the proposal ${proposal.title}`}
+								aria-label={`Delete the proposal ${proposal.title}`}
+							>
+								<Icon name="trash" size={14} />
 							</button>
 						)}
 					</div>
@@ -109,7 +135,7 @@ export function ProposalCard({
 
 			{proposal.followUp && pending && (
 				<p className="proposal-followup">
-					<span aria-hidden>✦</span> Approving it also builds the {proposal.followUp.build}{" "}
+					<Icon name="sparkles" size={13} /> Approving it also builds the {proposal.followUp.build}{" "}
 					<strong>{proposal.followUp.title}</strong>.
 				</p>
 			)}
@@ -130,7 +156,9 @@ export function ProposalCard({
 
 			{proposal.status === "applied" && (
 				<div className="proposal-outcome">
-					<span aria-hidden>✓</span>
+					<span aria-hidden>
+						<Icon name="checkCircle" size={16} />
+					</span>
 					<span>
 						Applied{proposal.decidedBy ? ` by ${proposal.decidedBy}` : ""}.
 						{proposal.kind === "combination" && proposal.result?.objectType
@@ -143,12 +171,13 @@ export function ProposalCard({
 					{built && (
 						<Link className="btn sm primary" to={`/dashboards/${built.slug}`} style={{ marginLeft: "auto" }}>
 							Open {built.kind} “{built.title}”
+							<Icon name="arrowRight" size={13} />
 						</Link>
 					)}
 				</div>
 			)}
 			{buildError && (
-				<div className="banner" style={{ marginTop: 8 }}>
+				<div className="banner warn" style={{ marginTop: 8 }}>
 					The change was applied, but the board could not be built: {buildError}
 				</div>
 			)}

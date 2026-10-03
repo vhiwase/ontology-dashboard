@@ -193,6 +193,9 @@ services:
       CHAT_RATE_PER_MINUTE: ${CHAT_RATE_PER_MINUTE:-10}
       CHAT_RATE_BURST: ${CHAT_RATE_BURST:-5}
       CHAT_DAILY_TOKEN_BUDGET: ${CHAT_DAILY_TOKEN_BUDGET:-0}
+      # Read here, enforced by the pipeline's retention pass: the conversation
+      # history says what that pass will do to what is not pinned.
+      CHAT_RETENTION_DAYS: ${CHAT_RETENTION_DAYS:-0}
       # azure_openai is the model; without its endpoint and key the built-in
       # planner answers from the ontology. Any other value fails loudly.
       LLM_PROVIDER: ${LLM_PROVIDER:-azure_openai}

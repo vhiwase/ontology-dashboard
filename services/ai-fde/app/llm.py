@@ -138,7 +138,9 @@ class LlmProvider:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> LlmReply:
+        """One completion. `tool_choice` forces a named tool when given."""
         raise NotImplementedError
 
     async def health(self) -> dict[str, Any]:
@@ -165,6 +167,7 @@ class AzureOpenAIProvider(LlmProvider):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
     ) -> LlmReply:
         payload: dict[str, Any] = {
             "messages": messages,
@@ -172,7 +175,7 @@ class AzureOpenAIProvider(LlmProvider):
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice or "auto"
 
         async with httpx.AsyncClient(timeout=CONFIG.azure_timeout) as client:
             for attempt in range(RATE_LIMIT_RETRIES + 1):

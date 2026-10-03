@@ -17,6 +17,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../../api";
 import { ErrorBanner, Spinner, useDebounced } from "../common";
+import { Icon } from "../icons";
 
 export interface DataColumn {
 	name: string;
@@ -181,6 +182,7 @@ export function DataGrid({
 						</div>
 					)}
 					<button className="btn sm" onClick={onClose} aria-label="Close">
+						<Icon name="x" size={13} />
 						Close
 					</button>
 				</div>
@@ -204,7 +206,7 @@ export function DataGrid({
 							))}
 						</select>
 					</label>
-					{loading && <span className="muted" style={{ fontSize: 11.5 }}>loading…</span>}
+					{loading && <Spinner label="Loading" />}
 				</div>
 
 				{page?.note && <p className="dg-note">{page.note}</p>}
@@ -303,16 +305,18 @@ export function DataGrid({
 							className="btn sm"
 							disabled={offset === 0 || loading}
 							onClick={() => setOffset(Math.max(0, offset - limit))}
-						>
-							Previous
-						</button>
+							>
+								<Icon name="chevronLeft" size={13} />
+								Previous
+							</button>
 						<button
 							className="btn sm"
 							disabled={offset + limit >= total || loading}
 							onClick={() => setOffset(offset + limit)}
-						>
-							Next
-						</button>
+							>
+								Next
+								<Icon name="chevronRight" size={13} />
+							</button>
 					</div>
 				</div>
 			</div>

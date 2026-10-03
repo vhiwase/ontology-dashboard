@@ -12,6 +12,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ApiError, type DatasetProfile, api } from "../../api";
 import { ErrorBanner, Spinner } from "../common";
+import { Icon } from "../icons";
 
 const ROLES = ["identity", "title", "measure", "dimension", "temporal", "geo", "flag", "attribute", "provenance"];
 const AGGREGATIONS = ["", "sum", "avg", "min", "max", "count"];
@@ -146,7 +147,7 @@ export function CreateObjectTypeDialog({
 			</div>
 
 			{profile.existingObjectTypes.length > 0 && (
-				<div className="banner">
+				<div className="banner warn">
 					This dataset is already modelled as {profile.existingObjectTypes.join(", ")}. A second type
 					on it is allowed, but is rarely what is wanted.
 				</div>
@@ -285,9 +286,11 @@ export function CreateObjectTypeDialog({
 			{error && <ErrorBanner error={error} />}
 			<div className="row" style={{ marginTop: 10 }}>
 				<button className="btn primary sm" disabled={busy || !primaryKey || !apiName.trim()} onClick={submit}>
+					{busy ? <span className="spinner" aria-hidden /> : <Icon name="plus" size={13} />}
 					{busy ? "Creating…" : "Create object type"}
 				</button>
 				<button className="btn sm" onClick={askAssistant} disabled={busy}>
+					<Icon name="sparkles" size={13} />
 					Ask the AI-FDE to model it
 				</button>
 				<button className="btn sm" onClick={onClose} disabled={busy}>

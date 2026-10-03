@@ -1,27 +1,51 @@
 /**
  * Actions: the ontology's verb layer, with a form per action and the audit trail.
  *
- * The role selector is prominent and defaults to Analyst, because the role is
- * what decides whether an action runs at all - and an analyst can read everything
- * and change nothing. Switching to Operations Manager to stage a hold is a
- * deliberate act, which is the point.
+ * AN ACTION RUNS AS WHOEVER IS SIGNED IN. The server takes the actor and the
+ * business role from the verified token and ignores anything the request says
+ * about either, so this page does not offer a role to "act as": the selector
+ * that used to sit at the top changed nothing, and implied it did. What the
+ * form shows instead is who the run will be recorded as, and which roles the
+ * action allows.
+ *
+ * THE FORM KNOWS THE DATA. An action is declared on an object type and takes
+ * that object's key as its first parameter, so the key is chosen from the
+ * object type's own records - searched by name, not typed as an id - and a
+ * parameter that names a field is chosen from the object type's fields.
+ * Everything else is typed, in a control that fits its declared type.
  *
  * A mutating action returns `staged`: validated, permission-checked and recorded,
  * but not sent, because this platform reads the TMS through a captured snapshot
  * and has no write-back endpoint. The response says so rather than implying the
  * change landed.
+ *
+ * AN ACTION CAN BE DELETED HERE. That removes the definition; the audit trail
+ * below keeps every run that was already recorded under its name.
  */
 
-import { useEffect, useMemo, useState } from "react";
-import { type ActionSummary, api, formatCell, isMissingOntology } from "../api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+	type ActionSummary,
+	type ObjectTypeDetail,
+	type ObjectTypeSummary,
+	type SearchResult,
+	api,
+	formatCell,
+	isMissingOntology,
+	session,
+} from "../api";
 import { useSpace } from "../SpaceContext";
 import {
 	DataTable,
 	Empty,
 	ErrorBanner,
 	NoOntologyHere,
+	PageLoader,
 	Spinner,
 } from "../components/common";
+import { DeleteButton, DeleteDialog, deletedNotice, useCanDelete } from "../components/DeleteDialog";
+import { Icon } from "../components/icons";
+import { type SearchOption, type SearchPage, SearchSelect } from "../components/SearchSelect";
 
 interface ActionOutcome {
 	action: string;
@@ -41,6 +65,27 @@ interface Role {
 	description?: { en?: string };
 }
 
+interface Parameter {
+	name: string;
+	label: string;
+	type: string;
+	required: boolean;
+	description: string;
+	options: string[] | null;
+	defaultValue: unknown;
+}
+
+/** How a parameter is filled in. */
+type Control =
+	| { kind: "object"; type: ObjectTypeSummary }
+	| { kind: "field" }
+	| { kind: "enum"; options: string[] }
+	| { kind: "boolean" }
+	| { kind: "number" }
+	| { kind: "date" }
+	| { kind: "datetime" }
+	| { kind: "text" };
+
 const STATUS_CHIP: Record<string, string> = {
 	succeeded: "good",
 	staged: "warning",
@@ -49,28 +94,79 @@ const STATUS_CHIP: Record<string, string> = {
 	rejected: "critical",
 };
 
+/** Parameter names that mean "one of the object's fields". */
+const FIELD_NAMES = new Set([
+	"field",
+	"fieldname",
+	"fieldtoupdate",
+	"property",
+	"propertyname",
+	"attribute",
+	"attributename",
+	"column",
+	"columnname",
+]);
+
+/** How many records a search lists at a time. */
+const PICKER_PAGE = 25;
+
+/**
+ * The control a parameter gets.
+ *
+ * `<objectType>Key` is the convention every declared action follows for the
+ * object it acts on (and the one the server resolves the target by), so it is
+ * what makes a parameter a record picker.
+ */
+function controlFor(parameter: Parameter, types: ObjectTypeSummary[], hasTarget: boolean): Control {
+	if (parameter.options) return { kind: "enum", options: parameter.options };
+	if (parameter.name.endsWith("Key")) {
+		const named = parameter.name.slice(0, -3).toLowerCase();
+		const type = types.find((entry) => entry.apiName.toLowerCase() === named);
+		if (type) return { kind: "object", type };
+	}
+	if (parameter.type === "boolean") return { kind: "boolean" };
+	if (["decimal", "float", "integer"].includes(parameter.type)) return { kind: "number" };
+	if (parameter.type === "date") return { kind: "date" };
+	if (parameter.type === "datetime") return { kind: "datetime" };
+	if (hasTarget && FIELD_NAMES.has(parameter.name.toLowerCase())) return { kind: "field" };
+	return { kind: "text" };
+}
+
 export function Actions() {
 	const [actions, setActions] = useState<ActionSummary[] | null>(null);
 	const [roles, setRoles] = useState<Role[]>([]);
-	const [role, setRole] = useState("tms:AnalystRole");
+	const [types, setTypes] = useState<ObjectTypeSummary[]>([]);
 	const [selected, setSelected] = useState<string | null>(null);
 	const [values, setValues] = useState<Record<string, string>>({});
+	// What each picker chose, with its name, so an id is never shown bare.
+	const [picked, setPicked] = useState<Record<string, SearchOption>>({});
+	// Set by the first attempt to run, so "required" is not shouted at an
+	// untouched form.
+	const [attempted, setAttempted] = useState(false);
+	const [target, setTarget] = useState<ObjectTypeDetail | null>(null);
+	const [record, setRecord] = useState<Record<string, unknown> | null>(null);
 	const [outcome, setOutcome] = useState<ActionOutcome | null>(null);
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [audit, setAudit] = useState<Array<Record<string, unknown>> | null>(null);
 	const [missing, setMissing] = useState(false);
-	const { spaceSlug, space, isPersonal } = useSpace();
+	// The action whose deletion is being confirmed.
+	const [removing, setRemoving] = useState<ActionSummary | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
+	const canDelete = useCanDelete();
+	const { spaceSlug, space, isPersonal, reload } = useSpace();
+	const me = session.user();
 
-	const loadAudit = () => {
+	const loadAudit = useCallback(() => {
 		api
 			.get<Array<Record<string, unknown>>>("/api/actions/audit?limit=60")
 			.then(setAudit)
 			.catch(() => setAudit([]));
-	};
+	}, []);
 
 	// Action types are part of the ontology, so they belong to a space and are
 	// reloaded when it changes.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the space is the trigger
 	useEffect(() => {
 		setActions(null);
 		setSelected(null);
@@ -79,10 +175,12 @@ export function Actions() {
 		Promise.all([
 			api.get<ActionSummary[]>("/api/action-types"),
 			api.get<Role[]>("/api/roles"),
+			api.get<ObjectTypeSummary[]>("/api/object-types"),
 		])
-			.then(([actionRows, roleRows]) => {
+			.then(([actionRows, roleRows, typeRows]) => {
 				setActions(actionRows);
 				setRoles(roleRows);
+				setTypes(typeRows);
 				// A read-only action first when there is one, because it is the one
 				// a visitor can actually run; otherwise the first action, rather
 				// than opening the page with nothing selected.
@@ -98,13 +196,39 @@ export function Actions() {
 	}, [spaceSlug]);
 
 	const action = actions?.find((entry) => entry.apiName === selected) ?? null;
+	// The object type the action is declared on.
+	const targetSummary = useMemo(
+		() => types.find((entry) => entry.rid === action?.targetObjectTypes?.[0]) ?? null,
+		[types, action],
+	);
 
 	useEffect(() => {
 		setValues({});
+		setPicked({});
+		setAttempted(false);
 		setOutcome(null);
+		setError(null);
 	}, [selected]);
 
-	const parameters = useMemo(
+	// The target's fields, for a parameter that names one.
+	useEffect(() => {
+		setTarget(null);
+		if (!targetSummary) return;
+		let current = true;
+		api
+			.get<ObjectTypeDetail>(`/api/object-types/${encodeURIComponent(targetSummary.apiName)}`)
+			.then((detail) => {
+				if (current) setTarget(detail);
+			})
+			.catch(() => {
+				if (current) setTarget(null);
+			});
+		return () => {
+			current = false;
+		};
+	}, [targetSummary]);
+
+	const parameters = useMemo<Parameter[]>(
 		() =>
 			(action?.parameters ?? []).map((parameter) => {
 				const rules = (parameter.validation ?? []) as Array<Record<string, any>>;
@@ -122,8 +246,59 @@ export function Actions() {
 		[action],
 	);
 
+	const controls = useMemo(
+		() => new Map(parameters.map((parameter) => [parameter.name, controlFor(parameter, types, targetSummary !== null)])),
+		[parameters, types, targetSummary],
+	);
+
+	// The record the action is about to act on, so the form can show what a
+	// field holds now. It is the target type's own key parameter.
+	const targetKeyName = parameters.find((parameter) => {
+		const control = controls.get(parameter.name);
+		return control?.kind === "object" && control.type.apiName === targetSummary?.apiName;
+	})?.name;
+	const targetKey = targetKeyName ? (values[targetKeyName] ?? "") : "";
+
+	useEffect(() => {
+		setRecord(null);
+		if (!targetSummary || !targetKey) return;
+		let current = true;
+		api
+			.get<Record<string, unknown>>(
+				`/api/objects/${encodeURIComponent(targetSummary.apiName)}/${encodeURIComponent(targetKey)}`,
+			)
+			.then((row) => {
+				if (current) setRecord(row);
+			})
+			.catch(() => {
+				if (current) setRecord(null);
+			});
+		return () => {
+			current = false;
+		};
+	}, [targetSummary, targetKey]);
+
+	const setValue = (name: string, value: string) => {
+		setValues((current) => ({ ...current, [name]: value }));
+		setOutcome(null);
+	};
+
+	const pick = (name: string, option: SearchOption | null) => {
+		setPicked((current) => {
+			const next = { ...current };
+			if (option) next[name] = option;
+			else delete next[name];
+			return next;
+		});
+		setValue(name, option?.value ?? "");
+	};
+
+	const missingRequired = parameters.filter((parameter) => parameter.required && !(values[parameter.name] ?? "").trim());
+
 	const run = async () => {
 		if (!action) return;
+		setAttempted(true);
+		if (missingRequired.length > 0) return;
 		setBusy(true);
 		setOutcome(null);
 		setError(null);
@@ -136,23 +311,21 @@ export function Actions() {
 			if (raw === undefined || raw === "") continue;
 			if (["decimal", "float", "integer"].includes(parameter.type)) payload[parameter.name] = Number(raw);
 			else if (parameter.type === "boolean") payload[parameter.name] = raw === "true";
+			else if (parameter.type === "datetime") payload[parameter.name] = new Date(raw).toISOString();
 			else payload[parameter.name] = raw;
 		}
 
 		try {
-			const response = await fetch(`/api/actions/${action.apiName}/apply`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					parameters: payload,
-					actor: "ui-user",
-					actorRole: role,
-					initiatedByAi: false,
-				}),
-			});
-			// 403 and 422 carry a full outcome body, so they are read rather than
-			// thrown: the refusal is the useful answer here.
-			setOutcome((await response.json()) as ActionOutcome);
+			// Sent as the signed-in person, in the space on screen. A refusal for
+			// the role (403) or for the parameters (422) carries a full outcome,
+			// so those are read rather than thrown: the refusal is the answer.
+			const response = await api.postReading<ActionOutcome>(
+				`/api/actions/${encodeURIComponent(action.apiName)}/apply`,
+				{ parameters: payload, initiatedByAi: false },
+				[403, 422],
+			);
+			if (response && typeof response.status === "string") setOutcome(response);
+			else setError("The server answered without an outcome. Nothing was recorded.");
 			loadAudit();
 		} catch (exc) {
 			setError((exc as Error).message);
@@ -164,29 +337,18 @@ export function Actions() {
 	if (missing)
 		return <NoOntologyHere what="action types" spaceName={space?.name ?? spaceSlug} />;
 	if (error && !actions) return <ErrorBanner error={error} />;
-	if (!actions) return <Spinner label="Loading actions" />;
+	if (!actions) return <PageLoader label="Loading actions" />;
+
+	const roleLabel = (id: string) => roles.find((entry) => entry["@id"] === id)?.label.en ?? id.replace(/^[a-z]+:/, "");
+	const mayRun = !action || !me || action.allowedRoles.length === 0 || action.allowedRoles.includes(me.ontologyRole);
 
 	return (
 		<div className="col" style={{ gap: 12 }}>
-			<div className="card">
-				<div className="card-head">
-					<h3>Acting as</h3>
-					<span className="sub">the role decides what may run</span>
-				</div>
-				<div className="row" style={{ gap: 10 }}>
-					<select value={role} onChange={(event) => setRole(event.target.value)}>
-						{roles.map((entry) => (
-							<option key={entry["@id"]} value={entry["@id"]}>
-								{entry.label.en ?? entry["@id"]}
-							</option>
-						))}
-					</select>
-					<span className="secondary" style={{ fontSize: 12.5 }}>
-						{roles.find((entry) => entry["@id"] === role)?.description?.en}
-					</span>
-				</div>
-			</div>
-
+			{notice && (
+				<p className="rb-notice" role="status">
+					{notice}
+				</p>
+			)}
 			<div className="split">
 				<div className="card" style={{ padding: 10 }}>
 					{/* The read-only group appears only when there is something in
@@ -256,77 +418,69 @@ export function Actions() {
 										{action.isReadOnly ? "read-only" : "mutating"}
 									</span>
 									{action.requiresApproval && <span className="chip">needs approval</span>}
+									{targetSummary && <span className="sub">acts on {targetSummary.label}</span>}
+									{canDelete && (
+										<span style={{ marginLeft: "auto" }}>
+											<DeleteButton title={`Delete the action ${action.label}`} onClick={() => setRemoving(action)} />
+										</span>
+									)}
 								</div>
-								<p className="secondary" style={{ margin: "0 0 12px" }}>
+								<p className="secondary" style={{ margin: "0 0 14px" }}>
 									{action.description}
 								</p>
 
-								<div className="col" style={{ gap: 9 }}>
+								<form
+									className="action-form"
+									onSubmit={(event) => {
+										event.preventDefault();
+										void run();
+									}}
+								>
 									{parameters.map((parameter) => (
-										<label key={parameter.name} className="col" style={{ gap: 3 }}>
-											<span style={{ fontSize: 12.5 }}>
-												{parameter.label}
-												{parameter.required && <span style={{ color: "var(--status-critical)" }}> *</span>}
-												<span className="muted mono" style={{ marginLeft: 6 }}>
-													{parameter.type}
-												</span>
-											</span>
-											{parameter.options ? (
-												<select
-													value={values[parameter.name] ?? ""}
-													onChange={(event) =>
-														setValues((current) => ({ ...current, [parameter.name]: event.target.value }))
-													}
-												>
-													<option value="">—</option>
-													{parameter.options.map((option) => (
-														<option key={option} value={option}>
-															{option}
-														</option>
-													))}
-												</select>
-											) : parameter.type === "boolean" ? (
-												<select
-													value={values[parameter.name] ?? ""}
-													onChange={(event) =>
-														setValues((current) => ({ ...current, [parameter.name]: event.target.value }))
-													}
-												>
-													<option value="">—</option>
-													<option value="true">Yes</option>
-													<option value="false">No</option>
-												</select>
-											) : (
-												<input
-													value={values[parameter.name] ?? ""}
-													placeholder={
-														parameter.defaultValue !== undefined
-															? `default ${String(parameter.defaultValue)}`
-															: undefined
-													}
-													onChange={(event) =>
-														setValues((current) => ({ ...current, [parameter.name]: event.target.value }))
-													}
-												/>
-											)}
-											{parameter.description && (
-												<span className="muted" style={{ fontSize: 11.5 }}>
-													{parameter.description}
-												</span>
-											)}
-										</label>
+										<ParameterField
+											key={parameter.name}
+											parameter={parameter}
+											control={controls.get(parameter.name) ?? { kind: "text" }}
+											value={values[parameter.name] ?? ""}
+											picked={picked[parameter.name] ?? null}
+											target={target}
+											record={record}
+											invalid={attempted && parameter.required && !(values[parameter.name] ?? "").trim()}
+											onValue={(value) => setValue(parameter.name, value)}
+											onPick={(option) => pick(parameter.name, option)}
+										/>
 									))}
-								</div>
 
-								<div className="row" style={{ marginTop: 12, gap: 8 }}>
-									<button className="btn primary" onClick={() => void run()} disabled={busy}>
-										{busy ? "Running…" : action.isReadOnly ? "Run" : "Validate and stage"}
-									</button>
-									<span className="muted" style={{ fontSize: 11.5 }}>
-										Allowed roles: {action.allowedRoles.join(", ") || "none"}
-									</span>
-								</div>
+									{attempted && missingRequired.length > 0 && (
+										<p className="field-hint warn" role="alert">
+											Fill in {missingRequired.map((parameter) => parameter.label).join(", ")} first.
+										</p>
+									)}
+
+									<div className="action-run">
+										<button className="btn primary" type="submit" disabled={busy}>
+											{busy ? <span className="spinner" aria-hidden /> : <Icon name="play" size={14} />}
+											{busy ? "Running…" : action.isReadOnly ? "Run" : "Validate and stage"}
+										</button>
+										<span className="muted action-run-as">
+											{me ? (
+												<>
+													Runs as <strong>{me.username}</strong> ({roleLabel(me.ontologyRole)}).
+												</>
+											) : null}{" "}
+											Allowed: {action.allowedRoles.map(roleLabel).join(", ") || "nobody"}.
+										</span>
+									</div>
+									{!mayRun && me && (
+										<p className="field-hint warn">
+											Your business role, {roleLabel(me.ontologyRole)}, is not one this action allows, so a run will be
+											refused and recorded as refused. An administrator can change your role in the admin console.
+										</p>
+									)}
+								</form>
 							</div>
+
+							{error && <ErrorBanner error={error} />}
 
 							{outcome && (
 								<div className="card">
@@ -342,20 +496,21 @@ export function Actions() {
 										{outcome.message}
 									</p>
 
-									{outcome.validation.errors.length > 0 && (
+									{(outcome.validation?.errors ?? []).length > 0 && (
 										<div className="banner error" style={{ marginBottom: 10 }}>
 											<strong>Parameter problems:</strong>
 											<ul style={{ margin: "5px 0 0", paddingLeft: 18 }}>
 												{outcome.validation.errors.map((problem) => (
-													<li key={problem.field}>
-														{problem.field}: {problem.message}
+													<li key={`${problem.field}-${problem.message}`}>
+														{parameters.find((parameter) => parameter.name === problem.field)?.label ?? problem.field}:{" "}
+														{problem.message}
 													</li>
 												))}
 											</ul>
 										</div>
 									)}
 
-									{Object.keys(outcome.result).length > 0 && (
+									{Object.keys(outcome.result ?? {}).length > 0 && (
 										<DataTable
 											columns={[
 												{ key: "field", label: "Field" },
@@ -374,13 +529,13 @@ export function Actions() {
 										/>
 									)}
 
-									{typeof outcome.result.note === "string" && (
+									{typeof outcome.result?.note === "string" && (
 										<p className="muted" style={{ fontSize: 11.5, marginTop: 9, marginBottom: 0 }}>
 											{outcome.result.note}
 										</p>
 									)}
 
-									{Boolean(outcome.result.payloadForTms) && (
+									{Boolean(outcome.result?.payloadForTms) && (
 										<details style={{ marginTop: 9 }}>
 											<summary className="mono" style={{ cursor: "pointer", fontSize: 11.5 }}>
 												Payload that would be sent to the TMS
@@ -402,6 +557,7 @@ export function Actions() {
 					<h3>Audit trail</h3>
 					<span className="sub">every attempt, including the refusals</span>
 					<button className="btn sm" onClick={loadAudit} style={{ marginLeft: 10 }}>
+						<Icon name="refresh" size={13} />
 						Refresh
 					</button>
 				</div>
@@ -415,6 +571,7 @@ export function Actions() {
 							{ key: "action_audit_id", label: "#", numeric: true },
 							{ key: "api_name", label: "Action" },
 							{ key: "status", label: "Status" },
+							{ key: "actor", label: "By" },
 							{ key: "actor_role", label: "Role" },
 							{ key: "initiated_by_ai", label: "By AI" },
 							{ key: "duration_ms", label: "ms", numeric: true },
@@ -426,6 +583,183 @@ export function Actions() {
 					/>
 				)}
 			</div>
+
+			{removing && (
+				<DeleteDialog
+					kind="actionType"
+					target={removing.apiName}
+					label={removing.label}
+					onClose={() => setRemoving(null)}
+					onDeleted={(plan) => {
+						const left = actions.filter((entry) => entry.apiName !== removing.apiName);
+						setRemoving(null);
+						setNotice(deletedNotice({ ...plan, name: removing.label }));
+						setActions(left);
+						// Whatever is next in the list, rather than an empty form.
+						setSelected(left.find((entry) => entry.isReadOnly)?.apiName ?? left[0]?.apiName ?? null);
+						// The counts in the navigation and on the object type's page.
+						reload();
+					}}
+				/>
+			)}
+		</div>
+	);
+}
+
+/** One parameter of an action, in the control that fits it. */
+function ParameterField({
+	parameter,
+	control,
+	value,
+	picked,
+	target,
+	record,
+	invalid,
+	onValue,
+	onPick,
+}: {
+	parameter: Parameter;
+	control: Control;
+	value: string;
+	/** What a picker chose, with its name. */
+	picked: SearchOption | null;
+	/** The object type the action is declared on, with its fields. */
+	target: ObjectTypeDetail | null;
+	/** The record chosen to act on, once one is. */
+	record: Record<string, unknown> | null;
+	invalid: boolean;
+	onValue: (value: string) => void;
+	onPick: (option: SearchOption | null) => void;
+}) {
+	const id = `action-parameter-${parameter.name}`;
+	const objectType = control.kind === "object" ? control.type : null;
+
+	// Records of the object type, searched by what is typed. Asked of the
+	// server each time: an object type can hold far more than a list should.
+	const searchRecords = useCallback(
+		async (term: string): Promise<SearchPage> => {
+			if (!objectType) return { options: [] };
+			const keyProperty = objectType.primaryKeyProperty;
+			const titleProperty = objectType.titleProperty;
+			const result = await api.post<SearchResult>(`/api/objects/${encodeURIComponent(objectType.apiName)}/search`, {
+				search: term,
+				limit: PICKER_PAGE,
+				// The key and the title come back whatever is selected; asking
+				// for one of them keeps the rest of the row off the wire.
+				...(keyProperty ? { select: [keyProperty] } : {}),
+			});
+			return {
+				total: result.totalCount,
+				options: result.data
+					.map((row): SearchOption | null => {
+						const key = keyProperty ? row[keyProperty] : undefined;
+						if (key === null || key === undefined) return null;
+						const title = titleProperty ? row[titleProperty] : null;
+						const named = title !== null && title !== undefined && String(title) !== String(key);
+						return named
+							? { value: String(key), label: String(title), detail: String(key) }
+							: { value: String(key), label: String(key) };
+					})
+					.filter((option): option is SearchOption => option !== null),
+			};
+		},
+		[objectType],
+	);
+
+	// The object type's fields, as they are named in the source.
+	const fieldOptions = useMemo<SearchOption[]>(
+		() =>
+			(target?.properties ?? []).map((property) => ({
+				value: property.sqlColumn,
+				label: property.label,
+				detail: `${property.sqlColumn} · ${property.datatype}${property.isIdentity ? " · key" : ""}`,
+			})),
+		[target],
+	);
+	const chosenField =
+		control.kind === "field" ? (target?.properties.find((property) => property.sqlColumn === value) ?? null) : null;
+
+	const set = (event: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => onValue(event.target.value);
+	const placeholder = parameter.defaultValue !== undefined ? `default ${String(parameter.defaultValue)}` : undefined;
+
+	return (
+		<div className="field action-field">
+			<span>
+				<label htmlFor={id}>{parameter.label}</label>
+				{parameter.required && (
+					<span className="action-required" title="Required">
+						{" "}
+						*<span className="sr-only"> required</span>
+					</span>
+				)}
+			</span>
+
+			{control.kind === "object" ? (
+				<SearchSelect
+					id={id}
+					value={value}
+					selected={picked}
+					onChange={onPick}
+					search={searchRecords}
+					invalid={invalid}
+					placeholder={`Search ${control.type.pluralLabel ?? control.type.label} by name or id…`}
+					emptyText={`No ${control.type.label} matches that.`}
+				/>
+			) : control.kind === "field" ? (
+				<SearchSelect
+					id={id}
+					value={value}
+					selected={picked}
+					onChange={onPick}
+					options={fieldOptions}
+					invalid={invalid}
+					disabled={!target}
+					placeholder={target ? `Search the ${target.label} fields…` : "Loading the fields…"}
+					emptyText="No field matches that."
+				/>
+			) : control.kind === "enum" ? (
+				<select id={id} value={value} aria-invalid={invalid || undefined} onChange={set}>
+					<option value="">—</option>
+					{control.options.map((option) => (
+						<option key={option} value={option}>
+							{option}
+						</option>
+					))}
+				</select>
+			) : control.kind === "boolean" ? (
+				<select id={id} value={value} aria-invalid={invalid || undefined} onChange={set}>
+					<option value="">—</option>
+					<option value="true">Yes</option>
+					<option value="false">No</option>
+				</select>
+			) : (
+				<input
+					id={id}
+					type={
+						control.kind === "number"
+							? "number"
+							: control.kind === "date"
+								? "date"
+								: control.kind === "datetime"
+									? "datetime-local"
+									: "text"
+					}
+					step={control.kind === "number" && parameter.type === "integer" ? 1 : control.kind === "number" ? "any" : undefined}
+					value={value}
+					placeholder={placeholder}
+					aria-invalid={invalid || undefined}
+					onChange={set}
+				/>
+			)}
+
+			{/* What the chosen field holds on the chosen record, so the new value
+			    is typed next to the one it replaces. */}
+			{chosenField && record && (
+				<span className="field-hint">
+					Current value: <strong className="action-current">{formatCell(record[chosenField.apiName])}</strong>
+				</span>
+			)}
+			{parameter.description && <span className="field-hint">{parameter.description}</span>}
 		</div>
 	);
 }

@@ -10,7 +10,8 @@ import { Link } from "react-router-dom";
 import { type PlatformStats, api, isMissingOntology, round } from "../api";
 import { useSpace } from "../SpaceContext";
 import { Chart } from "../components/Chart";
-import { Empty, ErrorBanner, NoOntologyHere, Spinner } from "../components/common";
+import { Empty, ErrorBanner, NoOntologyHere, PageLoader } from "../components/common";
+import { Icon, type IconName } from "../components/icons";
 
 export function Overview() {
 	const [stats, setStats] = useState<PlatformStats | null>(null);
@@ -36,48 +37,56 @@ export function Overview() {
 
 	if (missing) return <NoOntologyHere what="ontology" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
-	if (!stats) return <Spinner label="Loading platform summary" />;
+	if (!stats) return <PageLoader label="Loading platform summary" />;
 
 	const { counts, flow } = stats;
 	const valid = stats.ontology.validation?.valid !== false;
 
-	const stages = [
+	const stages: Array<{ label: string; value: number; foot: string; to: string; icon: IconName }> = [
 		{
 			label: "Connections",
 			value: flow.connections,
 			foot: "PostgreSQL sources",
 			to: "/browse/connections",
+			icon: "database",
 		},
 		{
 			label: "Syncs",
 			value: flow.syncs,
 			foot: `${flow.schedules} on a schedule`,
 			to: "/schedules",
+			icon: "refresh",
 		},
 		{
 			label: "Datasets",
 			value: flow.datasets,
 			foot: flow.lastSyncAt ? `last synced ${new Date(flow.lastSyncAt).toLocaleString()}` : "nothing synced yet",
 			to: "/browse/datasets",
+			icon: "table",
 		},
 		{
 			label: "Object types",
 			value: counts.objectTypes,
 			foot: `${counts.objects.toLocaleString()} objects, ${counts.linkTypes} links`,
 			to: "/ontology",
+			icon: "box",
 		},
 		{
 			label: "Metrics · actions",
 			value: counts.kpis + counts.actionTypes,
 			foot: `${counts.kpis} metrics, ${counts.actionTypes} actions, ${flow.functions} functions`,
 			to: "/browse/metrics",
+			icon: "sigma",
 		},
 	];
 
 	return (
-		<div className="col" style={{ gap: 14 }}>
+		<div className="col" style={{ gap: 16 }}>
 			<div className="card">
 				<div className="card-head">
+					<span className="stage-icon" aria-hidden>
+						<Icon name="layers" size={16} />
+					</span>
 					<h3>{stats.ontology.label ?? "TMS Ontology"}</h3>
 					<span className="sub">v{stats.ontology.version}</span>
 				</div>
@@ -98,11 +107,15 @@ export function Overview() {
 				</div>
 			</div>
 
-			<div className="grid grid-5">
+			<div className="grid grid-5 flow-grid">
 				{stages.map((stage, index) => (
 					<Link key={stage.label} to={stage.to} className="card stat" style={{ textDecoration: "none" }}>
 						<div className="label">
-							{index + 1}. {stage.label}
+							<span className="stage-icon" aria-hidden>
+								<Icon name={stage.icon} size={15} />
+							</span>
+							{stage.label}
+							<span className="stage-n">{index + 1}</span>
 						</div>
 						<div className="value">{stage.value.toLocaleString()}</div>
 						<div className="foot">{stage.foot}</div>
@@ -133,7 +146,7 @@ export function Overview() {
 					<div className="card-head">
 						<h3>How data gets here</h3>
 					</div>
-					<ol className="secondary" style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.8 }}>
+					<ol className="flow-steps">
 						<li>
 							A <Link to="/browse/connections">connection</Link> names a PostgreSQL host and the
 							secret its password is in - never the password.
@@ -152,11 +165,13 @@ export function Overview() {
 							actions are staged, and functions wait for an admin.
 						</li>
 					</ol>
-					<div className="row" style={{ marginTop: 12, gap: 6 }}>
+					<div className="row" style={{ marginTop: 18, gap: 8 }}>
 						<Link className="btn" to="/ontology">
+							<Icon name="box" size={14} />
 							Browse the ontology
 						</Link>
 						<Link className="btn primary" to="/assistant">
+							<Icon name="sparkles" size={14} />
 							Ask the AI-FDE
 						</Link>
 					</div>
@@ -201,18 +216,20 @@ function NextStep({ stats }: { stats: PlatformStats }) {
 	}
 
 	return (
-		<div className="card">
-			<div className="row" style={{ gap: 10 }}>
-				<strong style={{ fontSize: 13 }}>Next</strong>
-				<span className="secondary" style={{ flex: "1 1 auto" }}>
-					{message}
-				</span>
-				{action && (
-					<Link className="btn primary sm" to={action.to}>
-						{action.label}
-					</Link>
-				)}
+		<div className="card next-step">
+			<span className="next-step-mark" aria-hidden>
+				<Icon name="route" size={18} />
+			</span>
+			<div className="next-step-text">
+				<strong>Next</strong>
+				{message}
 			</div>
+			{action && (
+				<Link className="btn primary" to={action.to}>
+					{action.label}
+					<Icon name="arrowRight" size={15} />
+				</Link>
+			)}
 		</div>
 	);
 }

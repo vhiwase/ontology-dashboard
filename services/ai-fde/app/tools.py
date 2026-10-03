@@ -823,32 +823,51 @@ async def search_documentation(arguments: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# How many choices a question may offer. Enough for "which of these tables
+# should I sync?"; past this the person is better served by typing.
+MAX_CLARIFICATION_OPTIONS = 12
+
+
 async def request_clarification(arguments: dict[str, Any]) -> dict[str, Any]:
     """Ask the user a question instead of guessing.
 
     This tool does not look anything up. It is a terminal step: the agent stops
     the round loop when it is called and hands the question back, because
     continuing would mean answering the question the model was unsure about.
+    The UI shows the options as choices with a Submit button - several at once
+    when `multiple` is set - and the person's pick arrives as the next turn.
     """
     question = str(arguments.get("question") or "").strip()
     if not question:
         raise ToolError("question is required.")
 
     raw_options = arguments.get("options") or []
+    if not isinstance(raw_options, list):
+        raw_options = []
     options: list[dict[str, str]] = []
-    for option in raw_options[:6]:
+    seen: set[str] = set()
+    for option in raw_options:
         if isinstance(option, dict):
             label = str(option.get("label") or "").strip()
             detail = str(option.get("detail") or "").strip()
         else:
             label, detail = str(option).strip(), ""
-        if label:
-            options.append({"label": label, "detail": detail})
+        # A repeated label is one choice, not two buttons that do the same.
+        if label and label.lower() not in seen:
+            seen.add(label.lower())
+            options.append({"label": label[:120], "detail": detail[:240]})
+        if len(options) == MAX_CLARIFICATION_OPTIONS:
+            break
 
     return {
         "clarificationRequested": True,
         "question": question,
+        # What there was to say before asking. The reply keeps it above the
+        # choices, so asking a question never replaces answering one.
+        "message": str(arguments.get("message") or "").strip()[:8000],
         "options": options,
+        # Several choices only make sense when there are several to make.
+        "multiple": bool(arguments.get("multiple", False)) and len(options) > 1,
         "allowFreeText": bool(arguments.get("allowFreeText", True)),
     }
 
@@ -1234,14 +1253,32 @@ _BASE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     ),
     _fn(
         "request_clarification",
-        "Ask the user a question instead of guessing. Use this when the request "
-        "is genuinely ambiguous in a way that changes the answer. Do NOT use it for "
-        "something you could look up yourself. Calling it ends your turn.",
+        "Ask the user to choose or confirm, instead of asking in prose. Use it whenever "
+        "your reply would end by asking the user to pick something - which tables to "
+        "sync, which datasets to model, which metric or period, or whether to go ahead "
+        "with a next step you propose - and when a request is ambiguous in a way that "
+        "changes the answer. The options appear as choices with a Submit button. Do NOT "
+        "use it for something you could look up yourself. Calling it ends your turn, so "
+        "whatever you have to tell the user goes in `message`: asking must never replace "
+        "answering.",
         {
+            "message": {
+                "type": "string",
+                "description": (
+                    "Everything you would have written before the question - the answer, the "
+                    "explanation, what you found - in Markdown, with its citations and resource "
+                    "chips. Required whenever the user asked something you can answer; leave it "
+                    "out only when the question stands alone."
+                ),
+            },
             "question": {"type": "string", "description": "One specific question, in the user's language."},
             "options": {
                 "type": "array",
-                "description": "Two to six concrete choices, taken from the data.",
+                "description": (
+                    "Two to twelve concrete choices, taken from the data or from what you "
+                    "offered - e.g. the tables you listed, or 'Yes, model all three' / "
+                    "'Only business_entity_contact'."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -1250,6 +1287,10 @@ _BASE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                     "required": ["label"],
                 },
+            },
+            "multiple": {
+                "type": "boolean",
+                "description": "True when the user may pick several options at once, e.g. which tables to sync.",
             },
             "allowFreeText": {"type": "boolean", "description": "Whether a typed answer is also acceptable."},
         },

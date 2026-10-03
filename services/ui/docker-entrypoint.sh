@@ -31,4 +31,23 @@ else
     echo "[tls] Using the certificate mounted at $CERT_DIR."
 fi
 
+# ---------------------------------------------------------------------------
+#  Where the two APIs are.
+#
+#  Compose names them from the ports the services were told to listen on
+#  (ONTOLOGY_SERVICE_PORT, AI_FDE_PORT). The addresses used to be written into
+#  nginx.conf as :4000 and :4100, so changing either port moved the service
+#  and left nginx dialling the old one. They are filled in here instead. Only
+#  these two names are substituted: nginx's own $host, $uri and the rest are
+#  left exactly as written.
+# ---------------------------------------------------------------------------
+ONTOLOGY_SERVICE_URL=${ONTOLOGY_SERVICE_URL:-http://ontology-service:4000}
+AI_FDE_URL=${AI_FDE_URL:-http://ai-fde:4100}
+# No trailing slash: with one, nginx would forward /api/x as /x.
+export ONTOLOGY_SERVICE_URL="${ONTOLOGY_SERVICE_URL%/}"
+export AI_FDE_URL="${AI_FDE_URL%/}"
+envsubst '${ONTOLOGY_SERVICE_URL} ${AI_FDE_URL}' \
+    < /etc/nginx/default.conf.template > /etc/nginx/conf.d/default.conf
+echo "[proxy] /api -> $ONTOLOGY_SERVICE_URL, /api/assistant -> $AI_FDE_URL"
+
 exec "$@"

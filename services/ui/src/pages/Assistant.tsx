@@ -1,7 +1,7 @@
 /**
  * The AI-FDE conversation.
  *
- * Two things here are not cosmetic:
+ * Four things here are not cosmetic:
  *
  * TOOL CALLS ARE VISIBLE. Every answer shows which ontology queries produced it,
  * and each one expands to its arguments and result. A business user who cannot
@@ -11,18 +11,33 @@
  * ARTEFACTS RENDER AS ARTEFACTS. When the assistant runs a KPI it returns the
  * series, so the UI draws the chart rather than leaving the user to read numbers
  * out of a paragraph. When it builds a dashboard, the reply carries a link to it.
+ *
+ * THE CONVERSATION OUTLIVES THE PAGE. It is held in ChatContext, one per space,
+ * so opening a dataset or a schedule and coming back finds it where it was - and
+ * a question still being answered keeps running meanwhile. Only "New
+ * conversation" starts another.
+ *
+ * THE HISTORY IS BESIDE IT. Every conversation is stored as it happens; the
+ * panel on the left lists them, newest first, and opens, renames, pins,
+ * searches and deletes them (ChatHistoryPanel). It used to be a window behind
+ * a button, which is how a history that was always kept came to look as if it
+ * was not.
+ *
+ * A QUESTION IS ANSWERED BY CHOOSING. When the assistant asks - which tables,
+ * which datasets, whether to go ahead - its options open in a panel above the
+ * message box with a Submit button, one choice or several, so answering never
+ * means retyping.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { ResourcePreview } from "../components/spaces/ResourcePreview";
 import { FunctionReview } from "../components/functions/FunctionReview";
 import { useSpace } from "../SpaceContext";
+import { type Turn, useChat } from "../ChatContext";
 import {
 	type AssistantHealth,
 	type ChatArtifact,
-	type ChatResponse,
-	type ChatToolCall,
 	type FeasibilityItem,
 	type ProposalRecord,
 	api,
@@ -31,26 +46,18 @@ import {
 	grainOf,
 } from "../api";
 import { Chart, type ChartKind } from "../components/Chart";
+import {
+	type Clarification,
+	ClarificationPanel,
+	asClarification,
+	chosenIn,
+	replyProse,
+	toggleChoice,
+} from "../components/ClarificationPanel";
+import { ChatHistoryPanel } from "../components/ChatHistoryPanel";
 import { ProposalCard } from "../components/ProposalCard";
-import { DataTable, ErrorBanner, Markdown, Spinner, useScrollToBottom } from "../components/common";
-
-interface Turn {
-	role: "user" | "assistant";
-	content: string;
-	toolCalls?: ChatToolCall[];
-	artifacts?: ChatArtifact[];
-	meta?: {
-		rounds: number;
-		latencyMs: number;
-		model: string;
-		stoppedBecause: string;
-		tokens?: number;
-		costUsd?: number;
-		priced?: boolean;
-		/** The operational mode the conversation is in after this turn. */
-		agentMode?: string;
-	};
-}
+import { DataTable, ErrorBanner, Markdown, Refusal, Spinner, useScrollToBottom } from "../components/common";
+import { Icon } from "../components/icons";
 
 interface Starter {
 	label: string;
@@ -69,31 +76,70 @@ interface ProviderOption {
 interface ProviderCatalogue {
 	providers: ProviderOption[];
 	auto: { id: string; label: string; resolvedTo: string | null; reason: string | null };
-	/** Which option to preselect. */
+	/** Which option to preselect: the administrator's default when one is set. */
 	default: string;
 }
 
+/** Where the person stands against the monthly AI credit an administrator set. */
+interface CreditStatus {
+	mode: string;
+	limitUsd: number | null;
+	spentUsd: number;
+	remainingUsd: number | null;
+	exhausted: boolean;
+	periodStart: string | null;
+	resetsAt: string | null;
+}
+
+/** Whether the history panel is shown, remembered per browser. */
+const HISTORY_KEY = "tms.chat.history";
+/** Below this width the panel would squeeze the conversation, so it lies over it instead. */
+const HISTORY_INLINE_FROM = 1080;
+
+function historyPreference(): boolean {
+	try {
+		const stored = window.localStorage.getItem(HISTORY_KEY);
+		if (stored === "open") return true;
+		if (stored === "closed") return false;
+	} catch {
+		/* a private window: decided by the width below */
+	}
+	// Where there is room it is open: a history is for seeing, not for finding.
+	return typeof window !== "undefined" && window.innerWidth >= HISTORY_INLINE_FROM;
+}
+
+function usd(value: number): string {
+	return `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function dayAndMonth(iso: string | null): string {
+	if (!iso) return "";
+	return new Date(iso).toLocaleDateString(undefined, { day: "numeric", month: "long" });
+}
+
 export function Assistant() {
-	const [turns, setTurns] = useState<Turn[]>([]);
+	const { spaceSlug, isPersonal, reload } = useSpace();
+	const chat = useChat();
+	const { restore, setDraft, setAnswer, newConversation, open, append, setTitle, provider, setProvider } = chat;
+	const conversation = chat.conversation(spaceSlug);
+	const { turns, busy, draft, sessionId, loading } = conversation;
 	// ?prompt= pre-fills the composer - how "Ask the AI-FDE to model it" hands a
 	// request over. It is never sent on its own; the person reads it first.
-	const [searchParams] = useSearchParams();
-	const [input, setInput] = useState(() => searchParams.get("prompt") ?? "");
-	const [busy, setBusy] = useState(false);
-	const [sessionId, setSessionId] = useState<number | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const [health, setHealth] = useState<AssistantHealth | null>(null);
-	const [starters, setStarters] = useState<Starter[]>([]);
-	const [catalogue, setCatalogue] = useState<ProviderCatalogue | null>(null);
-	// Null until the catalogue loads, then the server's suggested default.
-	// Pinned per conversation rather than per turn, so a thread does not
-	// silently change model half way through.
-	const [provider, setProvider] = useState<string | null>(null);
-	const { spaceSlug, isPersonal, reload } = useSpace();
 	// A question handed over from elsewhere (the home page's ask box, a
 	// suggestion) arrives as ?q= and is asked once, then cleared from the URL.
 	const [params, setParams] = useSearchParams();
+	const prefill = useRef<string | null>(params.get("prompt"));
 	const handedOver = useRef<string | null>(params.get("q"));
+	// ?session= opens that conversation - how a dashboard's history links back
+	// to the one that built it.
+	const linked = useRef<string | null>(params.get("session"));
+	const [health, setHealth] = useState<AssistantHealth | null>(null);
+	const [starters, setStarters] = useState<Starter[]>([]);
+	const [catalogue, setCatalogue] = useState<ProviderCatalogue | null>(null);
+	const [credit, setCredit] = useState<CreditStatus | null>(null);
+	// Errors from this page's own lookups. A failed turn's error lives with the
+	// conversation, so it is still there after going to another page and back.
+	const [pageError, setPageError] = useState<string | null>(null);
 	// The resource a chip in a reply opened. An answer that names an object
 	// type should be able to show it, not just spell it.
 	const [previewId, setPreviewId] = useState<number | null>(null);
@@ -109,9 +155,79 @@ export function Assistant() {
 		sections: Array<{ title: string; body: string }>;
 		focus: string;
 	} | null>(null);
-	const scrollRef = useScrollToBottom(turns.length + (busy ? 1 : 0));
+	const [historyOpen, setHistoryOpenState] = useState(historyPreference);
+	const setHistoryOpen = useCallback((shown: boolean) => {
+		setHistoryOpenState(shown);
+		try {
+			window.localStorage.setItem(HISTORY_KEY, shown ? "open" : "closed");
+		} catch {
+			/* it still applies for this visit */
+		}
+	}, []);
 	const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+	// The question waiting for an answer: the latest turn's clarification, while
+	// nothing has been said since and nothing is being answered.
+	const last = turns[turns.length - 1];
+	const pending =
+		!busy && !loading && last?.role === "assistant"
+			? asClarification(last.artifacts?.find((artifact) => artifact.kind === "clarification"))
+			: null;
+	// What is ticked so far belongs to this question only: it lapses as soon
+	// as the conversation moves on.
+	const inProgress = conversation.answer?.at === turns.length ? conversation.answer : null;
+	const onlyOption = pending?.options.length === 1 ? pending.options[0] : undefined;
+	// A question with one option has it ticked already: Submit is all it needs.
+	const chosen = inProgress?.chosen ?? (onlyOption ? [onlyOption.label] : []);
+	const panelOpen = pending !== null && pending.options.length > 0 && !inProgress?.later;
+
+	const scrollRef = useScrollToBottom(turns.length + (busy ? 1 : 0) + (loading ? 1 : 0) + (panelOpen ? 1 : 0));
+
+	const sendIn = chat.send;
+	const creditOut = credit?.exhausted === true;
+	// With the month's credit used up nothing is sent: the server would refuse
+	// it. What was about to be asked is left in the box instead - a suggestion
+	// clicked, a question handed over from another page - and the banner above
+	// the box says why.
+	const send = useCallback(
+		(message: string) => {
+			// Asking something new answers any notice left above the box.
+			setPageError(null);
+			if (creditOut) setDraft(spaceSlug, message);
+			else void sendIn(spaceSlug, message);
+		},
+		[sendIn, setDraft, spaceSlug, creditOut],
+	);
+
+	// Reopen the conversation remembered for this space, unless it is already
+	// on screen - or open the one a link asked for.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: the link is read once
+	useEffect(() => {
+		const wanted = Number(linked.current);
+		linked.current = null;
+		if (!Number.isInteger(wanted) || wanted <= 0) {
+			restore(spaceSlug);
+			return;
+		}
+		params.delete("session");
+		setParams(params, { replace: true });
+		void open(spaceSlug, wanted).then((opened) => {
+			if (!opened) {
+				setPageError(
+					`Conversation ${wanted} could not be opened here. It may have been deleted, belong to someone else, or an answer is still on its way in this one.`,
+				);
+			}
+		});
+	}, [restore, open, spaceSlug]);
+
+	useEffect(() => {
+		if (prefill.current) {
+			setDraft(spaceSlug, prefill.current);
+			prefill.current = null;
+		}
+	}, [setDraft, spaceSlug]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: read once per visit
 	useEffect(() => {
 		api
 			.get<AssistantHealth>("/api/assistant/health")
@@ -121,9 +237,9 @@ export function Assistant() {
 			.get<ProviderCatalogue>("/api/assistant/providers")
 			.then((body) => {
 				setCatalogue(body);
-				// Only adopt the server's default before the user has chosen, so a
-				// refresh of availability never overrides an explicit pick.
-				setProvider((current) => current ?? body.default);
+				// Only adopt the server's default before the person has chosen, so
+				// a refresh of availability never overrides an explicit pick.
+				if (provider === null) setProvider(body.default);
 			})
 			.catch(() => setCatalogue(null));
 	}, []);
@@ -136,15 +252,17 @@ export function Assistant() {
 			.catch(() => setStarters([]));
 	}, [spaceSlug]);
 
-	const selected = catalogue?.providers.find((p) => p.id === provider) ?? null;
-
-	// A conversation belongs to one space, so changing space starts a new one
-	// rather than carrying the old thread across an environment boundary.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset
+	// Re-read after every answer, since each one spends some of the credit -
+	// and after a refusal, which may be the first this page hears of the limit.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: these are the triggers
 	useEffect(() => {
-		setTurns([]);
-		setSessionId(null);
-	}, [spaceSlug]);
+		api
+			.get<CreditStatus>("/api/assistant/credit")
+			.then(setCredit)
+			.catch(() => setCredit(null));
+	}, [conversation.answered, conversation.refusal]);
+
+	const selected = catalogue?.providers.find((p) => p.id === provider) ?? null;
 
 	/** Open the workspace resource a :resource[kind:ref] chip refers to. */
 	const openResource = async (kind: string, ref: string) => {
@@ -153,9 +271,9 @@ export function Assistant() {
 				`/api/resources/lookup?kind=${encodeURIComponent(kind)}&ref=${encodeURIComponent(ref)}&space=${spaceSlug}`,
 			);
 			if (found?.id) setPreviewId(found.id);
-			else setError(`${ref} is not registered as a resource in this space.`);
+			else setPageError(`${ref} is not registered as a resource in this space.`);
 		} catch {
-			setError("Could not open that resource.");
+			setPageError("Could not open that resource.");
 		}
 	};
 
@@ -170,62 +288,17 @@ export function Assistant() {
 			}>(`/api/docs/page/${path}`);
 			setDoc({ ...page, focus: section });
 		} catch {
-			setError(`Could not open the document '${path}'.`);
-		}
-	};
-
-	const send = async (message: string) => {
-		const trimmed = message.trim();
-		if (!trimmed || busy) return;
-		setError(null);
-		setInput("");
-		setTurns((current) => [...current, { role: "user", content: trimmed }]);
-		setBusy(true);
-
-		try {
-			const response = await api.post<ChatResponse>("/api/assistant/chat", {
-				message: trimmed,
-				sessionId,
-				// The conversation belongs to the space it was started in.
-				spaceSlug,
-				// Omitted while the catalogue is still loading, which leaves the
-				// server on its configured chain rather than guessing here.
-				...(provider ? { provider } : {}),
-			});
-			setSessionId(response.sessionId);
-			setTurns((current) => [
-				...current,
-				{
-					role: "assistant",
-					content: response.reply,
-					toolCalls: response.toolCalls,
-					artifacts: response.artifacts,
-					meta: {
-						rounds: response.rounds,
-						latencyMs: response.latencyMs,
-						model: response.model,
-						stoppedBecause: response.stoppedBecause,
-						tokens: response.cost?.totalTokens,
-						costUsd: response.cost?.usd,
-						priced: response.cost?.priced,
-						agentMode: response.agentMode,
-					},
-				},
-			]);
-		} catch (exc) {
-			setError((exc as Error).message);
-		} finally {
-			setBusy(false);
-			textareaRef.current?.focus();
+			setPageError(`Could not open the document '${path}'.`);
 		}
 	};
 
 	// Ask the handed-over question once the model catalogue has settled, so it
-	// goes to the same provider the picker shows.
+	// goes to the same provider the picker shows - and once any remembered
+	// conversation is back, so it is asked there rather than lost under it.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: fire once
 	useEffect(() => {
 		const question = handedOver.current;
-		if (!question || !catalogue) return;
+		if (!question || !catalogue || loading) return;
 		handedOver.current = null;
 		params.delete("q");
 		setParams(params, { replace: true });
@@ -233,16 +306,122 @@ export function Assistant() {
 		// A prompt that ends mid-sentence ("Build me a dashboard about ") is a
 		// starting point to finish, not a question to send.
 		if (/\s$/.test(question) || trimmed.endsWith(" about")) {
-			setInput(question);
+			setDraft(spaceSlug, question);
 			textareaRef.current?.focus();
 		} else {
-			void send(trimmed);
+			send(trimmed);
 		}
-	}, [catalogue]);
+	}, [catalogue, loading]);
 
+	// Once an answer is in, the keyboard goes back to the composer - unless the
+	// answer asked something, in which case it goes to the choices.
+	const wasBusy = useRef(busy);
+	const justAnswered = wasBusy.current && !busy;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: compares with the last render
+	useEffect(() => {
+		if (wasBusy.current && !busy && !panelOpen) textareaRef.current?.focus();
+		wasBusy.current = busy;
+	});
+
+	const startNew = () => {
+		setPageError(null);
+		newConversation(spaceSlug);
+		textareaRef.current?.focus();
+	};
+
+	/** Open a conversation from the history, unless an answer is still on its way here. */
+	const openFromHistory = (id: number) => {
+		setPageError(null);
+		// Over the conversation rather than beside it (a narrow window): out
+		// of the way once something has been chosen.
+		if (window.innerWidth < HISTORY_INLINE_FROM) setHistoryOpenState(false);
+		if (id === sessionId) return;
+		void open(spaceSlug, id).then((opened) => {
+			if (!opened) {
+				setPageError(
+					busy
+						? "An answer is still on its way in this conversation. Open another one once it has arrived."
+						: `Conversation ${id} could not be opened. It may have been deleted.`,
+				);
+			}
+		});
+	};
+
+	// Its name in the history when it has one (given, or the first question as
+	// the server kept it); otherwise the first question as it stands here.
+	const title = conversation.title ?? turns.find((turn) => turn.role === "user")?.content ?? "New conversation";
+	const creditShare = credit?.limitUsd ? Math.min(1, credit.spentUsd / credit.limitUsd) : creditOut ? 1 : 0;
 	const llmDown = health && !health.llm.reachable;
+	// A failed turn's error ends the transcript, under the question it belongs
+	// to. One about the page (pageError) is shown above the message box instead.
+	const error = conversation.error;
+
 	return (
+		<div className={`chat-layout ${historyOpen ? "with-history" : ""}`}>
+		{historyOpen && (
+			<>
+				{/* Only drawn on a narrow window, where the panel lies over the
+				    conversation: a click beside it puts it away. */}
+				<div className="chat-history-backdrop" onClick={() => setHistoryOpenState(false)} aria-hidden />
+				<ChatHistoryPanel
+					space={spaceSlug}
+					currentId={sessionId}
+					// Read again when a conversation begins, and after every answer:
+					// its place in the list and its message count have both moved.
+					refreshKey={`${sessionId ?? "new"}:${conversation.answered}:${turns.length}`}
+					busy={busy}
+					onOpen={openFromHistory}
+					onNew={() => {
+						startNew();
+						if (window.innerWidth < HISTORY_INLINE_FROM) setHistoryOpenState(false);
+					}}
+					onDeleted={(id) => {
+						// The one on screen is gone from the server, so it goes from here too.
+						if (id === sessionId) newConversation(spaceSlug);
+					}}
+					onRenamed={(id, name) => {
+						if (id === sessionId) setTitle(spaceSlug, name);
+					}}
+					onClose={() => setHistoryOpen(false)}
+				/>
+			</>
+		)}
 		<div className="chat">
+			<div className="chat-bar">
+				<span className="chat-bar-mark" aria-hidden>
+					<Icon name="message" size={15} />
+				</span>
+				<div className="chat-bar-text">
+					<span className="chat-bar-title" title={title}>
+						{title}
+					</span>
+					<span className="chat-bar-meta">
+						{loading
+							? "Opening your conversation…"
+							: turns.length === 0
+								? "Nothing asked yet"
+								: `${turns.length} message${turns.length === 1 ? "" : "s"}${sessionId ? ` · session ${sessionId} · saved in your history` : ""}`}
+					</span>
+				</div>
+				<div className="chat-bar-actions">
+					<button
+						className="btn sm ghost"
+						onClick={() => setHistoryOpen(!historyOpen)}
+						aria-pressed={historyOpen}
+						title={historyOpen ? "Hide the conversation history" : "Show the conversation history"}
+					>
+						<Icon name="history" size={14} />
+						History
+					</button>
+					{turns.length > 0 && (
+						<button className="btn sm" onClick={startNew} disabled={busy}>
+							<Icon name="plus" size={13} />
+							New conversation
+						</button>
+					)}
+				</div>
+			</div>
+
 			<div className="chat-scroll" ref={scrollRef}>
 				{llmDown && (
 					<div className="banner error" style={{ marginBottom: 12 }}>
@@ -251,9 +430,18 @@ export function Assistant() {
 					</div>
 				)}
 
-				{turns.length === 0 && (
-					<div className="card" style={{ marginBottom: 12 }}>
+				{loading && turns.length === 0 && (
+					<div className="chat-restoring">
+						<Spinner label="Opening your conversation" />
+					</div>
+				)}
+
+				{!loading && turns.length === 0 && (
+					<div className="card chat-welcome">
 						<div className="card-head">
+							<span className="chat-welcome-mark" aria-hidden>
+								<Icon name="sparkles" size={20} />
+							</span>
 							<h3>AI-FDE</h3>
 							<span className="sub" title={health?.providerReason ?? undefined}>
 								{health ? `${health.provider} · ${health.model}` : "checking model…"}
@@ -283,7 +471,8 @@ export function Assistant() {
 						)}
 						<div className="starters">
 							{starters.map((starter) => (
-								<button key={starter.label} className="starter" onClick={() => void send(starter.prompt)}>
+								<button key={starter.label} className="starter" onClick={() => send(starter.prompt)}>
+									<Icon name="sparkles" size={13} />
 									{starter.label}
 								</button>
 							))}
@@ -291,70 +480,95 @@ export function Assistant() {
 					</div>
 				)}
 
-				{turns.map((turn, index) => (
-					<TurnView
-						key={index}
-						turn={turn}
-						onResource={openResource}
-						onCitation={openCitation}
-						onAnswer={(answer) => void send(answer)}
-						onReviewFunction={setReviewFunction}
-						onApproved={(settled) => {
-							reload();
-							// Say what changed, in the conversation where it was asked for.
-							const built = settled
-								.map((entry) => entry.result?.built)
-								.find((entry): entry is { kind: "dashboard" | "report"; slug: string; title: string; widgets: number } =>
-									Boolean(entry && "slug" in entry),
-								);
-							if (built) {
-								setTurns((current) => [
-									...current,
-									{
+				{turns.map((turn, index) => {
+					const isPending = pending !== null && index === turns.length - 1;
+					const next = turns[index + 1];
+					return (
+						<TurnView
+							key={index}
+							turn={turn}
+							question={
+								isPending
+									? {
+											chosen,
+											panelOpen,
+											onToggle: (label) =>
+												setAnswer(spaceSlug, { chosen: toggleChoice(pending, chosen, label), later: false }),
+											onOpen: () => setAnswer(spaceSlug, { chosen, later: false }),
+										}
+									: null
+							}
+							answer={next?.role === "user" ? next.content : null}
+							onResource={openResource}
+							onCitation={openCitation}
+							onAnswer={send}
+							onReviewFunction={setReviewFunction}
+							onApproved={(settled) => {
+								reload();
+								// Say what changed, in the conversation where it was asked for.
+								const built = settled
+									.map((entry) => entry.result?.built)
+									.find((entry): entry is { kind: "dashboard" | "report"; slug: string; title: string; widgets: number } =>
+										Boolean(entry && "slug" in entry),
+									);
+								if (built) {
+									append(spaceSlug, {
 										role: "assistant",
 										content: `Approved and built: **${built.title}**, a ${built.kind} with ${built.widgets} widgets.`,
 										artifacts: [{ kind: "dashboard", slug: built.slug, title: built.title, widgets: built.widgets, boardKind: built.kind }],
-									},
-								]);
-								return;
-							}
-							// Nothing to open: the question that asked for this can be
-							// answered now, one click away rather than retyped.
-							const asked = turns
-								.slice(0, index)
-								.reverse()
-								.find((entry) => entry.role === "user")?.content;
-							const applied = settled.filter((entry) => entry.status === "applied").map((entry) => entry.title);
-							if (asked && applied.length > 0) {
-								setTurns((current) => [
-									...current,
-									{
+									});
+									return;
+								}
+								// Nothing to open: the question that asked for this can be
+								// answered now, one click away rather than retyped.
+								const asked = turns
+									.slice(0, index)
+									.reverse()
+									.find((entry) => entry.role === "user")?.content;
+								const applied = settled.filter((entry) => entry.status === "applied").map((entry) => entry.title);
+								if (asked && applied.length > 0) {
+									append(spaceSlug, {
 										role: "assistant",
 										content: `Approved: ${applied.join(", ")}.`,
 										artifacts: [
 											{
 												kind: "clarification",
-												question: `Approved: ${applied.join(", ")}. Ask again now?`,
+												question: "Ask again now?",
 												options: [{ label: asked, detail: "answered from what you just approved" }],
 												allowFreeText: false,
 											},
 										],
-									},
-								]);
-							}
-						}}
-					/>
-				))}
+									});
+								}
+							}}
+						/>
+					);
+				})}
 
 				{busy && (
 					<div className="msg assistant">
-						<div className="avatar">AI</div>
+						<div className="avatar">
+							<Icon name="sparkles" size={16} />
+							<span className="sr-only">AI</span>
+						</div>
 						<div className="body">
-							<Spinner label="Querying the ontology…" />
+							<div className="typing" role="status">
+								<i />
+								<i />
+								<i />
+								<span className="typing-label">Querying the ontology…</span>
+							</div>
 						</div>
 					</div>
 				)}
 
+				{/* Refused, not broken: said as it is, and the question is back in
+				    the box below. Hidden once the credit banner there says the same. */}
+				{conversation.refusal && !creditOut && (
+					<div style={{ marginTop: 10 }}>
+						<Refusal message={conversation.refusal} />
+					</div>
+				)}
 				{error && (
 					<div style={{ marginTop: 10 }}>
 						<ErrorBanner error={error} />
@@ -362,81 +576,122 @@ export function Assistant() {
 				)}
 			</div>
 
-			<div className="composer">
-				<form
-					onSubmit={(event) => {
-						event.preventDefault();
-						void send(input);
-					}}
-				>
-					<textarea
-						ref={textareaRef}
-						value={input}
-						placeholder={
-							isPersonal
-								? "Ask for a chart, a KPI, a dashboard or a report — “revenue by country per month”."
-								: "Ask about the data — or ask for a dashboard."
-						}
-						onChange={(event) => setInput(event.target.value)}
-						onKeyDown={(event) => {
-							// Enter sends; Shift+Enter is a newline. Standard for a chat box, and
-							// the hint below says so.
-							if (event.key === "Enter" && !event.shiftKey) {
-								event.preventDefault();
-								void send(input);
-							}
+			<div className="chat-dock">
+				{panelOpen && pending && (
+					<ClarificationPanel
+						// A new question gets a new panel, with nothing typed in it.
+						key={`${sessionId ?? "new"}:${turns.length}`}
+						clarification={pending}
+						chosen={chosen}
+						autoFocus={justAnswered && draft.trim() === ""}
+						onChange={(next) => setAnswer(spaceSlug, { chosen: next })}
+						onSubmit={send}
+						onDismiss={() => {
+							setAnswer(spaceSlug, { chosen, later: true });
+							textareaRef.current?.focus();
 						}}
-						rows={2}
 					/>
-					<button className="btn primary" type="submit" disabled={busy || !input.trim()}>
-						{busy ? "Working…" : "Send"}
-					</button>
-				</form>
-				<div className="row muted" style={{ fontSize: 11, marginTop: 6, gap: 10 }}>
-					<label className="model-picker">
-						<span>Model</span>
-						<select
-							value={provider ?? ""}
-							disabled={!catalogue}
-							onChange={(event) => setProvider(event.target.value)}
-							// Changing model mid-thread is allowed; the prior turns are
-							// replayed to whichever model answers next.
-							title={selected?.detail ?? undefined}
-						>
-							{catalogue?.providers.map((option) => (
-								<option key={option.id} value={option.id} disabled={!option.available}>
-									{option.label}
-									{!option.available ? " — unavailable" : ""}
-								</option>
-							))}
-							{catalogue && (
-								<option value="auto">
-									{catalogue.auto.label}
-									{catalogue.auto.resolvedTo ? ` — ${catalogue.auto.resolvedTo}` : ""}
-								</option>
-							)}
-						</select>
-					</label>
-					{selected && <span className="mono">{selected.model}</span>}
-					{selected?.detail && !selected.available && (
-						<span className="model-warn" title={selected.detail}>
-							⚠ {selected.detail}
-						</span>
+				)}
+
+				<div className="composer">
+					{/* About the page rather than an answer - a link to a conversation
+					    that is gone, a chip that opens nothing. Said here, where it is in
+					    view however far up the transcript the person is reading. */}
+					{pageError && (
+						<div className="banner error composer-banner composer-notice" role="alert">
+							<span>{pageError}</span>
+							<button type="button" className="link-button" onClick={() => setPageError(null)}>
+								Dismiss
+							</button>
+						</div>
 					)}
-					<span>Enter to send · Shift+Enter for a new line</span>
-					{sessionId && <span>session {sessionId}</span>}
-					{turns.length > 0 && (
-						<button
-							className="btn sm"
-							style={{ marginLeft: "auto" }}
-							onClick={() => {
-								setTurns([]);
-								setSessionId(null);
+					{creditOut && credit && (
+						<div className="banner warn composer-banner" role="status">
+							<span>
+								<strong>Your monthly AI credit is used up.</strong> {usd(credit.spentUsd)} of{" "}
+								{usd(credit.limitUsd ?? 0)} spent since {dayAndMonth(credit.periodStart)}; it renews on{" "}
+								{dayAndMonth(credit.resetsAt)}. Ask an administrator to raise your limit.
+							</span>
+						</div>
+					)}
+					<form
+						onSubmit={(event) => {
+							event.preventDefault();
+							send(draft);
+						}}
+					>
+						<textarea
+							ref={textareaRef}
+							value={draft}
+							placeholder={
+								panelOpen
+									? "Or type a different answer here."
+									: pending
+										? "Answer the question above, or ask something else."
+										: isPersonal
+										? "Ask for a chart, a KPI, a dashboard or a report — “revenue by country per month”."
+										: "Ask about the data — or ask for a dashboard."
+							}
+							onChange={(event) => setDraft(spaceSlug, event.target.value)}
+							onKeyDown={(event) => {
+								// Enter sends; Shift+Enter is a newline. Standard for a chat box, and
+								// the hint below says so.
+								if (event.key === "Enter" && !event.shiftKey) {
+									event.preventDefault();
+									send(draft);
+								}
 							}}
-						>
-							New conversation
+							rows={2}
+						/>
+						<button className="btn primary" type="submit" disabled={busy || loading || !draft.trim() || creditOut}>
+							{busy ? <span className="spinner" aria-hidden /> : <Icon name="arrowUp" size={16} />}
+							{busy ? "Working…" : "Send"}
 						</button>
-					)}
+					</form>
+					<div className="row muted composer-meta">
+						<label className="model-picker">
+							<span>Model</span>
+							<select
+								value={provider ?? ""}
+								disabled={!catalogue}
+								onChange={(event) => setProvider(event.target.value)}
+								// Changing model mid-thread is allowed; the prior turns are
+								// replayed to whichever model answers next.
+								title={selected?.detail ?? undefined}
+							>
+								{catalogue?.providers.map((option) => (
+									<option key={option.id} value={option.id} disabled={!option.available}>
+										{option.label}
+										{!option.available ? " — unavailable" : ""}
+									</option>
+								))}
+								{catalogue && (
+									<option value="auto">
+										{catalogue.auto.label}
+										{catalogue.auto.resolvedTo ? ` — ${catalogue.auto.resolvedTo}` : ""}
+									</option>
+								)}
+							</select>
+						</label>
+						{selected && <span className="mono">{selected.model}</span>}
+						{selected?.detail && !selected.available && (
+							<span className="model-warn" title={selected.detail}>
+								<Icon name="alertTriangle" size={12} /> {selected.detail}
+							</span>
+						)}
+						<span>Enter to send · Shift+Enter for a new line</span>
+						{credit && credit.limitUsd !== null && (
+							<span
+								className={`credit-pill ${creditOut ? "out" : creditShare >= 0.8 ? "low" : ""}`}
+								title={`Your monthly AI credit. It renews on ${dayAndMonth(credit.resetsAt)}.`}
+							>
+								<span className="credit-meter" aria-hidden>
+									<span style={{ width: `${Math.round(creditShare * 100)}%` }} />
+								</span>
+								{usd(credit.spentUsd)} of {usd(credit.limitUsd)} this month
+							</span>
+						)}
+					</div>
 				</div>
 			</div>
 
@@ -447,15 +702,12 @@ export function Assistant() {
 				onClose={() => setReviewFunction(null)}
 				onApproved={(fn) => {
 					// Say what changed, in the conversation where it was asked for.
-					setTurns((current) => [
-						...current,
-						{
-							role: "assistant",
-							content:
-								`**${fn.name}** is approved and active. You can use it in a dashboard now, ` +
-								`or ask me to build one with it.`,
-						},
-					]);
+					append(spaceSlug, {
+						role: "assistant",
+						content:
+							`**${fn.name}** is approved and active. You can use it in a dashboard now, ` +
+							`or ask me to build one with it.`,
+					});
 				}}
 			/>
 
@@ -476,8 +728,8 @@ export function Assistant() {
 								<h2 className="rp-title">{doc.title}</h2>
 							</div>
 							<span className="rp-rows mono">{doc.path}</span>
-							<button className="btn sm" onClick={() => setDoc(null)} aria-label="Close">
-								✕
+							<button className="icon-btn" onClick={() => setDoc(null)} aria-label="Close">
+								<Icon name="x" size={17} />
 							</button>
 						</header>
 						<div className="rp-body">
@@ -497,11 +749,109 @@ export function Assistant() {
 				</div>
 			)}
 		</div>
+		</div>
+	);
+}
+
+/** The live side of a question that is still waiting for its answer. */
+interface OpenQuestion {
+	chosen: string[];
+	/** The answer panel is showing above the message box. */
+	panelOpen: boolean;
+	onToggle: (label: string) => void;
+	onOpen: () => void;
+}
+
+/**
+ * The assistant's question, in the transcript.
+ *
+ * While the answer panel is open the card is only the question: the choices
+ * are in the panel, and listing them twice an inch apart is noise. Once the
+ * panel is put away the choices are here, and picking one reopens it with that
+ * choice ticked. Once answered, the card records what the answer was.
+ */
+function ClarificationCard({
+	clarification,
+	question,
+	answer,
+}: {
+	clarification: Clarification;
+	question: OpenQuestion | null;
+	answer: string | null;
+}) {
+	const picked = answer ? chosenIn(answer, clarification.options) : [];
+	return (
+		<div className={`clar-card ${question ? "pending" : ""}`}>
+			<div className="clar-card-head">
+				<span className="clar-mark sm" aria-hidden>
+					<Icon name={question ? "message" : "checkCircle"} size={14} />
+				</span>
+				<p className="clar-card-q">{clarification.question}</p>
+			</div>
+			{clarification.options.length > 0 && !question?.panelOpen && (
+				<div className="clar-chips">
+					{clarification.options.map((option) => {
+						if (!question) {
+							const on = picked.includes(option.label);
+							return (
+								<span key={option.label} className={`clar-chip static ${on ? "on" : ""}`} title={option.detail}>
+									{on && <Icon name="check" size={12} strokeWidth={2.6} />}
+									{option.label}
+								</span>
+							);
+						}
+						const on = question.chosen.includes(option.label);
+						return (
+							<button
+								key={option.label}
+								type="button"
+								className={`clar-chip ${on ? "on" : ""}`}
+								aria-pressed={on}
+								title={option.detail}
+								onClick={() => question.onToggle(option.label)}
+							>
+								{on && <Icon name="check" size={12} strokeWidth={2.6} />}
+								{option.label}
+							</button>
+						);
+					})}
+				</div>
+			)}
+			<div className="clar-card-foot">
+				{question ? (
+					clarification.options.length === 0 ? (
+						<span className="muted">Type your answer in the message box below.</span>
+					) : question.panelOpen ? (
+						<span className="muted">
+							{clarification.multiple
+								? "Tick one or more in the panel below, then press Submit answer."
+								: "Pick one in the panel below, then press Submit answer."}
+						</span>
+					) : (
+						<>
+							<span className="muted">Waiting for your answer.</span>
+							<button type="button" className="btn sm primary" onClick={question.onOpen}>
+								Answer
+								<Icon name="arrowRight" size={13} />
+							</button>
+						</>
+					)
+				) : answer ? (
+					<span className="muted clar-answered">
+						You answered: <strong>{answer.split("\n\n")[0]}</strong>
+					</span>
+				) : (
+					<span className="muted">Not answered.</span>
+				)}
+			</div>
+		</div>
 	);
 }
 
 function TurnView({
 	turn,
+	question,
+	answer,
 	onResource,
 	onCitation,
 	onAnswer,
@@ -509,11 +859,15 @@ function TurnView({
 	onApproved,
 }: {
 	turn: Turn;
+	/** Set while this turn's question is the one waiting for an answer. */
+	question: OpenQuestion | null;
+	/** What was said next, when this turn asked a question. */
+	answer: string | null;
 	/** Opens the workspace resource a :resource[...] chip names. */
 	onResource: (kind: string, ref: string) => void;
 	/** Opens the document a :citation[...] marker refers to. */
 	onCitation: (path: string, section: string) => void;
-	/** Sends the user's pick when the assistant asked for clarification. */
+	/** Sends a suggested follow-up as the person's next message. */
 	onAnswer: (answer: string) => void;
 	/** Opens the review dialog for a metric the assistant drafted. */
 	onReviewFunction?: (apiName: string) => void;
@@ -521,18 +875,20 @@ function TurnView({
 	onApproved?: (settled: ProposalRecord[]) => void;
 }) {
 	// A clarification arrives as an artifact rather than prose, so the options
-	// stay structured instead of being parsed back out of a sentence.
-	const clarification = turn.artifacts?.find(
-		(artifact) => artifact.kind === "clarification",
-	) as
-		| { question?: string; options?: Array<{ label: string; detail?: string }>; allowFreeText?: boolean }
-		| undefined;
+	// stay structured instead of being parsed back out of a sentence. Whatever
+	// the assistant had to say before asking stays above the question.
+	const raw = turn.artifacts?.find((artifact) => artifact.kind === "clarification");
+	const clarification = asClarification(raw);
+	const prose = replyProse(turn.content, clarification, raw?.inferred === true);
 	const [showTools, setShowTools] = useState(false);
 
 	if (turn.role === "user") {
 		return (
 			<div className="msg">
-				<div className="avatar">You</div>
+				<div className="avatar">
+					<Icon name="user" size={15} />
+					<span className="sr-only">You</span>
+				</div>
 				<div className="body">
 					<p style={{ margin: 0 }}>{turn.content}</p>
 				</div>
@@ -542,36 +898,14 @@ function TurnView({
 
 	return (
 		<div className="msg assistant">
-			<div className="avatar">AI</div>
+			<div className="avatar">
+				<Icon name="sparkles" size={16} />
+				<span className="sr-only">AI</span>
+			</div>
 			<div className="body">
-				{clarification ? (
-					/* The assistant asked rather than guessed. Its options are the
-					   answer, so they are buttons: picking one is far less work than
-					   retyping the question's terms. */
-					<div className="clarify">
-						<p className="clarify-q">{String(clarification.question ?? turn.content)}</p>
-						<div className="clarify-options">
-							{(clarification.options as Array<{ label: string; detail?: string }>).map(
-								(option) => (
-									<button
-										key={option.label}
-										className="clarify-option"
-										onClick={() => onAnswer(option.label)}
-									>
-										<span className="clarify-label">{option.label}</span>
-										{option.detail && <span className="muted">{option.detail}</span>}
-									</button>
-								),
-							)}
-						</div>
-						{clarification.allowFreeText !== false && (
-							<p className="muted clarify-hint">
-								Or answer in your own words below.
-							</p>
-						)}
-					</div>
-				) : (
-					<Markdown text={turn.content} onResource={onResource} onCitation={onCitation} />
+				{prose && <Markdown text={prose} onResource={onResource} onCitation={onCitation} />}
+				{clarification && (clarification.question || clarification.options.length > 0) && (
+					<ClarificationCard clarification={clarification} question={question} answer={answer} />
 				)}
 
 				{turn.artifacts && turn.artifacts.length > 0 && (
@@ -632,19 +966,25 @@ function TurnView({
 
 				{turn.meta && (
 					<div className="muted" style={{ fontSize: 11, marginTop: 7 }}>
-						{turn.meta.rounds} round{turn.meta.rounds === 1 ? "" : "s"} ·{" "}
-						{(turn.meta.latencyMs / 1000).toFixed(1)}s · {turn.meta.model}
-						{turn.meta.agentMode && ` · mode: ${turn.meta.agentMode}`}
-						{turn.meta.stoppedBecause !== "answered" && ` · ${turn.meta.stoppedBecause}`}
-						{/* Tokens and cost per turn, so the price of a question is visible
-						    where the question was asked rather than only in a report.
-						    A turn on an unpriced provider says so instead of showing $0. */}
-						{turn.meta.tokens ? ` · ${turn.meta.tokens.toLocaleString("en-US")} tokens` : ""}
-						{turn.meta.priced === false
-							? " · unpriced model"
-							: turn.meta.costUsd !== undefined
-								? ` · $${turn.meta.costUsd < 0.01 ? turn.meta.costUsd.toFixed(6) : turn.meta.costUsd.toFixed(4)}`
-								: ""}
+						{/* A turn read back from the server no longer knows its rounds or
+						    mode; what it does know is still shown. Tokens and cost are per
+						    turn, so the price of a question is visible where it was asked,
+						    and a turn on an unpriced provider says so instead of showing $0. */}
+						{[
+							turn.meta.rounds !== undefined ? `${turn.meta.rounds} round${turn.meta.rounds === 1 ? "" : "s"}` : null,
+							`${(turn.meta.latencyMs / 1000).toFixed(1)}s`,
+							turn.meta.model || null,
+							turn.meta.agentMode ? `mode: ${turn.meta.agentMode}` : null,
+							turn.meta.stoppedBecause !== "answered" ? turn.meta.stoppedBecause : null,
+							turn.meta.tokens ? `${turn.meta.tokens.toLocaleString("en-US")} tokens` : null,
+							turn.meta.priced === false
+								? "unpriced model"
+								: turn.meta.costUsd !== undefined
+									? `$${turn.meta.costUsd < 0.01 ? turn.meta.costUsd.toFixed(6) : turn.meta.costUsd.toFixed(4)}`
+									: null,
+						]
+							.filter(Boolean)
+							.join(" · ")}
 					</div>
 				)}
 			</div>
@@ -676,7 +1016,7 @@ function ChangesCard({
 }) {
 	if (changes.length === 0) return null;
 	return (
-		<div className="card" style={{ background: "var(--surface-2)" }}>
+		<div className="card">
 			<div className="card-head">
 				<h3>Built in this turn</h3>
 				<span className="sub">{changes.length} change{changes.length === 1 ? "" : "s"}</span>
@@ -838,7 +1178,7 @@ function ArtifactView({
 			<div className="card fn-proposal-card">
 				<div className="row" style={{ gap: 8, alignItems: "flex-start" }}>
 					<span className="rp-glyph" aria-hidden>
-						ƒ
+						<Icon name="fn" size={18} />
 					</span>
 					<div style={{ minWidth: 0, flex: "1 1 auto" }}>
 						<div className="row" style={{ gap: 6 }}>
@@ -870,7 +1210,7 @@ function ArtifactView({
 		return (
 			<Link className="board-artifact" to={`/dashboards/${String(artifact.slug)}`}>
 				<span className={`board-kind ${report ? "report" : ""}`} aria-hidden>
-					{report ? "▤" : "▦"}
+					<Icon name={report ? "fileText" : "dashboard"} size={17} />
 				</span>
 				<span className="board-artifact-text">
 					<strong>{String(artifact.title)}</strong>
@@ -878,7 +1218,10 @@ function ArtifactView({
 						{report ? "Report" : "Dashboard"} · {String(artifact.widgets)} widgets
 					</span>
 				</span>
-				<span className="btn sm primary">Open {report ? "report" : "dashboard"}</span>
+				<span className="btn sm primary">
+					Open {report ? "report" : "dashboard"}
+					<Icon name="arrowRight" size={13} />
+				</span>
 			</Link>
 		);
 	}
@@ -888,7 +1231,7 @@ function ArtifactView({
 		const grain = (artifact.dimensionGrain as string | null) ?? grainOf(artifact.dimension as string | null);
 		const formatLabel = grain ? (label: string) => formatPeriod(label, grain) : undefined;
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card">
 				<div className="card-head">
 					<h3>{String(artifact.title ?? artifact.kpi)}</h3>
 					{artifact.total !== null && artifact.total !== undefined && (
@@ -932,7 +1275,7 @@ function ArtifactView({
 			.filter((key) => !key.endsWith("__display") && !key.startsWith("_"))
 			.slice(0, 7);
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card">
 				<div className="card-head">
 					<h3>{String(artifact.title)}</h3>
 					{artifact.rowsTotal !== undefined && (
@@ -949,7 +1292,7 @@ function ArtifactView({
 	if (artifact.kind === "action") {
 		const result = (artifact.result as Record<string, unknown>) ?? {};
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card">
 				<div className="card-head">
 					<h3>{String(artifact.action)}</h3>
 					<span className="chip">{String(artifact.status)}</span>
@@ -990,7 +1333,7 @@ function ArtifactView({
 			skipped: "◌",
 		};
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card">
 				<div className="card-head">
 					<h3>Plan · {plan.title}</h3>
 					<span className="rp-rows mono" style={{ marginLeft: "auto" }}>
@@ -1018,7 +1361,7 @@ function ArtifactView({
 		const todos = artifact.todos as Array<{ text: string; status: string }>;
 		if (!todos.length) return null;
 		return (
-			<div className="card" style={{ background: "var(--surface-2)" }}>
+			<div className="card">
 				<div className="card-head">
 					<h3>Follow-ups</h3>
 				</div>

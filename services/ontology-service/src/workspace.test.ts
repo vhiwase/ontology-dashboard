@@ -7,7 +7,7 @@
  * All pure: nothing here touches the database.
  */
 
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 // auth.ts reads its signing secret when it is imported, so the secret has to
 // exist before the imports below run.
@@ -19,10 +19,13 @@ import { isLinkLocal, isLoopback, isPrivateAddress } from "./connectionPolicy";
 import { assertDerivedName, compileExpression } from "./derived";
 import { asksAboutPunctuality, detectIntent, parseQuestion, sliceName, tokens, widgetTitle } from "./feasibility";
 import { defaultSlice } from "./modeling";
-import { humanize, inferRoles, plural, singular, typeApiName, type ColumnInfo, type ColumnStats } from "./profiling";
+import { humanize, inferRoles, kindOf, plural, rangeOperand, singular, typeApiName, type ColumnInfo, type ColumnStats } from "./profiling";
 import { derivedMetric, parseFollowUp } from "./proposals";
 import type { KpiMeta } from "./registry";
-import { __testing as vaultTesting, decrypt, encrypt, isVaultRef } from "./vault";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { __testing as vaultTesting, decrypt, encrypt, isVaultRef, VaultUnavailable, vaultStatus } from "./vault";
 
 // ── profiling: what each column of a table is for ───────────────────────────
 
@@ -38,6 +41,23 @@ function column(name: string, dataType: string, stats: Partial<ColumnStats> = {}
 		...stats,
 	} as ColumnInfo & ColumnStats;
 }
+
+describe("the range of a column", () => {
+	it("compares a uuid as text, which has a min() where uuid has none", () => {
+		// PostgreSQL before 18: "function min(uuid) does not exist". A uuid key
+		// in any chosen table failed the import of all of them.
+		expect(kindOf("uuid", "uuid")).toBe("text");
+		expect(rangeOperand(kindOf("uuid", "uuid"), '"id"')).toBe('"id"::text');
+		expect(rangeOperand(kindOf("character varying", "varchar"), '"name"')).toBe('"name"::text');
+	});
+
+	it("leaves numbers and dates in their own ordering", () => {
+		expect(rangeOperand(kindOf("integer", "int4"), '"qty"')).toBe('"qty"');
+		expect(rangeOperand(kindOf("numeric", "numeric"), '"price"')).toBe('"price"');
+		expect(rangeOperand(kindOf("date", "date"), '"day"')).toBe('"day"');
+		expect(rangeOperand(kindOf("timestamp with time zone", "timestamptz"), '"at"')).toBe('"at"');
+	});
+});
 
 describe("inferRoles", () => {
 	const roles = (columns: Array<ColumnInfo & ColumnStats>, foreignKeys: string[] = [], primaryKey: string[] | null = ["id"]) =>
@@ -321,6 +341,74 @@ describe("vault", () => {
 		expect(isVaultRef("vault:12")).toBe(true);
 		expect(isVaultRef("env:DATABASE_URL")).toBe(false);
 		expect(isVaultRef(null)).toBe(false);
+	});
+});
+
+// A key that cannot be read used to surface as "Internal server error" the
+// first time someone typed a password into the connect form - with the
+// container reporting healthy all along.
+describe("vault with no usable key", () => {
+	const scratch = mkdtempSync(join(tmpdir(), "vault-key-"));
+	const before = { file: process.env.CREDENTIAL_KEY_FILE, key: process.env.CREDENTIAL_KEY };
+
+	const withKeyFile = (path: string) => {
+		process.env.CREDENTIAL_KEY_FILE = path;
+		vaultTesting.resetKey();
+	};
+
+	afterAll(() => {
+		if (before.file === undefined) delete process.env.CREDENTIAL_KEY_FILE;
+		else process.env.CREDENTIAL_KEY_FILE = before.file;
+		if (before.key === undefined) delete process.env.CREDENTIAL_KEY;
+		else process.env.CREDENTIAL_KEY = before.key;
+		vaultTesting.resetKey();
+		rmSync(scratch, { recursive: true, force: true });
+	});
+
+	// What Docker leaves at a secret's path when it is mounted before the file exists.
+	it("says a directory where the key file should be is a directory", () => {
+		withKeyFile(scratch);
+		const status = vaultStatus();
+		expect(status.usable).toBe(false);
+		expect(status.usable === false && status.reason).toMatch(/is a directory, not a file.*init-secrets\.sh/s);
+	});
+
+	it("refuses to seal anything, in words the person at the form can act on", () => {
+		withKeyFile(scratch);
+		let caught: unknown;
+		try {
+			encrypt("s3cret-password");
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(VaultUnavailable);
+		const refusal = caught as VaultUnavailable;
+		expect(refusal.status).toBe(503);
+		expect(refusal.expose).toBe(true);
+		expect(refusal.message).toMatch(/credential key is not set up/);
+		// The caller is not told where the server keeps its secrets; the log is.
+		expect(refusal.message).not.toContain(scratch);
+		expect(refusal.reason).toContain(scratch);
+	});
+
+	it("says a missing file is missing and an empty one is empty", () => {
+		withKeyFile(join(scratch, "not-there"));
+		const missing = vaultStatus();
+		expect(missing.usable === false && missing.reason).toMatch(/does not exist/);
+
+		const empty = join(scratch, "empty");
+		writeFileSync(empty, "\n");
+		withKeyFile(empty);
+		const blank = vaultStatus();
+		expect(blank.usable === false && blank.reason).toMatch(/is empty/);
+	});
+
+	it("works again once the file holds a key, and says it is its own", () => {
+		const good = join(scratch, "key");
+		writeFileSync(good, "ab".repeat(32));
+		withKeyFile(good);
+		expect(vaultStatus()).toEqual({ usable: true, derived: false });
+		expect(decrypt(encrypt("s3cret-password"))).toBe("s3cret-password");
 	});
 });
 

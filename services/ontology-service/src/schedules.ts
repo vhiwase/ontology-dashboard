@@ -11,7 +11,7 @@
  * so a scheduled run is the same work as a manual one and lands in the same run
  * history. The scheduler adds only the trigger, never a second way to execute.
  *
- * Two properties the implementation is built around:
+ * Three properties the implementation is built around:
  *
  *  - THE CLAIM IS THE FIRE. next_run_at is moved forward inside the same
  *    UPDATE that records the firing, so two ticks can never double-run one
@@ -19,6 +19,12 @@
  *  - A FAILED SCHEDULE IS A RECORD, NOT AN EXCEPTION. The loop never throws;
  *    a failing sync writes a failed schedule_run and updates the schedule's
  *    last_status/last_error, and the cadence continues.
+ *  - A SCHEDULE KEEPS ITS RHYTHM. A cadence may be given a first run - "every
+ *    day, starting 02:00 on the 6th" - and every run after it lands on that
+ *    same grid: the next run is counted from the previous due time, not from
+ *    whenever the tick got round to it, so "02:00" is still 02:00 a month on.
+ *    Intervals are whole seconds, so a daily schedule moves by the hour where
+ *    the clocks change.
  */
 
 import { query, queryOne } from "./db";
@@ -29,6 +35,8 @@ import { getSync, runSync } from "./connections";
 const MIN_INTERVAL_SECONDS = 60;
 /** A year. Anything longer is not a schedule anyone is waiting on. */
 const MAX_INTERVAL_SECONDS = 366 * 24 * 3600;
+/** How far ahead a first run may be set: the same year. */
+const MAX_START_AHEAD_MS = MAX_INTERVAL_SECONDS * 1000;
 
 export interface ScheduleRecord {
 	scheduleId: number;
@@ -147,6 +155,54 @@ export function parseIntervalSeconds(raw: unknown): number {
 	return seconds;
 }
 
+/**
+ * When a schedule's first run should be, from what the request carries: an
+ * ISO date-time, or nothing (null), which means one interval from now.
+ *
+ * A time already past is accepted - the schedule then starts at the next
+ * moment on the same rhythm - but one that is not a date, or is further off
+ * than a year, is refused rather than guessed at.
+ *
+ * Exported for the tests.
+ */
+export function parseStartAt(raw: unknown, now: Date = new Date()): Date | null {
+	if (raw === undefined || raw === null || raw === "") return null;
+	if (typeof raw !== "string" && !(raw instanceof Date)) {
+		throw new BadRequest("startAt must be a date and time, written as ISO 8601: 2026-10-06T02:00:00+05:30.");
+	}
+	const text = raw instanceof Date ? raw.toISOString() : raw.trim();
+	// A bare date has no time zone to read it in, and "tomorrow" is not a date
+	// at all; both would land on a moment nobody chose.
+	if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/.test(text)) {
+		throw new BadRequest(
+			`'${text}' is not a date and time with its time zone. Write it as 2026-10-06T02:00:00+05:30 or 2026-10-05T20:30:00Z.`,
+		);
+	}
+	const start = new Date(text);
+	if (Number.isNaN(start.getTime())) throw new BadRequest(`'${text}' is not a real date and time.`);
+	if (start.getTime() - now.getTime() > MAX_START_AHEAD_MS) {
+		throw new BadRequest("A schedule's first run must be within a year from now.");
+	}
+	if (now.getTime() - start.getTime() > MAX_START_AHEAD_MS) {
+		throw new BadRequest("A schedule's first run cannot be more than a year in the past.");
+	}
+	return start;
+}
+
+/**
+ * `start` while it is still ahead; after that, the first moment later than
+ * `now` on the grid `start + n * interval`.
+ *
+ * The same rule the database applies (see onGridSql); kept here as well so the
+ * rule itself can be tested without one.
+ */
+export function nextOnGrid(start: Date, intervalSeconds: number, now: Date): Date {
+	if (start.getTime() > now.getTime()) return start;
+	const step = intervalSeconds * 1000;
+	const elapsed = Math.floor((now.getTime() - start.getTime()) / step) + 1;
+	return new Date(start.getTime() + elapsed * step);
+}
+
 /** 7200 -> "every 2 hours"; 691200 -> "every 8 days". */
 export function describeInterval(seconds: number): string {
 	const units: Array<[number, string]> = [
@@ -194,6 +250,24 @@ function nextRunSql(column = "$3"): string {
 	return `now() + make_interval(secs => ${column}::int)`;
 }
 
+/**
+ * The next due moment on a schedule's own rhythm: `anchor` if it is still
+ * ahead, otherwise the first moment after now() that is a whole number of
+ * intervals past it. `anchor` and `seconds` are SQL expressions - a bound
+ * parameter or a column - never request text.
+ *
+ * Counted from the anchor rather than from now(), so the tick's own latency
+ * does not accumulate into the schedule, and a run that was missed while the
+ * service was down is followed by the next one at its usual time rather than
+ * a full interval after the catch-up.
+ */
+function onGridSql(anchor: string, seconds: string): string {
+	return `CASE WHEN ${anchor} > now() THEN ${anchor}
+	             ELSE ${anchor} + make_interval(secs =>
+	                    (floor(extract(epoch FROM (now() - ${anchor})) / ${seconds}::int) + 1) * ${seconds}::int)
+	        END`;
+}
+
 export async function listSchedules(spaceSlug?: string): Promise<ScheduleRecord[]> {
 	const rows = await query<ScheduleRow>(
 		`${SELECT_SCHEDULES} WHERE ($1::text IS NULL OR sp.slug = $1) ORDER BY s.name`,
@@ -214,7 +288,9 @@ export async function getSchedule(scheduleId: number, spaceSlug?: string): Promi
 // ── writes ──────────────────────────────────────────────────────────────────
 
 /**
- * Create a schedule for a sync. `every` ("2h") or `intervalSeconds` (7200).
+ * Create a schedule for a sync. `every` ("2h") or `intervalSeconds` (7200),
+ * and optionally `startAt`, the date and time of its first run; without one
+ * it first runs an interval from now.
  * A sync that already has one is refused: change that one instead.
  */
 export async function createSchedule(
@@ -226,6 +302,7 @@ export async function createSchedule(
 	if (!targetRef) throw new BadRequest("A schedule needs the id of the sync it runs.");
 	const target = await assertSyncTarget(targetRef, spaceSlug);
 	const seconds = parseIntervalSeconds(body.every ?? body.intervalSeconds);
+	const startAt = parseStartAt(body.startAt);
 	const name = String(body.name ?? "").trim() || `${target.name} ${describeInterval(seconds)}`;
 
 	const existing = await queryOne<{ schedule_id: number }>(
@@ -243,10 +320,12 @@ export async function createSchedule(
 	const row = await queryOne<ScheduleRow>(
 		`INSERT INTO platform.schedule
 		        (space_id, name, kind, target_ref, interval_seconds, created_by, next_run_at)
-		 SELECT sp.space_id, $2, 'sync', $3, $4, $5, now() + make_interval(secs => $4::int)
+		 SELECT sp.space_id, $2, 'sync', $3, $4, $5,
+		        CASE WHEN $6::timestamptz IS NULL THEN now() + make_interval(secs => $4::int)
+		             ELSE ${onGridSql("$6::timestamptz", "$4")} END
 		   FROM platform.space sp WHERE sp.slug = $1
 		 RETURNING *`,
-		[spaceSlug, name, targetRef, seconds, createdBy],
+		[spaceSlug, name, targetRef, seconds, createdBy, startAt],
 	);
 	if (!row) throw new NotFound(`No space '${spaceSlug}'.`);
 	return toRecord({ ...row, space_slug: spaceSlug } as ScheduleRow);
@@ -267,24 +346,41 @@ export async function updateSchedule(
 		values.push(name);
 		sets.push(`name = $${values.length}`);
 	}
+	// next_run_at is decided once, from whichever of these the request carries.
+	// It used to be assigned by the cadence and again by `enabled`, and changing
+	// the cadence of an existing schedule sends both - which PostgreSQL refuses
+	// ("multiple assignments to same column"), so that change always failed.
+	let nextRun: string | null = null;
+	const startAt = parseStartAt(body.startAt);
 	if (body.every !== undefined || body.intervalSeconds !== undefined) {
 		values.push(parseIntervalSeconds(body.every ?? body.intervalSeconds));
-		sets.push(`interval_seconds = $${values.length}`);
-		// A new cadence re-anchors the next run from now, not from the old
-		// schedule's drift.
-		sets.push(`next_run_at = ${nextRunSql(`$${values.length}`)}`);
+		const seconds = `$${values.length}`;
+		sets.push(`interval_seconds = ${seconds}`);
+		if (startAt) {
+			// A cadence with a first run: the rhythm starts there.
+			values.push(startAt);
+			nextRun = onGridSql(`$${values.length}::timestamptz`, seconds);
+		} else {
+			// A new cadence re-anchors the next run from now, not from the old
+			// schedule's rhythm.
+			nextRun = nextRunSql(seconds);
+		}
+	} else if (startAt) {
+		// Only the first run moves; the interval stays what it was.
+		values.push(startAt);
+		nextRun = onGridSql(`$${values.length}::timestamptz`, "interval_seconds");
 	}
 	if (body.enabled !== undefined) {
 		values.push(Boolean(body.enabled));
 		sets.push(`enabled = $${values.length}`);
-		// Re-enabling fires on the cadence from now, not retroactively.
-		sets.push(
-			`next_run_at = CASE WHEN $${values.length} AND next_run_at IS NULL
+		// Re-enabling fires on the cadence from now, not retroactively - unless
+		// the same request already said when the next run is.
+		nextRun ??= `CASE WHEN $${values.length} AND next_run_at IS NULL
 			 THEN now() + make_interval(secs => interval_seconds::int)
-			 ELSE next_run_at END`,
-		);
+			 ELSE next_run_at END`;
 	}
-	if (!sets.length) throw new BadRequest("Nothing to update: pass name, every or enabled.");
+	if (nextRun) sets.push(`next_run_at = ${nextRun}`);
+	if (!sets.length) throw new BadRequest("Nothing to update: pass name, every, startAt or enabled.");
 
 	const row = await queryOne<ScheduleRow>(
 		`UPDATE platform.schedule s SET ${sets.join(", ")}
@@ -303,14 +399,17 @@ export async function deleteSchedule(scheduleId: number, spaceSlug?: string): Pr
 
 /**
  * Set how often a sync runs, in one call: `every` creates or changes its
- * schedule, and "manual" (or null) removes it. What the sync panel and the
- * assistant use, so neither has to know whether a schedule exists yet.
+ * schedule, and "manual" (or null) removes it. `startAt`, when given, is the
+ * date and time of the first run; the runs after it keep that rhythm. What
+ * the sync panel and the assistant use, so neither has to know whether a
+ * schedule exists yet.
  */
 export async function setSyncSchedule(
 	syncId: number,
 	every: unknown,
 	actor: string,
 	spaceSlug = currentSpace(),
+	startAt: unknown = null,
 ): Promise<ScheduleRecord | null> {
 	const sync = await getSync(syncId);
 	await assertSyncTarget(String(syncId), spaceSlug);
@@ -321,9 +420,9 @@ export async function setSyncSchedule(
 		return null;
 	}
 	if (sync.schedule) {
-		return updateSchedule(sync.schedule.id, { every, enabled: true }, spaceSlug);
+		return updateSchedule(sync.schedule.id, { every, enabled: true, startAt }, spaceSlug);
 	}
-	return createSchedule({ targetRef: String(syncId), every }, actor, spaceSlug);
+	return createSchedule({ targetRef: String(syncId), every, startAt }, actor, spaceSlug);
 }
 
 export async function listScheduleRuns(scheduleId: number, limit = 25): Promise<unknown[]> {
@@ -363,11 +462,16 @@ async function dueSchedules(): Promise<ScheduleRecord[]> {
  * Move next_run_at forward and count the firing in one statement. Returns
  * false when the schedule was disabled or claimed between the SELECT and this
  * UPDATE - in which case this tick does not run it.
+ *
+ * Forward along the schedule's own rhythm: the next moment after now() that is
+ * a whole number of intervals past the time this run was due. Moving it
+ * "an interval from now" instead would push every run later by however long
+ * the tick took to reach it, and a daily 02:00 would creep through the night.
  */
 async function claimSchedule(scheduleId: number): Promise<boolean> {
 	const row = await queryOne<{ schedule_id: number }>(
 		`UPDATE platform.schedule
-		    SET next_run_at = ${nextRunSql("interval_seconds::int")},
+		    SET next_run_at = ${onGridSql("next_run_at", "interval_seconds")},
 		        last_run_at = now(),
 		        run_count = run_count + 1
 		  WHERE schedule_id = $1 AND enabled AND next_run_at <= now()

@@ -5,7 +5,16 @@
 #  Run once before the first `docker compose up`. It is idempotent: an existing
 #  file is left alone, so re-running it never rotates a secret out from under a
 #  running stack. Pass --force to regenerate (which invalidates every issued
-#  token and, for the database password, requires a `down -v`).
+#  token, makes every stored connection password unreadable and, for the
+#  database password, requires a `down -v`).
+#
+#  Run it again after pulling a version that adds a secret. A stack started
+#  before a secret's file exists gets an empty DIRECTORY at that path from
+#  Docker, and the service cannot read its key; this replaces such a directory
+#  with the file. The containers then have to be RECREATED, not restarted
+#  (`docker compose up -d --force-recreate`): one that started with the
+#  directory mounted cannot start again now the path is a file, and for as long
+#  as it keeps running Docker shows the directory to every new container too.
 #
 #      ./scripts/init-secrets.sh
 #
@@ -21,10 +30,32 @@ FORCE=0
 mkdir -p "$SECRETS_DIR"
 chmod 700 "$SECRETS_DIR"
 
+# Docker creates a DIRECTORY at a secret's path when the stack is started
+# before the file exists, and the service that mounts it then cannot read its
+# key. An empty directory there is that leftover - never a secret - so it is
+# replaced by the file. One with something in it is not this script's to remove.
+clear_stray_directory() {
+    local path=$1
+    [ -d "$path" ] || return 0
+    if [ -n "$(ls -A "$path" 2>/dev/null)" ]; then
+        echo "  ! $path is a directory with files in it. Move it away and run this again." >&2
+        exit 1
+    fi
+    if ! rmdir "$path" 2>/dev/null; then
+        echo "  ! $path is an empty directory that could not be removed (a running container" >&2
+        echo "    may be holding it). Run 'docker compose stop' and run this again." >&2
+        exit 1
+    fi
+    echo "  - $(basename "$path") was an empty directory left by Docker; writing the file in its place"
+    REPLACED_STRAY=1
+}
+REPLACED_STRAY=0
+
 write_secret() {
     local name=$1 value=$2 description=$3
     local path="$SECRETS_DIR/$name"
 
+    clear_stray_directory "$path"
     if [ -s "$path" ] && [ "$FORCE" -eq 0 ]; then
         echo "  = $name already exists, left alone"
         return
@@ -71,6 +102,7 @@ AZURE_KEY=""
 if [ -f .env ]; then
     AZURE_KEY=$(grep -E '^AZURE_OPENAI_KEY=' .env | head -1 | cut -d= -f2- || true)
 fi
+clear_stray_directory "$SECRETS_DIR/azure_openai_key"
 if [ -s "$SECRETS_DIR/azure_openai_key" ] && [ "$FORCE" -eq 0 ]; then
     echo "  = azure_openai_key already exists, left alone"
 else
@@ -90,6 +122,15 @@ fi
 write_secret credential_key "$(openssl rand -hex 32)" "AES-256 key for stored connection passwords"
 
 echo
+if [ "$REPLACED_STRAY" -eq 1 ]; then
+    # Said instead of the first-run steps: this stack has run before.
+    echo "Done. A secret that was a directory is a file now. A container that"
+    echo "started with the directory mounted cannot be restarted with the file in"
+    echo "its place, and while it runs Docker shows new containers the directory"
+    echo "too - so recreate them:"
+    echo "  docker compose up -d --build --force-recreate"
+    exit 0
+fi
 echo "Done. Next:"
 echo "  1. Set BOOTSTRAP_ADMIN_PASSWORD in .env (at least 12 characters)."
 echo "  2. docker compose up -d --build"

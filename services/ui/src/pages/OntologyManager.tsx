@@ -5,6 +5,9 @@
  * what decides what may be summed and grouped, and everything downstream depends on it.
  * The links table shows the match ratio and how each link was discovered, so a
  * partial join is visibly partial rather than looking like a clean arrow.
+ *
+ * A type, a link and an action can each be deleted from here. Deleting a type
+ * names the metrics, links and actions built on it first, since they go too.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -30,8 +33,17 @@ import {
 	Empty,
 	ErrorBanner,
 	NoOntologyHere,
+	PageLoader,
 	Spinner,
 } from "../components/common";
+import {
+	DeleteButton,
+	DeleteDialog,
+	type RemovableKind,
+	deletedNotice,
+	useCanDelete,
+} from "../components/DeleteDialog";
+import { Icon } from "../components/icons";
 
 type Tab = "properties" | "links" | "actions" | "raw";
 
@@ -54,8 +66,12 @@ export function OntologyManager() {
 	const [filter, setFilter] = useState("");
 	const [error, setError] = useState<string | null>(null);
 	const [missing, setMissing] = useState(false);
-	const { spaceSlug, space } = useSpace();
+	const { spaceSlug, space, reload } = useSpace();
 	const [editing, setEditing] = useState(false);
+	// What is being deleted: the type on screen, a link, or one of its actions.
+	const [removing, setRemoving] = useState<{ kind: RemovableKind; target: string; label: string } | null>(null);
+	const [notice, setNotice] = useState<string | null>(null);
+	const canDelete = useCanDelete();
 	const [drawingLink, setDrawingLink] = useState(false);
 	const [edits, setEdits] = useState<OntologyEdit[]>([]);
 	const [undoing, setUndoing] = useState<number | null>(null);
@@ -142,19 +158,55 @@ export function OntologyManager() {
 		return [...buckets.entries()];
 	}, [types, filter]);
 
+	/**
+	 * Reload after a delete. The type on screen may be the one that went, so
+	 * the list is read first and the selection moved to something that exists
+	 * before its detail is asked for.
+	 */
+	const reloadAfterDelete = async (goneType: string | null) => {
+		const [typeRows, linkRows, journal] = await Promise.all([
+			api.get<ObjectTypeSummary[]>("/api/object-types"),
+			api.get<LinkTypeRow[]>("/api/link-types"),
+			api.get<OntologyEdit[]>("/api/ontology/edits").catch(() => [] as OntologyEdit[]),
+		]);
+		setTypes(typeRows);
+		setAllLinks(linkRows);
+		setEdits(journal);
+		if (goneType !== null && goneType === selected) {
+			setDetail(null);
+			setSelected(typeRows[0]?.apiName ?? null);
+		} else if (selected) {
+			setDetail(await api.get<ObjectTypeDetail>(`/api/object-types/${selected}`));
+		}
+		// The counts in the navigation, and the lists other pages keep.
+		reload();
+	};
+
 	if (missing)
 		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
 	if (error) return <ErrorBanner error={error} />;
-	if (!types) return <Spinner label="Loading ontology" />;
-	if (types.length === 0) return <NoObjectTypesYet />;
+	if (!types) return <PageLoader label="Loading ontology" />;
+	if (types.length === 0)
+		return (
+			<>
+				{notice && (
+					<p className="rb-notice" role="status">
+						{notice}
+					</p>
+				)}
+				<NoObjectTypesYet />
+			</>
+		);
 
 	return (
 		<div className="split">
 			<div className="card" style={{ padding: 10 }}>
 				<Link className="btn sm" to="/browse/datasets" style={{ width: "100%", marginBottom: 8 }}>
+					<Icon name="plus" size={13} />
 					New object type from a dataset
 				</Link>
 				<input
+					className="search-field"
 					placeholder="Filter object types"
 					value={filter}
 					onChange={(event) => setFilter(event.target.value)}
@@ -193,6 +245,11 @@ export function OntologyManager() {
 			</div>
 
 			<div className="col" style={{ minWidth: 0 }}>
+				{notice && (
+					<p className="rb-notice" role="status">
+						{notice}
+					</p>
+				)}
 				{!detail ? (
 					<Spinner label="Loading object type" />
 				) : (
@@ -206,9 +263,16 @@ export function OntologyManager() {
 									className="btn sm"
 									style={{ marginLeft: "auto" }}
 									onClick={() => setEditing(true)}
-								>
-									Edit
-								</button>
+									>
+										<Icon name="pencil" size={13} />
+										Edit
+									</button>
+								{canDelete && (
+									<DeleteButton
+										title={`Delete the object type ${detail.label}`}
+										onClick={() => setRemoving({ kind: "objectType", target: detail.apiName, label: detail.label })}
+									/>
+								)}
 							</div>
 							<p className="secondary" style={{ margin: "0 0 10px" }}>
 								{detail.description}
@@ -225,22 +289,25 @@ export function OntologyManager() {
 							</dl>
 						</div>
 
-						<div className="row" style={{ gap: 4 }}>
+						<div className="tabs" role="tablist" aria-label="Object type detail">
 							{(["properties", "links", "actions", "raw"] as Tab[]).map((name) => (
 								<button
 									key={name}
-									className={`btn sm ${tab === name ? "primary" : ""}`}
+									role="tab"
+									aria-selected={tab === name}
+									className={tab === name ? "active" : ""}
 									onClick={() => setTab(name)}
 								>
-									{name === "raw"
-										? "JSON"
-										: `${name[0]!.toUpperCase()}${name.slice(1)} (${
-												name === "properties"
-													? detail.properties.length
-													: name === "links"
-														? detail.links.length
-														: detail.actions.length
-											})`}
+									{name === "raw" ? "JSON" : `${name[0]!.toUpperCase()}${name.slice(1)}`}
+									{name !== "raw" && (
+										<span className="tab-count">
+											{name === "properties"
+												? detail.properties.length
+												: name === "links"
+													? detail.links.length
+													: detail.actions.length}
+										</span>
+									)}
 								</button>
 							))}
 						</div>
@@ -296,14 +363,7 @@ export function OntologyManager() {
 								) : (
 									<div className="col" style={{ gap: 10 }}>
 										{detail.actions.map((action) => (
-											<div
-												key={action.apiName}
-												style={{
-													border: "1px solid var(--border)",
-													borderRadius: "var(--radius)",
-													padding: "10px 12px",
-												}}
-											>
+											<div key={action.apiName} className="action-card">
 												<div className="row" style={{ gap: 7 }}>
 													<strong>{action.label}</strong>
 													<span className={`chip ${action.isReadOnly ? "good" : "warning"}`}>
@@ -311,6 +371,15 @@ export function OntologyManager() {
 														{action.isReadOnly ? "read-only" : "mutating"}
 													</span>
 													{action.requiresApproval && <span className="chip">needs approval</span>}
+													{canDelete && (
+														<span style={{ marginLeft: "auto" }}>
+															<DeleteButton
+																iconOnly
+																title={`Delete the action ${action.label}`}
+																onClick={() => setRemoving({ kind: "actionType", target: action.apiName, label: action.label })}
+															/>
+														</span>
+													)}
 												</div>
 												<p className="secondary" style={{ margin: "6px 0", fontSize: 12.5 }}>
 													{action.description}
@@ -353,9 +422,10 @@ export function OntologyManager() {
 								className="btn sm"
 								style={{ marginLeft: "auto" }}
 								onClick={() => setDrawingLink(true)}
-							>
-								+ Draw a link
-							</button>
+								>
+									<Icon name="plus" size={13} />
+									Draw a link
+								</button>
 							<span className="sub">
 								{allLinks.filter((link) => link.isVerified).length} of {allLinks.length} resolve
 								every reference
@@ -376,6 +446,19 @@ export function OntologyManager() {
 								coverage: `${round(link.matchRatio * 100, 1)}%`,
 							}))}
 							maxHeight={380}
+							actions={
+								canDelete
+									? (row) => (
+											<DeleteButton
+												iconOnly
+												title={`Delete the link ${String(row.apiName)}`}
+												onClick={() =>
+													setRemoving({ kind: "linkType", target: String(row.apiName), label: String(row.apiName) })
+												}
+											/>
+										)
+									: undefined
+							}
 						/>
 					</div>
 				)}
@@ -427,7 +510,7 @@ export function OntologyManager() {
 					</div>
 				)}
 			</div>
-			<div className="card">
+			<div className="card split-span">
 				<div className="card-head">
 					<h3>Change history</h3>
 					<span className="sub">every creation, edit and deletion, with who made it</span>
@@ -461,6 +544,21 @@ export function OntologyManager() {
 				onClose={() => setDrawingLink(false)}
 				onCreated={() => void reloadAfterEdit()}
 			/>
+
+			{removing && (
+				<DeleteDialog
+					kind={removing.kind}
+					target={removing.target}
+					label={removing.label}
+					onClose={() => setRemoving(null)}
+					onDeleted={(plan) => {
+						const goneType = removing.kind === "objectType" ? removing.target : null;
+						setRemoving(null);
+						setNotice(deletedNotice(plan));
+						void reloadAfterDelete(goneType).catch((exc: Error) => setError(exc.message));
+					}}
+				/>
+			)}
 		</div>
 	);
 }

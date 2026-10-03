@@ -20,16 +20,29 @@ What is deliberate here:
   * ARTEFACTS ARE COLLECTED SEPARATELY. When the model builds a dashboard or runs a
     KPI, the structured result is attached to the reply so the UI can render a real
     chart next to the prose instead of the user reading numbers out of a paragraph.
+
+  * ONE CHECK IS NOT LEFT TO THE MODEL. "What can I build?" is run through the
+    feasibility check before the model is asked anything (see
+    asks_what_can_be_built), so the answer is what the data was measured to
+    support and not a recital of the inventory.
+
+  * A PROMISED APPROVAL HAS TO EXIST. An answer that tells the user to approve
+    a proposal the turn never made is sent back once, to make it (see
+    proposals_promised_but_not_made). So is a question that only asks leave to
+    make one (proposals_asked_about_instead_of_made): the proposal's Approve
+    button is how that is asked.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .clarify import asks_something, closing_passage
 from .config import CONFIG
 from .context import current_session_state
 from .llm import LlmError, LlmProvider, ToolCall, recover_text_tool_calls
@@ -58,6 +71,86 @@ WRITE_TOOLS = frozenset(
         "notepad",
     }
 )
+
+# "What can I build?", "what charts and KPIs can we make from my data?",
+# "what's possible with this?" - narrower than the feasibility service's own
+# reading of the same question (detectIntent in feasibility.ts), which also
+# takes "what can I see/do": here a wrong match costs an unasked-for check.
+_ASKS_WHAT_IS_POSSIBLE = re.compile(
+    r"\b(what|which)\b[^?.!]{0,80}?\b(can|could)\s+(i|we|you)\s+(build|chart|make|create|measure|plot|visuali[sz]e)\b"
+    r"|\bwhat('s|\u2019s| is) possible\b"
+    r"|\bwhat (can|could) (my|our|this|the) data\b",
+    re.IGNORECASE,
+)
+
+
+def asks_what_can_be_built(message: str) -> bool:
+    """Whether the user is asking what their data can be turned into.
+
+    The model is handed the workspace's inventory every turn, and answers this
+    question from it: a fluent list of object types that says nothing about
+    which charts are ready now, which are one approval away and which the data
+    cannot support. Telling it to check first was not enough - it had what
+    looked like the answer already. So for this one question the feasibility
+    check is run before the model is asked, and it answers from the result.
+    """
+    return bool(_ASKS_WHAT_IS_POSSIBLE.search(message))
+
+
+_SPEAKS_OF_APPROVING = re.compile(r"\bapprov(e|es|ed|al|ing)\b", re.IGNORECASE)
+_ASKS_TO_GO_AHEAD = re.compile(r"\b(approv\w*|proceed|go ahead|create|build)\b", re.IGNORECASE)
+
+
+def drafts_not_proposed(invocations: list["ToolInvocation"]) -> int:
+    """Proposals this turn's feasibility checks drafted and nothing has made.
+
+    check_feasibility only DRAFTS what a request needs; propose_change is what
+    puts a draft in front of the user, with its Approve button. Zero once the
+    turn has made a proposal, or when none was drafted.
+    """
+    if any(invocation.ok and invocation.name == "propose_change" for invocation in invocations):
+        return 0
+    drafted = 0
+    for invocation in invocations:
+        if not (invocation.ok and invocation.name == "check_feasibility"):
+            continue
+        for item in invocation.result.get("items") or []:
+            if isinstance(item, dict) and item.get("status") == "needs_approval":
+                drafted += len(item.get("proposals") or [])
+    return drafted
+
+
+def proposals_promised_but_not_made(content: str, invocations: list["ToolInvocation"]) -> int:
+    """How many drafted proposals a reply tells the user to approve but never made.
+
+    A model will sometimes describe the draft, write "approve it below" and
+    stop - and there is nothing below. Or it closes by asking, in prose,
+    whether it should go ahead and create it. Zero when the reply does
+    neither, or there is nothing it left unmade.
+    """
+    text = content or ""
+    asks_leave = asks_something(text) and _ASKS_TO_GO_AHEAD.search(closing_passage(text))
+    if not (_SPEAKS_OF_APPROVING.search(text) or asks_leave):
+        return 0
+    return drafts_not_proposed(invocations)
+
+
+def proposals_asked_about_instead_of_made(question: dict[str, Any], invocations: list["ToolInvocation"]) -> int:
+    """How many drafted proposals a clarifying question asks permission to make.
+
+    "Shall I create the combined dataset and build the dashboard?" is a
+    question the proposal already asks, with a button: putting it to the user
+    first makes them say yes twice, and gives them choices where the Approve
+    button should be. A question about anything else - which period, which of
+    two measures - is the user's to answer and is not counted.
+    """
+    labels = " ".join(
+        str(option.get("label", "")) if isinstance(option, dict) else str(option)
+        for option in question.get("options") or []
+    )
+    if not _ASKS_TO_GO_AHEAD.search(f"{question.get('question', '')} {labels}"):
+        return 0
+    return drafts_not_proposed(invocations)
 
 
 @dataclass
@@ -222,6 +315,21 @@ _CHANGE_NOUNS = {
 }
 
 
+def clarification_reply(payload: dict[str, Any], written: str | None) -> str:
+    """The text of a turn that ends by asking: what there was to say, then the question.
+
+    A question must not cost the person the answer that came with it. "How do
+    I create this dataset?" deserves the how, and then the offer to do it - so
+    whatever the model gave the tool as its message (or wrote beside the call)
+    stays in the reply, with the question after it. The choices are shown by
+    the UI from the clarification artifact; the text is what the next turn's
+    model reads back as what it said.
+    """
+    question = str(payload.get("question") or "").strip()
+    said = str(payload.get("message") or written or "").strip()
+    return f"{said}\n\n{question}" if said and said != question else question
+
+
 def _summarise_changes(artifacts: list[dict[str, Any]]) -> str:
     """What a turn changed, as a Markdown list, from its artifacts."""
     lines = [
@@ -314,6 +422,22 @@ class Agent:
         rounds = 0
         provider_used = ""
         model_used = ""
+        # Whether the model has already been sent back once to make the
+        # proposals its answer spoke of (proposals_promised_but_not_made).
+        reminded = False
+
+        if asks_what_can_be_built(user_message):
+            await self._preflight(
+                ToolCall(
+                    id="preflight_check_feasibility",
+                    name="check_feasibility",
+                    arguments={"text": user_message, "intent": "capabilities"},
+                ),
+                messages,
+                invocations,
+                artifacts,
+                cache,
+            )
 
         for round_index in range(CONFIG.max_tool_rounds):
             rounds = round_index + 1
@@ -375,6 +499,28 @@ class Agent:
                     calls = recovered
 
             if not calls:
+                # An answer that says "approve it below" over nothing: sent
+                # back once, with what is missing, while there are still tools
+                # to make it with. Whatever comes back the second time stands.
+                missing = 0 if (reminded or is_final_round) else proposals_promised_but_not_made(content, invocations)
+                if missing:
+                    reminded = True
+                    log.info("Reply promised an approval with no proposal made; asking for %d.", missing)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Your reply tells the user to approve something, but nothing exists for them "
+                                f"to approve: check_feasibility drafted {missing} proposal(s) and "
+                                "propose_change was never called, so there is no Approve button under your "
+                                "answer. Call propose_change now - once per drafted proposal, in order, "
+                                "passing dependsOn and the followUp each one carries - and then answer "
+                                "again, briefly."
+                            ),
+                        }
+                    )
+                    continue
                 return AgentResult(
                     content=content.strip()
                     or "I did not manage to produce an answer for that. Try rephrasing it?",
@@ -408,6 +554,28 @@ class Agent:
 
             for call in calls:
                 payload, ok, duration_ms = await self._invoke(call, cache)
+                # A question that only asks leave to make a proposal is not put
+                # to the user: the answer goes back to the model instead, once,
+                # saying to make the proposal. Its Approve button is the asking.
+                put_to_user = ok and call.name == "request_clarification"
+                if put_to_user and not reminded and not is_final_round:
+                    pending = proposals_asked_about_instead_of_made(payload, invocations)
+                    if pending:
+                        reminded = True
+                        put_to_user = False
+                        log.info("Clarification asked leave to make %d drafted proposal(s); sent back.", pending)
+                        payload = {
+                            "asked": False,
+                            "note": (
+                                "This question was NOT put to the user. check_feasibility drafted "
+                                f"{pending} proposal(s) for this request, and a proposal is how the user "
+                                "is asked: it appears under your answer with its own Approve button and "
+                                "changes nothing until they press it. Call propose_change now - once per "
+                                "drafted proposal, in order, passing dependsOn and the followUp each one "
+                                "carries - then tell the user what each adds. Ask a question only if "
+                                "something other than whether to go ahead is unclear."
+                            ),
+                        }
                 if ok and call.name == "manage_context":
                     # Applied here, where the message list is in hand, and
                     # before the tool message is appended - so the model's
@@ -433,9 +601,9 @@ class Agent:
                 # just said it could not answer, which is the guess the tool
                 # exists to prevent. The turn ends and the question goes to the
                 # user; their reply arrives as the next turn.
-                if ok and call.name == "request_clarification":
+                if put_to_user:
                     return AgentResult(
-                        content=payload.get("question", ""),
+                        content=clarification_reply(payload, content),
                         tool_invocations=invocations,
                         artifacts=[
                             *artifacts,
@@ -443,6 +611,7 @@ class Agent:
                                 "kind": "clarification",
                                 "question": payload.get("question", ""),
                                 "options": payload.get("options", []),
+                                "multiple": payload.get("multiple", False),
                                 "allowFreeText": payload.get("allowFreeText", True),
                             },
                         ],
@@ -484,6 +653,61 @@ class Agent:
             provider=provider_used,
             model=model_used,
         )
+
+    async def _preflight(
+        self,
+        call: ToolCall,
+        messages: list[dict[str, Any]],
+        invocations: list[ToolInvocation],
+        artifacts: list[dict[str, Any]],
+        cache: dict[str, dict[str, Any]],
+    ) -> None:
+        """Run one tool before the first model round, as if the model had asked.
+
+        The call and its result go into the transcript in the shape a model's
+        own tool call takes, so the model reads it as work already done, and
+        the result is recorded and turned into an artifact like any other. A
+        call that fails leaves no trace: the model is then asked as usual, and
+        may make the call itself.
+        """
+        payload, ok, duration_ms = await self._invoke(call, cache)
+        if not ok:
+            log.info("preflight %s did not run: %s", call.name, str(payload.get("error", ""))[:200])
+            return
+        messages.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "content": serialise_result(payload),
+            }
+        )
+        invocations.append(
+            ToolInvocation(
+                name=call.name,
+                arguments=call.arguments,
+                ok=True,
+                duration_ms=duration_ms,
+                result_preview=serialise_result(payload)[:240],
+                result=payload,
+            )
+        )
+        artifact = _artifact_from(call.name, call.arguments, payload)
+        if artifact:
+            artifacts.append(artifact)
 
     async def _invoke(
         self, call: ToolCall, cache: dict[str, dict[str, Any]]

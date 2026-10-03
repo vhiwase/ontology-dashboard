@@ -15,6 +15,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, formatCell } from "../../api";
 import { RESOURCE_SPECS, type ResourceKind } from "./resourceKinds";
 import { SyncPanel } from "./SyncPanel";
+import { Spinner } from "../common";
+import { Icon } from "../icons";
 
 export interface ResourceSummary {
 	id: number;
@@ -163,7 +165,7 @@ export function ResourcePreview({
 			<div className="rp" role="dialog" aria-label="Resource preview">
 				<header className="rp-head">
 					<span className="rp-glyph" style={{ color: spec?.accent }} aria-hidden>
-						{spec?.glyph ?? "▫"}
+						{spec ? <Icon name={spec.icon} size={18} /> : "▫"}
 					</span>
 					<div className="rp-heading">
 						<div className="rp-kind">{spec?.label.toUpperCase() ?? "RESOURCE"}</div>
@@ -180,8 +182,8 @@ export function ResourcePreview({
 					{preview?.rowCount !== null && preview?.rowCount !== undefined && (
 						<span className="rp-rows mono">{preview.rowCount.toLocaleString("en-US")} rows</span>
 					)}
-					<button className="btn sm" onClick={close} aria-label="Close preview">
-						✕
+					<button className="icon-btn" onClick={close} aria-label="Close preview">
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 
@@ -209,7 +211,7 @@ export function ResourcePreview({
 
 				<div className="rp-body">
 					{error && <div className="banner error">{error}</div>}
-					{!preview && !error && <p className="muted">Loading…</p>}
+					{!preview && !error && <Spinner label="Loading" />}
 
 					{preview && !preview.resolved && (
 						<div className="banner warn" style={{ marginBottom: 12 }}>
@@ -337,10 +339,11 @@ export function ResourcePreview({
 									className="btn sm primary"
 									onClick={() =>
 										onOpenTarget(preview.resource.kind, preview.resource.targetRef as string)
-									}
-								>
-									Open in workbench
-								</button>
+										}
+										>
+											Open in workbench
+											<Icon name="arrowRight" size={13} />
+										</button>
 							)}
 						</>
 					)}
@@ -431,7 +434,7 @@ export function ResourcePreview({
 
 							<div className="lin-self">
 								<span className="rp-glyph" style={{ color: spec?.accent }} aria-hidden>
-									{spec?.glyph}
+									{spec && <Icon name={spec.icon} size={15} />}
 								</span>
 								<span className="lin-name">{preview.resource.name}</span>
 								{preview.rowCount !== null && (

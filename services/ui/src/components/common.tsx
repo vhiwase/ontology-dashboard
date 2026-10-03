@@ -2,34 +2,91 @@
 
 import { useEffect, useRef, useState } from "react";
 import { type KpiResult, formatCell, formatPeriod, formatValue, statusFor } from "../api";
+import { Icon } from "./icons";
 
 export function Spinner({ label }: { label?: string }) {
 	return (
-		<span className="row muted" style={{ gap: 7 }}>
+		<span className="loading-inline" role="status">
 			<span className="spinner" aria-hidden />
 			{label ?? "Loading"}
 		</span>
 	);
 }
 
+/**
+ * A page's first load: the label, then the shape of what is coming.
+ *
+ * Shown where a whole page is waiting on its first request, so the screen
+ * keeps its layout instead of collapsing to one line of text and then
+ * jumping when the data lands. Inline waits keep the small Spinner.
+ */
+export function PageLoader({ label }: { label?: string }) {
+	return (
+		<div className="page-loader" role="status" aria-live="polite">
+			<div className="page-loader-head">
+				<span className="spinner" aria-hidden />
+				<span>{label ?? "Loading"}…</span>
+			</div>
+			<div className="skeleton-grid" aria-hidden>
+				{[0, 1, 2, 3].map((index) => (
+					<div key={index} className="skeleton-card">
+						<span className="skeleton sk-line short" />
+						<span className="skeleton sk-value" />
+						<span className="skeleton sk-line mid" />
+					</div>
+				))}
+			</div>
+			<div className="skeleton-grid two" aria-hidden>
+				{[0, 1].map((index) => (
+					<div key={index} className="skeleton-card">
+						<span className="skeleton sk-line short" />
+						<span className="skeleton sk-block" />
+					</div>
+				))}
+			</div>
+		</div>
+	);
+}
+
 export function ErrorBanner({ error, onRetry }: { error: string; onRetry?: () => void }) {
 	return (
-		<div className="banner error">
-			<strong>Something went wrong.</strong> {error}
-			{onRetry && (
-				<>
-					{" "}
-					<button className="btn sm" onClick={onRetry} style={{ marginLeft: 6 }}>
+		<div className="banner error" role="alert">
+			<div className="error-banner">
+				<div className="error-banner-text">
+					<strong>Something went wrong.</strong> {error}
+				</div>
+				{onRetry && (
+					<button className="btn sm" onClick={onRetry}>
+						<Icon name="refresh" size={13} />
 						Retry
 					</button>
-				</>
-			)}
+				)}
+			</div>
+		</div>
+	);
+}
+
+/**
+ * A refusal the person can put right - a rule a form did not meet. Said as
+ * it is, without ErrorBanner's "Something went wrong": nothing did.
+ */
+export function Refusal({ message }: { message: string }) {
+	return (
+		<div className="banner error" role="alert">
+			{message}
 		</div>
 	);
 }
 
 export function Empty({ children }: { children: React.ReactNode }) {
-	return <div className="empty">{children}</div>;
+	return (
+		<div className="empty">
+			<span className="empty-icon" aria-hidden>
+				<Icon name="inbox" size={18} />
+			</span>
+			<div>{children}</div>
+		</div>
+	);
 }
 
 /**
@@ -111,20 +168,36 @@ export function Sparkline({
 	const solid = partial ? points.slice(0, -1) : points;
 	const line = solid.map((point, index) => `${index === 0 ? "M" : "L"}${x(index)},${y(point.value)}`).join(" ");
 	const last = points.length - 1;
+	// The history in the de-emphasis ink, the current period in the accent:
+	// the shape is context, the latest value is the point.
 	return (
 		<svg className="sparkline" width={width} height={height} viewBox={`0 0 ${width} ${height}`} aria-hidden>
-			<path d={line} fill="none" stroke="var(--series-1)" strokeWidth={1.6} strokeLinejoin="round" />
+			<path
+				d={line}
+				fill="none"
+				stroke="var(--ink-faint)"
+				strokeWidth={1.6}
+				strokeLinejoin="round"
+				strokeLinecap="round"
+			/>
 			{partial && last > 0 && (
 				<path
 					d={`M${x(last - 1)},${y(points[last - 1]!.value)} L${x(last)},${y(points[last]!.value)}`}
 					fill="none"
-					stroke="var(--series-1)"
+					stroke="var(--ink-faint)"
 					strokeWidth={1.6}
 					strokeDasharray="2 2"
-					opacity={0.6}
+					opacity={0.7}
 				/>
 			)}
-			<circle cx={x(partial ? last - 1 : last)} cy={y(points[partial ? last - 1 : last]!.value)} r={2.4} fill="var(--series-1)" />
+			<circle
+				cx={x(partial ? last - 1 : last)}
+				cy={y(points[partial ? last - 1 : last]!.value)}
+				r={3}
+				fill="var(--series-1)"
+				stroke="var(--surface-1)"
+				strokeWidth={1.5}
+			/>
 		</svg>
 	);
 }
@@ -141,12 +214,15 @@ export function DataTable({
 	onRowClick,
 	emptyMessage = "Nothing to show.",
 	maxHeight,
+	actions,
 }: {
 	columns: Column[];
 	rows: Array<Record<string, unknown>>;
 	onRowClick?: (row: Record<string, unknown>) => void;
 	emptyMessage?: string;
 	maxHeight?: number;
+	/** What can be done to a row - a delete button, say - in a last cell of its own. */
+	actions?: (row: Record<string, unknown>) => React.ReactNode;
 }) {
 	if (rows.length === 0) return <Empty>{emptyMessage}</Empty>;
 	return (
@@ -159,6 +235,7 @@ export function DataTable({
 								{column.label}
 							</th>
 						))}
+						{actions && <th className="row-actions" aria-label="Actions" />}
 					</tr>
 				</thead>
 				<tbody>
@@ -173,6 +250,12 @@ export function DataTable({
 									{formatCell(row[column.key])}
 								</td>
 							))}
+							{actions && (
+								// A button in a row is not a click on the row.
+								<td className="row-actions" onClick={(event) => event.stopPropagation()}>
+									{actions(row)}
+								</td>
+							)}
 						</tr>
 					))}
 				</tbody>
@@ -223,7 +306,9 @@ export function Markdown({
 				mermaid.initialize({
 					startOnLoad: false,
 					securityLevel: "strict",
-					theme: "dark",
+					// Drawn in the theme the page is in, so a diagram on the light
+					// theme is not a dark slab in the middle of the answer.
+					theme: document.documentElement.dataset.theme === "dark" ? "dark" : "neutral",
 					fontFamily: "inherit",
 				});
 				for (const [index, node] of blocks.entries()) {
@@ -530,7 +615,7 @@ export function useScrollToBottom(dependency: unknown) {
 export function CoverageBanner({ notes }: { notes: string[] }) {
 	if (notes.length === 0) return null;
 	return (
-		<div className="banner">
+		<div className="banner warn">
 			{/* Worded as a caveat, not as "simulated". Nothing on this platform is
 			    generated any more, so a coverage note now means the source is thin
 			    for that figure - saying "simulated" would be a false statement the
@@ -566,7 +651,7 @@ export function NoOntologyHere({
 	return (
 		<div className="empty-space">
 			<div className="empty-space-mark" aria-hidden>
-				◈
+				<Icon name="layers" size={24} />
 			</div>
 			<h3>
 				No {what} in {spaceName}

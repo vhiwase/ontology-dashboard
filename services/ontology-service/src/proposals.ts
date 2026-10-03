@@ -1026,6 +1026,36 @@ export async function rejectProposal(id: number, decidedBy: string, note?: strin
 	return settle(id, "rejected", decidedBy, { note: note ?? null });
 }
 
+/**
+ * The undecided proposals that name this one as something to apply first.
+ *
+ * Approving one of them walks its dependencies; with this one gone it would
+ * fail on a proposal that no longer exists, so they have to be dealt with
+ * before it can be deleted.
+ */
+export async function proposalsWaitingOn(id: number): Promise<ProposalRecord[]> {
+	const rows = await query<ProposalRow>(
+		`SELECT p.* FROM platform.proposal p JOIN platform.space s ON s.space_id = p.space_id
+		  WHERE s.slug = $1 AND p.status IN ('pending', 'failed') AND $2::bigint = ANY(p.depends_on)
+		  ORDER BY p.proposal_id`,
+		[currentSpace(), id],
+	);
+	return rows.map(toRecord);
+}
+
+/**
+ * Remove a proposal from the record.
+ *
+ * Deleting one that was applied does not undo what it built - the link, the
+ * metric or the dataset is part of the model now and is deleted as such. One
+ * still waiting is simply withdrawn, without the "rejected" entry left behind.
+ */
+export async function deleteProposal(id: number): Promise<ProposalRecord> {
+	const proposal = await getProposal(id);
+	await query("DELETE FROM platform.proposal WHERE proposal_id = $1", [proposal.id]);
+	return proposal;
+}
+
 /** Internals for tests. */
 export const __testing = { walkPath, dimensionsOf, metricMeta, uniqueName, pascal };
 export type { ActionTypeMeta };

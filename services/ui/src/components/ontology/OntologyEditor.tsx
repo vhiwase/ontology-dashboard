@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { type ObjectTypeDetail, type PropertyMeta, api } from "../../api";
 import { ErrorBanner } from "../common";
+import { Icon } from "../icons";
 
 const OBJECT_KINDS = ["entity", "event", "role", "value"];
 
@@ -47,6 +48,22 @@ interface ObjectDraft {
 	kind: string;
 }
 
+/**
+ * The type's title, as the column it is.
+ *
+ * The select's options are columns and a column is what the server stores,
+ * but `titleProperty` is the property's API name - a different string
+ * wherever the column is snake_case (generalEmail / general_email). Starting
+ * the select from it showed "none" for a type that has a title, and comparing
+ * against it on save could not tell a changed title from an untouched one.
+ */
+function titleColumnOf(detail: ObjectTypeDetail): string {
+	const title =
+		detail.properties.find((prop) => prop.isTitle) ??
+		detail.properties.find((prop) => prop.apiName === detail.titleProperty);
+	return title?.sqlColumn ?? "";
+}
+
 export function ObjectTypeEditor({
 	detail,
 	onClose,
@@ -73,7 +90,7 @@ export function ObjectTypeEditor({
 			group: detail.group ?? "",
 			icon: detail.icon ?? "",
 			color: detail.color ?? "",
-			titleColumn: detail.titleProperty ?? "",
+			titleColumn: titleColumnOf(detail),
 			kind: detail.kind ?? "entity",
 		});
 	}, [detail]);
@@ -108,8 +125,7 @@ export function ObjectTypeEditor({
 			if (draft.group !== (detail.group ?? "")) fields.group = draft.group || null;
 			if (draft.icon !== (detail.icon ?? "")) fields.icon = draft.icon || null;
 			if (draft.color !== (detail.color ?? "")) fields.color = draft.color || null;
-			if (draft.titleColumn !== (detail.titleProperty ?? ""))
-				fields.titleColumn = draft.titleColumn || null;
+			if (draft.titleColumn !== titleColumnOf(detail)) fields.titleColumn = draft.titleColumn || null;
 			if (draft.kind !== detail.kind) fields.kind = draft.kind;
 
 			if (Object.keys(fields).length === 0) {
@@ -156,14 +172,14 @@ export function ObjectTypeEditor({
 			<div className="rp fn-window" role="dialog" aria-modal="true" aria-label="Edit object type">
 				<header className="rp-head">
 					<span className="rp-glyph" aria-hidden>
-						◈
+						<Icon name="box" size={18} />
 					</span>
 					<div className="rp-heading">
 						<div className="rp-kind">OBJECT TYPE</div>
 						<h3 className="rp-title">{detail.label}</h3>
 					</div>
 					<button className="icon-button" onClick={close} aria-label="Close">
-						×
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 
@@ -267,7 +283,7 @@ export function ObjectTypeEditor({
 											<option value="">— none —</option>
 											{detail.properties.map((prop) => (
 												<option key={prop.sqlColumn} value={prop.sqlColumn}>
-													{prop.apiName}
+													{prop.label} ({prop.sqlColumn})
 												</option>
 											))}
 										</select>
@@ -312,10 +328,10 @@ export function ObjectTypeEditor({
 							Recorded in the edit journal, and undoable from there.
 						</div>
 						<div className="row" style={{ gap: 8 }}>
-							<button className="ghost" onClick={close} disabled={busy}>
+							<button className="btn ghost" onClick={close} disabled={busy}>
 								Cancel
 							</button>
-							<button className="primary" onClick={save} disabled={busy}>
+							<button className="btn primary" onClick={save} disabled={busy}>
 								{busy ? "Saving…" : "Save changes"}
 							</button>
 						</div>
@@ -404,11 +420,11 @@ function PropertyForm({
 			</div>
 
 			<div className="row" style={{ gap: 8, marginTop: 10, justifyContent: "flex-end" }}>
-				<button className="ghost" onClick={onCancel} disabled={busy}>
+				<button className="btn ghost" onClick={onCancel} disabled={busy}>
 					Back
 				</button>
 				<button
-					className="primary"
+					className="btn primary"
 					disabled={busy}
 					onClick={() =>
 						onSave({

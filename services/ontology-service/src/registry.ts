@@ -431,8 +431,18 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 		[versionId],
 	);
 
+	// The title is said in two places: the type's title_column, which every
+	// query uses, and an is_title flag on one of its properties. The column is
+	// the one read here - one source of truth - so a type whose title was
+	// changed shows the new one everywhere even if a flag was left behind by an
+	// older version of the editor. The stored flag only stands in where a type
+	// has no title_column at all; an edit keeps the two in step (alignTitleFlag
+	// in builder.ts), so a title that was cleared has no flag either.
+	const titleColumnOf = new Map(typeRows.map((row) => [row.object_type_rid, row.title_column]));
+
 	const propertiesByType = new Map<string, PropertyMeta[]>();
 	for (const row of propertyRows) {
+		const titleColumn = titleColumnOf.get(row.object_type_rid);
 		const meta: PropertyMeta = {
 			rid: row.object_property_rid,
 			apiName: row.api_name,
@@ -442,7 +452,7 @@ async function loadRegistryForSpace(spaceSlug: string): Promise<Registry> {
 			sqlColumn: row.sql_column,
 			sqlType: row.sql_type,
 			isIdentity: row.is_identity,
-			isTitle: row.is_title,
+			isTitle: titleColumn ? row.sql_column === titleColumn : row.is_title,
 			isNullable: row.is_nullable,
 			isForeignKey: row.is_foreign_key,
 			semanticRole: row.semantic_role,

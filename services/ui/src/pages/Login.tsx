@@ -1,5 +1,6 @@
 import { type FormEvent, useEffect, useState } from "react";
 import { ApiError, type AuthConfig, type SessionUser, api } from "../api";
+import { BrandMark, Icon } from "../components/icons";
 
 /**
  * Sign-in and registration.
@@ -31,7 +32,7 @@ export function Login({ onSignedIn }: { onSignedIn: (user: SessionUser) => void 
 			<section className="auth-pitch" aria-label="About this product">
 				<div className="auth-brand">
 					<span className="brand-mark" aria-hidden>
-						◈
+						<BrandMark size={22} />
 					</span>
 					<span>Ontology Dashboard</span>
 				</div>
@@ -152,7 +153,17 @@ function SignInForm({ onSignedIn }: { onSignedIn: (user: SessionUser) => void })
 				</div>
 			)}
 			<button className="btn primary lg" type="submit" disabled={busy || !username || !password}>
-				{busy ? "Signing in…" : "Sign in"}
+				{busy ? (
+					<>
+						<span className="spinner" aria-hidden />
+						Signing in…
+					</>
+				) : (
+					<>
+						Sign in
+						<Icon name="arrowRight" size={16} />
+					</>
+				)}
 			</button>
 		</form>
 	);
@@ -257,7 +268,17 @@ function RegisterForm({ onSignedIn }: { onSignedIn: (user: SessionUser) => void 
 				</div>
 			)}
 			<button className="btn primary lg" type="submit" disabled={busy || !ready}>
-				{busy ? "Creating your workspace…" : "Create account"}
+				{busy ? (
+					<>
+						<span className="spinner" aria-hidden />
+						Creating your workspace…
+					</>
+				) : (
+					<>
+						Create account
+						<Icon name="arrowRight" size={16} />
+					</>
+				)}
 			</button>
 		</form>
 	);

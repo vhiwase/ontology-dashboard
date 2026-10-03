@@ -13,14 +13,17 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from . import store
+from . import settings, store
 from .agent import Agent
 from .auth import Principal, require_role
+from .clarify import infer_clarification
 from .context import current_request_id, current_session, current_space, current_user
 from .config import CONFIG
+from .credit import credit_status
 from .limits import REPLICA_WARNING, RateLimited, limiter
 from .llm import LlmError, _single_provider, build_provider
 from .modes import SessionAgentState, resolve_mode
@@ -459,6 +462,16 @@ async def providers(
 
     described = [await describe(name) for name in SELECTABLE_PROVIDERS]
 
+    # The administrator's default model, when it is one that can answer right
+    # now. A default that is not available falls back to "auto" rather than
+    # preselecting something every turn would then fail on.
+    chosen = settings.get("assistant.defaultModel")
+    default = (
+        chosen
+        if any(entry["id"] == chosen and entry["available"] for entry in described)
+        else "auto"
+    )
+
     return {
         "providers": described,
         "auto": {
@@ -467,7 +480,8 @@ async def providers(
             "resolvedTo": getattr(state.get("provider"), "name", None),
             "reason": state.get("providerReason"),
         },
-        "default": "auto",
+        "default": default,
+        "defaultSetByAdmin": default == chosen and chosen not in (None, "auto"),
     }
 
 
@@ -494,6 +508,15 @@ async def costs(
         for name, rate in rates().items()
     }
     return summary
+
+
+@app.get("/api/assistant/credit")
+async def credit(
+    principal: Principal = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Where the caller stands against their monthly AI credit."""
+    status = await run_in_threadpool(credit_status, principal.username)
+    return status.as_dict()
 
 
 async def default_space() -> str:
@@ -537,12 +560,56 @@ def _visible_owner(principal: Principal) -> str | None:
     return None if principal.role == "admin" else principal.username
 
 
+class SessionChange(BaseModel):
+    """What may be changed about a conversation: its name, and whether it is pinned."""
+
+    title: str | None = Field(default=None, max_length=400)
+    pinned: bool | None = None
+
+
+class SessionNote(BaseModel):
+    """Something the page itself added to a conversation, to be kept with it."""
+
+    content: str = Field(min_length=1, max_length=4000)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list, max_length=4)
+
+
 @app.get("/api/assistant/sessions")
 async def sessions(
     space: str | None = None,
+    q: str | None = None,
+    scope: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
     principal: Principal = Depends(require_role("viewer")),
 ) -> dict[str, Any]:
-    return {"sessions": store.list_sessions(_visible_owner(principal), space_slug=space)}
+    """The caller's conversation history in a space, newest first.
+
+    `q` searches titles and everything asked and answered. `scope=mine` keeps
+    an administrator to their own conversations; without it they see
+    everyone's, as before. Paged with `limit` and `offset`; `total` is how
+    many there are in all. `retentionDays` is the idle window after which one
+    that is not pinned is removed (0: kept until it is deleted).
+    """
+    owner = principal.username if (scope or "").lower() == "mine" else _visible_owner(principal)
+    bounded = max(1, min(limit, 200))
+    rows = await run_in_threadpool(
+        store.list_sessions,
+        owner,
+        bounded,
+        space,
+        q,
+        max(0, offset),
+    )
+    total = int(rows[0]["total"]) if rows else 0
+    for row in rows:
+        row.pop("total", None)
+    return {
+        "sessions": rows,
+        "total": total,
+        "hasMore": max(0, offset) + len(rows) < total,
+        "retentionDays": CONFIG.chat_retention_days,
+    }
 
 
 @app.get("/api/assistant/sessions/{session_id}")
@@ -556,7 +623,55 @@ async def session_messages(
         raise HTTPException(status_code=404, detail=f"No session {session_id}.")
     else:
         current_space.set(store.session_space(session_id) or "sandbox")
-    return {"sessionId": session_id, "messages": store.get_messages(session_id)}
+    info = store.session_info(session_id) or {}
+    return {
+        "sessionId": session_id,
+        # Its name as the history shows it (a rename is kept), and whose it is.
+        "title": info.get("title"),
+        "owner": info.get("user_id"),
+        "pinned": bool(info.get("pinned")),
+        "messages": store.get_messages(session_id),
+    }
+
+
+@app.patch("/api/assistant/sessions/{session_id}")
+async def change_session(
+    session_id: int,
+    change: SessionChange,
+    principal: Principal = Depends(require_role("viewer")),
+) -> dict[str, Any]:
+    """Rename a conversation, or pin it to the top of the history."""
+    title = change.title.strip() if change.title is not None else None
+    if title is not None and not title:
+        raise HTTPException(status_code=400, detail="A conversation's name cannot be empty.")
+    if title is None and change.pinned is None:
+        raise HTTPException(status_code=400, detail="Nothing to change: pass title or pinned.")
+    row = await run_in_threadpool(
+        store.update_session, session_id, _visible_owner(principal), title, change.pinned
+    )
+    # 404 rather than 403 on someone else's, as for reading one.
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No session {session_id}.")
+    return row
+
+
+@app.post("/api/assistant/sessions/{session_id}/notes", status_code=201)
+async def add_note(
+    session_id: int,
+    note: SessionNote,
+    principal: Principal = Depends(require_role("analyst")),
+) -> dict[str, Any]:
+    """Keep something the page added to a conversation as part of its history.
+
+    Approving a proposal from inside a conversation is answered by the page -
+    "Approved and built: ..." - not by the model. Without this, that line was
+    on screen and nowhere else, and the conversation read differently the next
+    time it was opened.
+    """
+    if not store.session_exists(session_id, _visible_owner(principal)):
+        raise HTTPException(status_code=404, detail=f"No session {session_id}.")
+    message_id = await run_in_threadpool(store.append_note, session_id, note.content, note.artifacts)
+    return {"messageId": message_id}
 
 
 # response_class=Response is required, not stylistic: FastAPI asserts that a 204
@@ -567,10 +682,10 @@ async def remove_session(
     session_id: int,
     principal: Principal = Depends(require_role("viewer")),
 ) -> Response:
-    if not store.delete_session(session_id, _visible_owner(principal)):
+    # What was said is erased and the conversation leaves every list; what it
+    # cost stays on record (see store.delete_session).
+    if not store.delete_session(session_id, _visible_owner(principal), principal.username):
         raise HTTPException(status_code=404, detail=f"No session {session_id}.")
-    else:
-        current_space.set(store.session_space(session_id) or "sandbox")
     return Response(status_code=204)
 
 
@@ -591,6 +706,12 @@ async def chat(
             detail=str(exc),
             headers={"Retry-After": str(exc.retry_after)},
         ) from exc
+
+    # The monthly AI credit an administrator set. Checked before the turn,
+    # never during one: a turn already paid for is allowed to finish.
+    credit_now = await run_in_threadpool(credit_status, principal.username)
+    if credit_now.exhausted:
+        raise HTTPException(status_code=402, detail=credit_now.refusal())
 
     # Pick the agent for this turn. An explicit choice is honoured exactly:
     # naming a provider that is not configured is refused rather than silently
@@ -712,6 +833,18 @@ async def chat(
     # fabricated source never reaches the reader or the transcript.
     reply_text, dropped_citations = await _validate_citations(result.content)
     result.content = reply_text
+
+    # A reply that ends by asking the person to choose, without offering the
+    # choices as a clarification, gets them read off its own text - so there
+    # is always something to select rather than only a box to retype into.
+    if result.stopped_because == "answered" and not any(
+        artifact.get("kind") == "clarification" for artifact in result.artifacts
+    ):
+        inferred, result.usage = await infer_clarification(
+            agent.provider, request.message, result.content, result.usage or {}
+        )
+        if inferred:
+            result.artifacts.append(inferred)
 
     usage = result.usage or {}
     limiter.record_usage(principal.username, int(usage.get("totalTokens") or 0))

@@ -469,6 +469,11 @@ export function me(req: Request, res: Response): void {
 
 // ── route policy ────────────────────────────────────────────────────────────
 
+/** Every route of the admin console, whatever its verb. */
+const ADMIN_CONSOLE: ReadonlyArray<{ method: string; pattern: RegExp }> = ["GET", "POST", "PUT", "PATCH", "DELETE"].map(
+	(method) => ({ method, pattern: /^\/admin(\/.*)?$/ }),
+);
+
 /**
  * Routes that need more than read access. Everything else under /api requires
  * the viewer role, so a route added later is protected by default rather than
@@ -577,6 +582,14 @@ const ELEVATED: ReadonlyArray<{ method: string; pattern: RegExp; role: Role }> =
 	{ method: "DELETE", pattern: /^\/spaces\/[^/]+\/projects\/[^/]+$/, role: "admin" },
 	{ method: "DELETE", pattern: /^\/resources\/[^/]+$/, role: "admin" },
 	{ method: "DELETE", pattern: /^\/folders\/[^/]+$/, role: "admin" },
+	// Deleting anything by kind (removal.ts) - a connection, a dataset, an object
+	// type, a metric, a function, a proposal... Asking what a delete would take
+	// with it is a read and stays at viewer.
+	{ method: "DELETE", pattern: /^\/removal\/[^/]+\/.+$/, role: "admin" },
+
+	// The admin console: accounts, credit, platform settings. Every verb, and
+	// pinned to the platform role in PLATFORM_ADMIN_ONLY below as well.
+	...ADMIN_CONSOLE.map((rule) => ({ ...rule, role: "admin" as Role })),
 ];
 
 /** The role a request needs, from the table above or viewer as the floor. */
@@ -613,6 +626,9 @@ const PLATFORM_ADMIN_ONLY: ReadonlyArray<{ method: string; pattern: RegExp }> = 
 	{ method: "POST", pattern: /^\/registry\/reload$/ },
 	{ method: "POST", pattern: /^\/spaces\/[^/]+\/members$/ },
 	{ method: "DELETE", pattern: /^\/spaces\/[^/]+\/members\/[^/]+$/ },
+	// Owning a personal workspace makes a person "admin" of it; it must never
+	// make them an administrator of everyone's accounts.
+	...ADMIN_CONSOLE,
 ];
 
 /** The role the caller effectively holds in the space the request is scoped to. */
@@ -769,8 +785,15 @@ export async function recordRegistration(ip: string | undefined): Promise<void> 
 	await recordAttempt(`register:${ip ?? "unknown"}`, ip, true);
 }
 
-/** Insert a self-registered account, or null when the name or email is taken. */
-export async function createSelfRegisteredUser(input: RegistrationInput): Promise<{
+/**
+ * Insert a self-registered account, or null when the name or email is taken.
+ * `role` is the registration default in force, which an administrator can set
+ * from the admin console; the environment's is the fallback.
+ */
+export async function createSelfRegisteredUser(
+	input: RegistrationInput,
+	role: Role = REGISTRATION_ROLE,
+): Promise<{
 	app_user_id: number;
 	username: string;
 	role: Role;
@@ -785,7 +808,7 @@ export async function createSelfRegisteredUser(input: RegistrationInput): Promis
 			 VALUES ($1, $2, $3, $4, $5, 'tms:AnalystRole', 'self')
 			 ON CONFLICT (username) DO NOTHING
 			 RETURNING app_user_id, username, role, ontology_role, token_version`,
-			[input.username, input.displayName, input.email, hash, REGISTRATION_ROLE],
+			[input.username, input.displayName, input.email, hash, role],
 		);
 	} catch (error) {
 		// The email index is the other unique constraint an insert can hit.

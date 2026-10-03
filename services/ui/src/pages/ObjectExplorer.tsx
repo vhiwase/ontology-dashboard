@@ -27,9 +27,11 @@ import {
 	Empty,
 	ErrorBanner,
 	NoOntologyHere,
+	PageLoader,
 	Spinner,
 	useDebounced,
 } from "../components/common";
+import { Icon } from "../components/icons";
 
 interface FilterRow {
 	id: number;
@@ -183,7 +185,7 @@ export function ObjectExplorer() {
 
 	if (missing)
 		return <NoOntologyHere what="object types" spaceName={space?.name ?? spaceSlug} />;
-	if (!types) return <Spinner label="Loading object types" />;
+	if (!types) return <PageLoader label="Loading object types" />;
 	if (types.length === 0) return <NoObjectTypesYet />;
 
 	return (
@@ -202,6 +204,7 @@ export function ObjectExplorer() {
 					</label>
 
 					<input
+						className="search-field"
 						placeholder="Search names and identifiers"
 						value={search}
 						onChange={(event) => {
@@ -232,9 +235,10 @@ export function ObjectExplorer() {
 								className="btn sm"
 								onClick={() => setSortDescending((current) => !current)}
 								title="Toggle direction"
-							>
-								{sortDescending ? "desc" : "asc"}
-							</button>
+								>
+									<Icon name={sortDescending ? "chevronDown" : "arrowUp"} size={13} />
+									{sortDescending ? "desc" : "asc"}
+								</button>
 						</label>
 					)}
 
@@ -252,10 +256,11 @@ export function ObjectExplorer() {
 									value: "",
 								},
 							])
-						}
-					>
-						+ Filter
-					</button>
+							}
+							>
+								<Icon name="filter" size={13} />
+								Add filter
+							</button>
 				</div>
 
 				{filters.length > 0 && detail && (
@@ -331,9 +336,10 @@ export function ObjectExplorer() {
 									<button
 										className="btn sm"
 										onClick={() => setFilters((current) => current.filter((entry) => entry.id !== row.id))}
-									>
-										Remove
-									</button>
+										>
+											<Icon name="x" size={13} />
+											Remove
+										</button>
 								</div>
 							);
 						})}
@@ -370,20 +376,23 @@ export function ObjectExplorer() {
 
 					<div className="row" style={{ marginTop: 10, gap: 8 }}>
 						<button className="btn sm" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
+							<Icon name="chevronLeft" size={14} />
 							Previous
 						</button>
 						<button
 							className="btn sm"
 							disabled={result.offset + result.returned >= result.totalCount}
 							onClick={() => setPage((p) => p + 1)}
-						>
-							Next
-						</button>
+							>
+								Next
+								<Icon name="chevronRight" size={14} />
+							</button>
 						<span className="muted" style={{ fontSize: 12 }}>
 							page {page + 1}
 						</span>
 						<div style={{ flex: 1 }} />
 						<button className="btn sm" onClick={() => setShowSql((current) => !current)}>
+							<Icon name="code" size={13} />
 							{showSql ? "Hide" : "Show"} SQL
 						</button>
 					</div>
@@ -484,7 +493,7 @@ function ObjectDetail({
 			<div className="rp rp-wide" role="dialog" aria-label={`${type.label} detail`}>
 				<header className="rp-head">
 					<span className="rp-glyph" aria-hidden>
-						◈
+						<Icon name="box" size={18} />
 					</span>
 					<div className="rp-heading">
 						<div className="rp-kind">{type.label.toUpperCase()}</div>
@@ -492,8 +501,8 @@ function ObjectDetail({
 							{title}
 						</h2>
 					</div>
-					<button className="btn sm" onClick={onClose} aria-label="Close">
-						✕
+					<button className="icon-btn" onClick={onClose} aria-label="Close">
+						<Icon name="x" size={17} />
 					</button>
 				</header>
 
@@ -504,7 +513,7 @@ function ObjectDetail({
 			) : (
 				<div className="grid grid-2" style={{ gap: 14 }}>
 					<div>
-						<h4 style={{ margin: "0 0 7px", fontSize: 12, color: "var(--ink-muted)" }}>PROPERTIES</h4>
+						<h4 className="section-label">Properties</h4>
 						<div className="table-wrap" style={{ maxHeight: 340, overflowY: "auto" }}>
 							<table className="data">
 								<tbody>
@@ -533,7 +542,7 @@ function ObjectDetail({
 					</div>
 
 					<div>
-						<h4 style={{ margin: "0 0 7px", fontSize: 12, color: "var(--ink-muted)" }}>LINKS</h4>
+						<h4 className="section-label">Links</h4>
 						<div className="col" style={{ gap: 4, maxHeight: 340, overflowY: "auto" }}>
 							{type.links.map((link) => (
 								<button
@@ -570,7 +579,7 @@ function ObjectDetail({
 					) : (
 						<>
 							{linked.matchRatio < 0.999 && (
-								<div className="banner" style={{ marginBottom: 9 }}>
+								<div className="banner warn" style={{ marginBottom: 9 }}>
 									This link resolves {round(linked.matchRatio * 100, 1)}% of references, so
 									some related objects are not reachable through it.
 								</div>

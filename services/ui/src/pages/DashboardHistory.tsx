@@ -11,7 +11,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, api, session } from "../api";
-import { Empty, ErrorBanner, Spinner } from "../components/common";
+import { Empty, ErrorBanner, PageLoader } from "../components/common";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { Icon } from "../components/icons";
 import { useSpace } from "../SpaceContext";
 
 interface RenameEntry {
@@ -76,6 +78,8 @@ export function DashboardHistory() {
 	const [busy, setBusy] = useState(false);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [outcome, setOutcome] = useState<ImportOutcome | null>(null);
+	// The backup chosen to restore from, held while the person says how.
+	const [pendingFile, setPendingFile] = useState<File | null>(null);
 	const fileRef = useRef<HTMLInputElement>(null);
 
 	const { spaceSlug } = useSpace();
@@ -185,12 +189,19 @@ export function DashboardHistory() {
 			);
 		} finally {
 			setBusy(false);
+			setPendingFile(null);
 			if (fileRef.current) fileRef.current.value = "";
 		}
 	}
 
+	/** Not restoring after all: the same file can be chosen again afterwards. */
+	function cancelRestore() {
+		setPendingFile(null);
+		if (fileRef.current) fileRef.current.value = "";
+	}
+
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
-	if (!entries) return <Spinner label="Loading dashboard history" />;
+	if (!entries) return <PageLoader label="Loading dashboard history" />;
 
 	return (
 		<div className="col" style={{ gap: 14 }}>
@@ -213,11 +224,13 @@ export function DashboardHistory() {
 						onChange={(event) => setQuery(event.target.value)}
 						aria-label="Search dashboards"
 					/>
-					<div className="row" style={{ gap: 4 }}>
+					<div className="segmented" role="radiogroup" aria-label="Filter by origin">
 						{(["all", "ai", "seeded", "renamed"] as Origin[]).map((key) => (
 							<button
 								key={key}
-								className={`btn sm ${origin === key ? "primary" : ""}`}
+								role="radio"
+								aria-checked={origin === key}
+								className={origin === key ? "active" : ""}
 								onClick={() => setOrigin(key)}
 							>
 								{key === "all"
@@ -232,6 +245,7 @@ export function DashboardHistory() {
 					</div>
 					<div className="row" style={{ gap: 6, marginLeft: "auto" }}>
 						<button className="btn sm" onClick={exportAll} disabled={busy}>
+							<Icon name="download" size={13} />
 							Back up to file
 						</button>
 						{canWrite && (
@@ -240,9 +254,10 @@ export function DashboardHistory() {
 									className="btn sm"
 									onClick={() => fileRef.current?.click()}
 									disabled={busy}
-								>
-									Restore…
-								</button>
+									>
+										<Icon name="upload" size={13} />
+										Restore…
+									</button>
 								<input
 									ref={fileRef}
 									type="file"
@@ -250,15 +265,10 @@ export function DashboardHistory() {
 									style={{ display: "none" }}
 									onChange={(event) => {
 										const file = event.target.files?.[0];
-										if (!file) return;
-										// Overwriting replaces boards that already exist, so it is
-										// asked for rather than assumed.
-										const overwrite = window.confirm(
-											`Restore from ${file.name}?\n\n` +
-												"OK — replace dashboards that already exist.\n" +
-												"Cancel — keep existing ones and add only what is missing.",
-										);
-										void importFile(file, overwrite);
+										// Overwriting replaces boards that already exist, so how to
+										// restore is asked for rather than assumed - below, in a
+										// window that can also be backed out of.
+										if (file) setPendingFile(file);
 									}}
 								/>
 							</>
@@ -342,15 +352,16 @@ export function DashboardHistory() {
 											)}
 											{canWrite && (
 												<button
-													className="btn sm"
+													className="btn sm ghost"
 													onClick={() => {
 														setRenaming(entry.slug);
 														setDraftTitle(entry.title);
 														setNotice(null);
 													}}
-												>
-													Rename
-												</button>
+													>
+														<Icon name="pencil" size={12} />
+														Rename
+													</button>
 											)}
 										</>
 									)}
@@ -371,18 +382,20 @@ export function DashboardHistory() {
 							<div className="history-side">
 								{entry.session ? (
 									entry.session.available ? (
-										<Link to="/assistant" className="history-session">
+										// Opens that conversation, not just the assistant: the
+										// link from a board back to what built it.
+										<Link to={`/assistant?session=${entry.session.id}`} className="history-session">
 											<span className="chip">session {entry.session.id}</span>
 											<span className="muted">
 												{entry.session.messageCount} messages · {entry.session.userId}
 											</span>
 										</Link>
 									) : (
-										// The board outlived its conversation, which the retention
-										// policy is entitled to remove. Say that rather than
-										// implying it never had one.
-										<span className="muted" title="Removed by the chat retention policy">
-											session {entry.session.id} · purged
+										// The board outlived its conversation: its owner deleted
+										// it, or the retention policy removed it. Say that rather
+										// than implying it never had one.
+										<span className="muted" title="The conversation was deleted, or removed by the chat retention policy">
+											session {entry.session.id} · no longer kept
 										</span>
 									)
 								) : (
@@ -409,6 +422,37 @@ export function DashboardHistory() {
 						</div>
 					))}
 				</div>
+			)}
+
+			{pendingFile && (
+				<ConfirmDialog
+					title="Restore dashboards from a backup"
+					icon="upload"
+					busy={busy}
+					onCancel={cancelRestore}
+					choices={[
+						{
+							label: "Replace existing",
+							tone: "danger",
+							onSelect: () => void importFile(pendingFile, true),
+						},
+						{
+							label: "Add only what is missing",
+							tone: "primary",
+							onSelect: () => void importFile(pendingFile, false),
+						},
+					]}
+				>
+					<p>
+						From <strong className="mono">{pendingFile.name}</strong>. A dashboard in the file whose metric no longer
+						exists here is skipped and named afterwards.
+					</p>
+					<p>
+						<strong>Add only what is missing</strong> leaves every dashboard already in this space as it is.{" "}
+						<strong>Replace existing</strong> also overwrites the ones with the same address with the file's
+						version, and what they are now cannot be brought back.
+					</p>
+				</ConfirmDialog>
 			)}
 		</div>
 	);

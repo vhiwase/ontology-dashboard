@@ -514,6 +514,24 @@ export async function setFunctionStatus(
 	return getFunction(current.apiName);
 }
 
+/**
+ * Remove a function for good, with the record of every time it ran.
+ *
+ * Archiving is the reversible way to retire one: it stays in the list, marked
+ * as no longer in use. This is for the one that should not be there at all - a
+ * draft nobody wants, a mistake - and it frees the name.
+ */
+export async function deleteFunction(apiName: string): Promise<{ apiName: string; name: string; runs: number }> {
+	const current = await getFunction(apiName);
+	const runs = await queryOne<{ n: string }>(
+		"SELECT count(*)::text AS n FROM platform.function_run WHERE function_id = $1",
+		[current.id],
+	);
+	// function_run rows go with it (ON DELETE CASCADE).
+	await query("DELETE FROM platform.function WHERE function_id = $1", [current.id]);
+	return { apiName: current.apiName, name: current.name, runs: Number(runs?.n ?? 0) };
+}
+
 // ── execution ───────────────────────────────────────────────────────────────
 
 export interface FunctionResult {

@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { Icon } from "../icons";
 
 /** An empty ontology is the normal start: object types come from datasets. */
 export function NoObjectTypesYet() {
@@ -9,7 +10,7 @@ export function NoObjectTypesYet() {
 	return (
 		<div className="empty-space">
 			<div className="empty-space-mark" aria-hidden>
-				◇
+				<Icon name="box" size={24} />
 			</div>
 			<h3>No object types yet</h3>
 			<p>
@@ -19,9 +20,11 @@ export function NoObjectTypesYet() {
 			</p>
 			<div className="row" style={{ gap: 8, justifyContent: "center" }}>
 				<Link className="btn" to="/browse/datasets">
+					<Icon name="table" size={15} />
 					Open datasets
 				</Link>
 				<Link className="btn primary" to={`/assistant?prompt=${build}`}>
+					<Icon name="sparkles" size={15} />
 					Build with the AI-FDE
 				</Link>
 			</div>

@@ -142,9 +142,12 @@ neither. Data without both dates is told so - it is never estimated.
 
 **Upgrading an existing install:** re-run `./scripts/init-secrets.sh` - it adds
 `credential_key` without touching the existing secrets - then
-`docker compose up -d --build`. The pipeline applies the pending migrations at
-start (workspaces, proposals and per-workspace audit are 0032-0034, after the
-dataset-ontology migrations 0027-0031).
+`docker compose up -d --build`. If the script says it replaced a directory with
+a file, use `docker compose up -d --build --force-recreate` instead (see
+[Secrets](#secrets) for why a restart is not enough). The pipeline applies the
+pending migrations at start (workspaces, proposals and per-workspace audit are
+0032-0034, after the dataset-ontology migrations 0027-0031; the admin console
+is 0035; 0036 lets a conversation be deleted without deleting what it cost).
 
 A question that names a value - "revenue in Germany", "orders shipped via
 Speedy Express", "customers in Mexico" - is answered for that value. The
@@ -345,11 +348,18 @@ platform's bookkeeping, not source data.
 ### Schedules (`/schedules`)
 
 One row per sync, with its cadence beside it. Choose *Manual only*, *Every 20
-minutes* … *Every 8 days*, or *Custom…* for anything like `45m`, `3d`, `2w`
-(at least a minute, at most a year).
+minutes* … *Every 8 days*, or *Custom schedule…*, which opens a window: repeat
+every *n* minutes, hours, days or weeks (at least a minute, at most a year), and
+the **first run** picked on a calendar with a time — or one interval from now.
+The runs that follow are listed before anything is saved.
 
 - **One cadence per sync**, enforced by a unique index: two schedules on one
   dataset would each rebuild it under the other.
+- **A schedule keeps its rhythm.** Each run is due a whole number of intervals
+  after the first, counted from when the last one was *due* rather than when the
+  tick reached it — so "every day at 02:00" is still 02:00 a month on, and a run
+  missed while the service was down is followed by the next one at its usual
+  time. A first run already past starts at the next moment on the same rhythm.
 - **A scheduled run is a normal run** — the same function as *Run now* — and lands
   in the same run history.
 - **The claim is the fire.** `next_run_at` moves forward inside the same `UPDATE`
@@ -361,12 +371,19 @@ The loop ticks every `SCHEDULE_TICK_SECONDS` (default 20; `0` disables it).
 ```bash
 # Every 2 hours; "manual" removes the schedule
 curl -X POST -H "authorization: Bearer $TOKEN" -d '{"every":"2h"}' .../api/syncs/3/schedule
+# Every 3 days, first at 02:00 on the 6th (a date and time with its zone)
+curl -X POST -H "authorization: Bearer $TOKEN" \
+     -d '{"every":"3d","startAt":"2026-10-06T02:00:00+05:30"}' .../api/syncs/3/schedule
 ```
 
 ### Datasets (`/browse/datasets`)
 
 Each synced view, with where it came from, when it was last synced, what it is
-modelled as, and its rows. **Create object type** opens the profile as a form:
+modelled as, and its rows. **Add dataset** chooses a connection and one of its
+views and syncs it — the same sync the connection's page sets up. A sync's first
+run is what registers its dataset, and the list and the count in the navigation
+are re-read whenever one runs, so a new dataset is there without reloading the
+page. **Create object type** opens the profile as a form:
 every column kept, each with its suggested role, the key chosen from the columns
 that qualify — a person corrects rather than composes. **Ask the AI-FDE to model
 it** hands the same request to the assistant.
@@ -378,7 +395,9 @@ it** hands the same request to the assistant.
 - **Object types** shows each type's properties with their semantic role and
   column, its links with their match ratios, its actions and metrics, and the
   change history — every creation, edit and deletion, with who made it and what
-  it replaced, and an undo.
+  it replaced, and an undo. A type's **title column** — the one an object is
+  named by in lists and pickers — is chosen from its own columns and is the
+  single record of that choice; a column the type does not have is refused.
 - **Graph** is a force layout of the types and links; dashed edges are partial
   joins. Export the ontology as OWL, SHACL, Mermaid, DOT, ER or JSON Schema.
 - **Object explorer** queries any type with filters built from its properties,
@@ -400,7 +419,13 @@ approves it. Its SQL is restricted in three layers:
    hidden behind an `information_schema` view, is refused by name;
 3. it runs as a subquery inside a `READ ONLY` transaction with a 30-second limit.
 
-**Actions** — pick one, fill the form, run it. The ontology role decides what is
+**Actions** — pick one, fill the form, run it. An action runs **as whoever is
+signed in**: the actor and the ontology role come from the token, never from the
+request, so the page offers no role to "act as". The form knows the data: the
+object the action acts on is chosen from its own records, searched by name
+rather than typed as an id; a parameter that names a field is chosen from the
+object type's fields, with the value it holds now beside it; the rest are typed
+in a control that fits their declared type. The ontology role decides what is
 permitted through ontograph's `AccessController` with **default-deny**. Every
 action returns **`staged`** and writes an audit row with the exact payload that
 would be sent. The Business Analyst role may run none.
@@ -411,7 +436,65 @@ A widget names a **metric** and how to slice it; it never carries SQL, so the
 worst a bad generation can do is pick the wrong metric, not run the wrong query.
 `/dashboards/history` shows where each board came from and lets you rename, back
 up to a file and restore — a restore validates every widget against the
-**current** metrics and skips one whose metric no longer exists.
+**current** metrics and skips one whose metric no longer exists. Restoring asks
+first whether a board that already exists should be replaced or left as it is
+(or neither: cancelling restores nothing), and deleting a board asks before it
+goes. A board the assistant built links back to the conversation that built it.
+
+### Deleting
+
+Every list has a **Delete**: connections, datasets, schedules, object types,
+links, actions, metrics, functions, dashboards and approvals - and, in a
+personal workspace, the databases and tables under *Data sources*. It deletes
+the thing, not its card: a deleted object type is not back after the next
+change to the model, and a deleted dataset is not back after the next sync.
+
+The window that asks first is read from the database at that moment and lists
+three things - what is **deleted with it**, what is **built on it** and would
+be deleted too, and what is **kept but affected**:
+
+| Deleting | Goes with it | Built on it (deleted too, once confirmed) | Kept |
+|---|---|---|---|
+| a connection | its syncs, each with its schedule and the record of its runs; its stored password | | the datasets it landed, with the rows they have now; they can no longer be refreshed |
+| a dataset | its copied table; its sync, with its schedule and the record of its runs | the object types built on it and the combined datasets that read it, each with its metrics, links and actions | the connection; a dashboard showing one of those metrics, with that widget in error; a function that reads the table, which fails until it is changed |
+| a sync (on *Schedules*) | its schedule and the record of its runs | | its dataset, with the rows it has now |
+| a schedule | | | the sync, which then runs only when someone starts it |
+| an object type | its properties; a combined dataset's view | its metrics, its links (either end) and its actions | the dataset; a dashboard showing one of those metrics, with that widget in error |
+| a metric | | | a dashboard showing it, with that widget in error |
+| a link | | | the object types at both ends |
+| an action | | | every run already in its audit trail |
+| a function | its recorded runs | | |
+| a dashboard or report | | | the metrics it showed |
+| an approval | | | whatever an approved one added to the model |
+
+Nothing with a name of its own is lost to a delete that did not mention it: a
+request that leaves out what is built on something is refused with `409` and
+the list, and goes through only with `cascade=true` - which is what the button
+"Delete it and *n* things built on it" sends. Three things are refused
+outright and say why: an object type the pipeline generates (its next run would
+rebuild it), a proposal another proposal is still waiting on, and a table that
+something outside this space's model reads.
+
+A dataset's table is dropped only when it is provably that dataset's own: the
+sync that lands it is in the same space, or the card is the one a sync run
+registered. A dataset registered by hand over some other relation comes off
+the list - with what was modelled on it, once confirmed - and the relation
+itself is left alone.
+
+```bash
+# What deleting it would do - changes nothing
+curl -H "authorization: Bearer $TOKEN" .../api/removal/objectType/Order
+# Do it, with what is built on it
+curl -X DELETE -H "authorization: Bearer $TOKEN" ".../api/removal/objectType/Order?cascade=true"
+```
+
+`kind` is one of `connection`, `dataset`, `sync`, `schedule`, `objectType`,
+`linkType`, `actionType`, `metric`, `function`, `dashboard`, `proposal`; the
+reference is an id, an api name or a dashboard's slug. `DELETE
+/api/resources/:id` does the same for whatever a workspace card stands for.
+Deleting needs the `admin` role in the space - an administrator in the shared
+spaces, the owner in their own workspace - and everyone else is not shown the
+button.
 
 ### The AI-FDE assistant (`/assistant`)
 
@@ -443,6 +526,54 @@ each dataset, creates the types, draws the links the data supports (at least
 **Built in this turn** card, the metric values, and a Mermaid diagram. A read
 made before a write in the same turn is never served from its duplicate-call
 cache, so it sees what it just created.
+
+**A conversation outlives the page.** It is held above the pages, one per space,
+so opening a dataset or a schedule and coming back finds it where it was, and a
+question still being answered keeps running meanwhile. It is stored on the
+server, so a reload reopens it, and only **New conversation** (or **New chat**
+in the history) starts another.
+
+**Every conversation is kept, and the history is beside it.** Each question,
+each answer, what was attached to it and what it cost is a row in
+`platform.chat_session` / `platform.chat_message`, under the account that
+asked and the space it was asked in. The panel on the left of the page lists
+that account's conversations in the space, newest first under *Today*,
+*Yesterday*, *Previous 7 days*, … with the one on screen marked:
+
+- **Open** one to continue it where it stopped.
+- **Search** looks through the names and through everything asked and answered,
+  and shows the passage that matched.
+- **Rename** one; **pin** it to keep it at the top.
+- **Delete** erases what was said - questions, answers, attachments - and takes
+  it out of every list. What it cost stays on record, so deleting a
+  conversation does not hand back any of the month's AI credit or take money
+  out of the cost report. What it built (dashboards, metrics, proposals) stays.
+- What the page itself adds to a conversation - "Approved and built: …" after
+  approving a proposal from inside it - is stored with it, so it reads the same
+  when it is opened again.
+
+An administrator can switch the panel from *Mine* to *Everyone's* in a shared
+space; nobody else can list, open, rename or delete another account's
+conversation (the API answers `404`, not `403`, so ids cannot be probed). The
+**History** button in the bar hides and shows the panel; on a narrow window it
+slides over the conversation instead of sitting beside it.
+
+```bash
+# The caller's conversations in a space; q searches, limit/offset page
+curl -H "authorization: Bearer $TOKEN" ".../api/assistant/sessions?space=sandbox&scope=mine&q=freight"
+curl -H "authorization: Bearer $TOKEN" .../api/assistant/sessions/42            # every message of one
+curl -X PATCH -H "authorization: Bearer $TOKEN" -H "content-type: application/json" \
+     -d '{"title":"Freight by country","pinned":true}' .../api/assistant/sessions/42
+curl -X DELETE -H "authorization: Bearer $TOKEN" .../api/assistant/sessions/42
+```
+
+**A question is answered by choosing.** When the assistant needs the person to
+pick — which tables to sync, which datasets to model, whether to go ahead — the
+choices open in a panel above the message box: one or several, an optional note,
+and **Submit answer**. It asks through the `request_clarification` tool, which
+carries whatever it had to say first (asking never replaces answering); a reply
+that still closes with a question in prose has its choices read off it by one
+small extra call, priced into the turn.
 
 Try:
 
@@ -520,6 +651,9 @@ Development, Staging and Production** exist from the start, each with its own
 connections, syncs, datasets, ontology, functions, dashboards and conversations.
 The sandbox is set up at boot with a *TMS Platform* project (`/Connections`,
 `/Datasets`, `/Ontology`, `/Outputs`) and the platform-database connection.
+That connection is added when the project is first set up and not again: one
+that was deleted stays deleted across restarts, and `POST
+/api/spaces/sandbox/seed` puts it back when it is wanted.
 
 A **resource** is the addressable card. Seven kinds: connection, dataset, object
 type, link type, action type, metric and dashboard. Datasets are filed by their
@@ -547,6 +681,7 @@ one sign-in works across both APIs.
 | reads: object types, objects, metrics, datasets, profiles, dashboards | `viewer` |
 | connections, syncs, schedules; object types, links, actions, metrics; function proposals; dashboards | `analyst` |
 | deleting anything, approving functions, the audit trail, registry reload | `admin` |
+| the admin console, `/api/admin/*` | the **platform** `admin` role |
 
 Anything under `/api` added later needs at least `viewer`: the guard is mounted
 once, ahead of the routes.
@@ -559,6 +694,33 @@ docker compose run --rm pipeline python -m pipeline.users revoke jo   # kills is
 
 Passwords are scrypt, in a format both Python and Node derive from their
 standard library.
+
+### The admin console (`/admin`)
+
+For platform administrators, with the same sign-in — there is no second
+password. An analyst is the admin of their own workspace and is still refused
+here: `/api/admin/*` is pinned to the platform role, whichever space a request
+names.
+
+- **Overview** — accounts, what the assistant has cost this month and today, who
+  is spending it, and what needs attention (credit used up, no default set).
+- **Users** — add an account (it gets its private workspace), change its role,
+  business role and monthly AI credit, set a new password, sign it out
+  everywhere, disable it, or delete it. Nobody can delete, disable or demote
+  themselves, and the last active admin cannot be removed. Deleting removes the
+  account and frees the username; the workspace, conversations and notes it owned
+  are kept under a label nobody can sign in as, so the cost history stays whole.
+  Kept is not kept running: that workspace's scheduled refreshes are switched
+  off and the database passwords it stored are removed, so nothing goes on
+  reading a deleted person's database.
+- **Defaults** — the default model, the Azure prices per million tokens, the
+  default monthly AI credit, whether anyone may register and with which role.
+  Stored in `platform.app_setting` and applied within seconds, with no restart.
+  A setting nobody has set falls back to its environment variable and then the
+  built-in default, so `.env` works as before.
+- **Activity** — every change made in the console, with who made it.
+
+The CLI above and the console manage the same `app_user` rows.
 
 ### Secrets
 
@@ -573,6 +735,26 @@ gitignored.
 | `postgres_password` | Postgres, and the sandbox connection's credential reference |
 | `database_url` | all three services |
 | `azure_openai_key` | the assistant |
+| `credential_key` | the ontology service, to encrypt the connection passwords typed into the connect form |
+
+Each must be a **file**. A stack started before a secret's file exists gets an
+empty *directory* at that path from Docker, and the service cannot read its
+key. The ontology service checks the credential key as it starts and logs
+`[boot] credential vault ready` or `[boot] CREDENTIAL VAULT NOT USABLE` with the
+reason; until it is fixed, saving a connection with a typed password answers
+`503` and says so, rather than "Internal server error". The fix is to re-run
+`./scripts/init-secrets.sh` - it replaces such an empty directory with the key
+and leaves every existing secret alone - then **recreate** the containers:
+`docker compose up -d --build --force-recreate`. Restarting is not enough, and
+on Docker Desktop it is worse than that: a container that started with the
+directory mounted cannot start again once the path is a file ("Are you trying
+to mount a directory onto a file?"), and for as long as it keeps running,
+Docker shows the directory to every new container as well.
+
+A stored connection password lives exactly as long as what it is for. Deleting
+a connection - by itself, with its folder or with its project - removes its
+password from the vault, and deleting an account removes every password its
+workspace stored.
 
 ### Cost controls
 
@@ -582,10 +764,21 @@ both per process. Every turn's tokens and price are recorded — including a tur
 the model stopped part way through — and shown on the turn and at
 `/assistant/cost`.
 
+A **monthly AI credit** per person is set in the admin console: the platform
+default, an account's own limit, or none. Spend is what the person's turns cost
+this calendar month, priced when they ran. A question is refused (`402`) only
+*before* it starts, once the credit is used up; a turn already running is never
+cut off. The message box shows what is left, and a refused question is put back
+in it rather than lost. Deleting a conversation does not lower the spend: the
+record of what each answer cost outlives what it said.
+
 ### Retention and logs
 
 `CHAT_RETENTION_DAYS` purges conversations idle longer than the window on each
-pipeline run (`0` disables it). Both services emit one JSON line per request
+pipeline run (`0`, the default, disables it: a conversation is then kept until
+its owner deletes it). A **pinned** conversation is never purged, and the
+history panel says which of the two applies, so nobody is told a conversation
+is kept that a clean-up will remove. Both services emit one JSON line per request
 carrying a `requestId`, forwarded from the assistant to the ontology service, so
 one chat turn and every query it caused share one value. A 5xx returns only the
 request id; the detail stays in the log.
@@ -594,6 +787,7 @@ request id; the detail stays in the log.
 
 ```bash
 cd services/ontology-service && npm test          # unit tests (vitest)
+cd services/ui              && npm test          # the UI's own rules (vitest)
 cd services/ai-fde          && pytest tests/ -q
 cd services/pipeline        && pytest tests/ -q
 cd e2e && npm test                                # browser journey, against a running stack
@@ -606,7 +800,9 @@ suggestions, the definition builder (held to ontograph's own validator and
 write-aware cache and failure summaries, and - for workspaces - role inference,
 request parsing, feasibility decisions, derived expressions, proposals and
 follow-ups, registration, space roles, connection address classes, the vault
-and the built-in planner. `e2e/` drives a browser through sign-up, connect,
+and the built-in planner; who may delete and how a refused delete reads; and
+the conversation history - searching it, the grouping by day, and a delete
+that erases what was said and leaves what it cost. `e2e/` drives a browser through sign-up, connect,
 import, ask, approve and the built board (see `e2e/README.md`). `.github/workflows/ci.yml` runs all of
 it plus typechecks, an `nginx -t` and a full image build.
 
@@ -631,10 +827,11 @@ services/ontology-service/src/
                       connections (sources, syncs) · schedules (the loop)
                       authoring (profile, object types, suggestions, actions, metrics)
                       builder (edits, links, deletes, history) · definition (document, cards)
+                      removal (what a delete takes with it, for every kind)
                       functions + sqlGuard · objectSet · kpi · actions · dashboards
                       spaces · resourceData · documentation · registry · auth
 services/ai-fde/app/  llm (Azure OpenAI) · modes · tools · capability_tools
-                      agent · prompts · store · ontology_client
+                      agent · prompts · store (conversations, their history) · ontology_client
 services/ui/src/      pages: Overview, OntologyManager, ObjectExplorer, GraphView,
                       ResourceBrowser (connections, datasets, metrics), Schedules,
                       Functions, Actions, Dashboards, Assistant, Spaces

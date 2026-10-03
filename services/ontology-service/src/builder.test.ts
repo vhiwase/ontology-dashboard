@@ -17,7 +17,7 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("./db", () => ({ query: vi.fn(async () => []), queryOne: vi.fn(async () => null) }));
 vi.mock("./kpi", () => ({ clearColumnCache: vi.fn() }));
 
-import { inverseNameFor, resolveFields } from "./builder";
+import { inverseNameFor, resolveFields, resolveTitleColumn } from "./builder";
 
 describe("editable fields", () => {
 	it("maps a camelCase field to its SQL column", () => {
@@ -103,6 +103,36 @@ describe("per-kind allow-lists are distinct", () => {
 		expect(() => resolveFields("actionType", { cardinality: "ONE_TO_ONE" })).toThrow(
 			/not an editable field/,
 		);
+	});
+});
+
+describe("the title column", () => {
+	const account = {
+		apiName: "Account",
+		properties: [
+			{ apiName: "id", sqlColumn: "id" },
+			{ apiName: "name", sqlColumn: "name" },
+			{ apiName: "generalEmail", sqlColumn: "general_email" },
+		],
+	};
+
+	it("is stored as the column, whichever name it was given by", () => {
+		expect(resolveTitleColumn(account, "general_email")).toBe("general_email");
+		// The rest of the API speaks property names, so one is accepted.
+		expect(resolveTitleColumn(account, "generalEmail")).toBe("general_email");
+	});
+
+	// It becomes an identifier in every search on the type: a name that is not
+	// a column would be saved happily and then break all of them.
+	it("refuses a name that is not one of the type's columns, and lists them", () => {
+		expect(() => resolveTitleColumn(account, "title")).toThrow(/not a column of Account.*id, name, general_email/s);
+		expect(() => resolveTitleColumn(account, 'name"; DROP TABLE x; --')).toThrow(/not a column of Account/);
+	});
+
+	it("clears the title on null or nothing", () => {
+		expect(resolveTitleColumn(account, null)).toBeNull();
+		expect(resolveTitleColumn(account, "")).toBeNull();
+		expect(resolveTitleColumn(account, undefined)).toBeNull();
 	});
 });
 

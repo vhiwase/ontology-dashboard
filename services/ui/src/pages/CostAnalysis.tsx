@@ -12,7 +12,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, session } from "../api";
-import { ErrorBanner, Spinner } from "../components/common";
+import { ErrorBanner, PageLoader } from "../components/common";
+import { Icon } from "../components/icons";
 import { useSpace } from "../SpaceContext";
 
 interface Totals {
@@ -91,7 +92,7 @@ export function CostAnalysis() {
 	useEffect(load, [load]);
 
 	if (error) return <ErrorBanner error={error} onRetry={load} />;
-	if (!summary) return <Spinner label="Loading cost analysis" />;
+	if (!summary) return <PageLoader label="Loading cost analysis" />;
 
 	const { totals } = summary;
 	const peak = Math.max(1, ...summary.byDay.map((row) => row.cost));
@@ -105,11 +106,13 @@ export function CostAnalysis() {
 					<span className="sub">
 						{summary.scope === "everyone" ? "all users" : `your usage (${summary.scope})`}
 					</span>
-					<div className="row" style={{ gap: 4, marginLeft: 10 }}>
+					<div className="segmented" role="radiogroup" aria-label="Window" style={{ marginLeft: 10 }}>
 						{[7, 30, 90].map((window) => (
 							<button
 								key={window}
-								className={`btn sm ${days === window ? "primary" : ""}`}
+								role="radio"
+								aria-checked={days === window}
+								className={days === window ? "active" : ""}
 								onClick={() => setDays(window)}
 							>
 								{window}d
@@ -120,18 +123,30 @@ export function CostAnalysis() {
 
 				<div className="cost-tiles">
 					<div className="cost-tile">
+						<span className="stage-icon" aria-hidden>
+							<Icon name="dollar" size={15} />
+						</span>
 						<div className="cost-value">{usd(totals.total_cost)}</div>
 						<div className="cost-label">Total spend</div>
 					</div>
 					<div className="cost-tile">
+						<span className="stage-icon" aria-hidden>
+							<Icon name="barChart" size={15} />
+						</span>
 						<div className="cost-value">{totals.total_tokens.toLocaleString("en-US")}</div>
 						<div className="cost-label">Tokens</div>
 					</div>
 					<div className="cost-tile">
+						<span className="stage-icon" aria-hidden>
+							<Icon name="message" size={15} />
+						</span>
 						<div className="cost-value">{totals.turns.toLocaleString("en-US")}</div>
 						<div className="cost-label">Turns</div>
 					</div>
 					<div className="cost-tile">
+						<span className="stage-icon" aria-hidden>
+							<Icon name="trendingUp" size={15} />
+						</span>
 						<div className="cost-value">{usd(avgPerTurn)}</div>
 						<div className="cost-label">Average per turn</div>
 					</div>
@@ -152,32 +167,34 @@ export function CostAnalysis() {
 				<div className="card-head">
 					<h3>By model</h3>
 				</div>
-				<table className="dense">
-					<thead>
-						<tr>
-							<th>Provider</th>
-							<th>Model</th>
-							<th>Turns</th>
-							<th>Tokens</th>
-							<th>Cost</th>
-							<th>Per turn</th>
-						</tr>
-					</thead>
-					<tbody>
-						{summary.byModel.map((row) => (
-							<tr key={`${row.provider}-${row.model}`}>
-								<td>{row.provider}</td>
-								<td className="mono">{row.model}</td>
-								<td className="mono">{row.turns.toLocaleString("en-US")}</td>
-								<td className="mono">{row.tokens.toLocaleString("en-US")}</td>
-								<td className="mono">{usd(row.cost)}</td>
-								<td className="mono muted">
-									{row.turns > 0 ? usd(row.cost / row.turns) : "—"}
-								</td>
+				<div className="table-wrap">
+					<table className="dense">
+						<thead>
+							<tr>
+								<th>Provider</th>
+								<th>Model</th>
+								<th>Turns</th>
+								<th>Tokens</th>
+								<th>Cost</th>
+								<th>Per turn</th>
 							</tr>
-						))}
-					</tbody>
-				</table>
+						</thead>
+						<tbody>
+							{summary.byModel.map((row) => (
+								<tr key={`${row.provider}-${row.model}`}>
+									<td>{row.provider}</td>
+									<td className="mono">{row.model}</td>
+									<td className="mono">{row.turns.toLocaleString("en-US")}</td>
+									<td className="mono">{row.tokens.toLocaleString("en-US")}</td>
+									<td className="mono">{usd(row.cost)}</td>
+									<td className="mono muted">
+										{row.turns > 0 ? usd(row.cost / row.turns) : "—"}
+									</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
 			</div>
 
 			<div className="card">
@@ -219,26 +236,28 @@ export function CostAnalysis() {
 						<h3>By user</h3>
 						<span className="sub">admin view</span>
 					</div>
-					<table className="dense">
-						<thead>
-							<tr>
-								<th>User</th>
-								<th>Turns</th>
-								<th>Tokens</th>
-								<th>Cost</th>
-							</tr>
-						</thead>
-						<tbody>
-							{summary.byUser.map((row) => (
-								<tr key={row.username}>
-									<td>{row.username}</td>
-									<td className="mono">{row.turns.toLocaleString("en-US")}</td>
-									<td className="mono">{row.tokens.toLocaleString("en-US")}</td>
-									<td className="mono">{usd(row.cost)}</td>
+					<div className="table-wrap">
+						<table className="dense">
+							<thead>
+								<tr>
+									<th>User</th>
+									<th>Turns</th>
+									<th>Tokens</th>
+									<th>Cost</th>
 								</tr>
-							))}
-						</tbody>
-					</table>
+							</thead>
+							<tbody>
+								{summary.byUser.map((row) => (
+									<tr key={row.username}>
+										<td>{row.username}</td>
+										<td className="mono">{row.turns.toLocaleString("en-US")}</td>
+										<td className="mono">{row.tokens.toLocaleString("en-US")}</td>
+										<td className="mono">{usd(row.cost)}</td>
+									</tr>
+								))}
+							</tbody>
+						</table>
+					</div>
 				</div>
 			)}
 
@@ -247,32 +266,35 @@ export function CostAnalysis() {
 					<h3>Rates</h3>
 					<span className="sub">USD per million tokens</span>
 				</div>
-				<table className="dense">
-					<thead>
-						<tr>
-							<th>Provider</th>
-							<th>Input</th>
-							<th>Output</th>
-							<th>Source</th>
-						</tr>
-					</thead>
-					<tbody>
-						{Object.entries(summary.rates).map(([provider, rate]) => (
-							<tr key={provider}>
-								<td>{provider}</td>
-								<td className="mono">${rate.inputPerMillion.toFixed(2)}</td>
-								<td className="mono">${rate.outputPerMillion.toFixed(2)}</td>
-								<td className="muted">{rate.source}</td>
+				<div className="table-wrap">
+					<table className="dense">
+						<thead>
+							<tr>
+								<th>Provider</th>
+								<th>Input</th>
+								<th>Output</th>
+								<th>Source</th>
 							</tr>
-						))}
-					</tbody>
-				</table>
+						</thead>
+						<tbody>
+							{Object.entries(summary.rates).map(([provider, rate]) => (
+								<tr key={provider}>
+									<td>{provider}</td>
+									<td className="mono">${rate.inputPerMillion.toFixed(2)}</td>
+									<td className="mono">${rate.outputPerMillion.toFixed(2)}</td>
+									<td className="muted">{rate.source}</td>
+								</tr>
+							))}
+						</tbody>
+					</table>
+				</div>
 				<p className="muted rp-note" style={{ marginTop: 8 }}>
 					Rates marked <em>list price (verify)</em> are defaults, not your contract. Azure
 					pricing varies by region and commitment, and an enterprise agreement usually does not
-					pay list. Set <span className="mono">COST_AZURE_INPUT_PER_M</span> and{" "}
-					<span className="mono">COST_AZURE_OUTPUT_PER_M</span> in <span className="mono">.env</span>{" "}
-					and check them against an invoice before anyone makes a decision on these numbers.
+					pay list. An administrator sets them under <em>Defaults</em> in the admin console (or with{" "}
+					<span className="mono">COST_AZURE_INPUT_PER_M</span> and{" "}
+					<span className="mono">COST_AZURE_OUTPUT_PER_M</span> in <span className="mono">.env</span>);
+					check them against an invoice before anyone makes a decision on these numbers.
 				</p>
 			</div>
 		</div>

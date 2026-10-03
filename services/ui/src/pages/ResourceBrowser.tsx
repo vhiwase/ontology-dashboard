@@ -15,19 +15,38 @@
  *
  * Two kinds carry the next step of the flow on their page: a connection its
  * syncs and how often each runs, a dataset the object type made from it.
+ *
+ * The list is read again on every visit. Resources are registered from
+ * elsewhere too - a scheduled sync's first run, the assistant, another
+ * person - and a list loaded once per sign-in would not show them.
+ *
+ * Delete deletes the thing, not its card. The x that used to sit on each row
+ * only unregistered the card, which for a metric, a type, a link or an action
+ * came back with the next change to the ontology, and for a dataset with its
+ * next sync. It now opens the same confirmation as everywhere else, which
+ * lists what goes with it first.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { ApiError, api, session } from "../api";
+import { api, session } from "../api";
 import { useResources, type BrowseResource } from "../ResourceContext";
 import { useSpace } from "../SpaceContext";
 import { DataGrid, type DataPage } from "../components/data/DataGrid";
 import { CreateObjectTypeDialog } from "../components/ontology/CreateObjectTypeDialog";
+import { AddDatasetDialog } from "../components/spaces/AddDatasetDialog";
 import { SyncPanel } from "../components/spaces/SyncPanel";
 import { BROWSE_KINDS, RESOURCE_SPECS } from "../components/spaces/resourceKinds";
 import { ConnectionDialog } from "../components/spaces/ConnectionDialog";
+import {
+	DeleteButton,
+	DeleteDialog,
+	type RemovableKind,
+	deletedNotice,
+	useCanDelete,
+} from "../components/DeleteDialog";
 import { Empty, ErrorBanner, Spinner } from "../components/common";
+import { Icon } from "../components/icons";
 
 interface LineageEntry {
 	kind: string;
@@ -43,23 +62,44 @@ interface Preview {
 /** How many rows the inline preview shows before "Open full data". */
 const PREVIEW_ROWS = 25;
 
+/** What a card stands for, as the server's delete knows it - or null for a card that stands for nothing. */
+function removalTarget(resource: BrowseResource): { kind: RemovableKind; target: string | number } | null {
+	switch (resource.kind) {
+		case "connection":
+		case "dataset":
+			return { kind: resource.kind, target: resource.id };
+		case "objectType":
+		case "linkType":
+		case "actionType":
+			return resource.targetRef ? { kind: resource.kind, target: resource.targetRef } : null;
+		case "kpi":
+			return resource.targetRef ? { kind: "metric", target: resource.targetRef } : null;
+		case "dashboard":
+			return resource.targetRef ? { kind: "dashboard", target: resource.targetRef } : null;
+		default:
+			return null;
+	}
+}
+
 export function ResourceBrowser() {
 	const { kind: slug } = useParams<{ kind: string }>();
 	const entry = BROWSE_KINDS.find((item) => item.slug === slug) ?? BROWSE_KINDS[0]!;
 	const spec = RESOURCE_SPECS[entry.kind];
 	const { resources, loading, refresh } = useResources();
-	const { spaceSlug, space } = useSpace();
+	const { spaceSlug, space, reload } = useSpace();
 
 	const [filter, setFilter] = useState("");
 	const [selectedId, setSelectedId] = useState<number | null>(null);
-	const [confirming, setConfirming] = useState<number | null>(null);
-	const [deleting, setDeleting] = useState<number | null>(null);
+	// The resource whose deletion is being confirmed.
+	const [removing, setRemoving] = useState<BrowseResource | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [gridOpen, setGridOpen] = useState(false);
 	const [notice, setNotice] = useState<string | null>(null);
 	const [creating, setCreating] = useState(false);
+	const [addingDataset, setAddingDataset] = useState(false);
 	const role = session.user()?.role;
 	const canWrite = role === "admin" || role === "analyst";
+	const canDelete = useCanDelete();
 
 	const items = useMemo(() => {
 		const needle = filter.trim().toLowerCase();
@@ -78,9 +118,24 @@ export function ResourceBrowser() {
 	// than keeping an id that belongs to a different list.
 	useEffect(() => {
 		setFilter("");
-		setConfirming(null);
+		setRemoving(null);
 		setSelectedId(null);
+		setNotice(null);
+		setError(null);
 	}, [entry.kind, spaceSlug]);
+
+	// Opening a list re-reads it, so what was registered since the last look
+	// is there. It is a quiet refresh: the list on screen stays until the new
+	// one arrives.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: once per list opened
+	useEffect(() => {
+		void refresh();
+	}, [entry.kind]);
+
+	const connections = useMemo(
+		() => resources.filter((resource) => resource.kind === "connection").sort((a, b) => a.name.localeCompare(b.name)),
+		[resources],
+	);
 
 	useEffect(() => {
 		if (selectedId === null || !items.some((item) => item.id === selectedId)) {
@@ -89,27 +144,14 @@ export function ResourceBrowser() {
 	}, [items, selectedId]);
 
 	const selected = items.find((item) => item.id === selectedId) ?? null;
-
-	async function remove(resource: BrowseResource) {
-		setDeleting(resource.id);
-		setError(null);
-		try {
-			await api.del(`/api/resources/${resource.id}`);
-			await refresh();
-		} catch (exc) {
-			setError(exc instanceof ApiError ? exc.message : String(exc));
-		} finally {
-			setDeleting(null);
-			setConfirming(null);
-		}
-	}
+	const removingTarget = removing ? removalTarget(removing) : null;
 
 	return (
 		<div className="rb">
 			<aside className="rb-list card">
 				<div className="rb-list-head">
 					<span className="rb-glyph" style={{ color: spec.accent }} aria-hidden>
-						{spec.glyph}
+						<Icon name={spec.icon} size={15} />
 					</span>
 					<strong>{entry.label}</strong>
 					<span className="wsp-badge">{items.length}</span>
@@ -128,8 +170,17 @@ export function ResourceBrowser() {
 						className="btn sm"
 						style={{ margin: "0 8px 8px" }}
 						onClick={() => setCreating(true)}
-					>
-						New connection
+						>
+							<Icon name="plus" size={13} />
+							New connection
+						</button>
+				)}
+				{/* The same gap, one step along: a dataset could only be added from
+				    a connection's page, so the page that lists them had no way in. */}
+				{entry.kind === "dataset" && canWrite && (
+					<button className="btn sm" style={{ margin: "0 8px 8px" }} onClick={() => setAddingDataset(true)}>
+						<Icon name="plus" size={13} />
+						Add dataset
 					</button>
 				)}
 				<ul className="rb-items">
@@ -151,36 +202,25 @@ export function ResourceBrowser() {
 									<span className="rb-item-view mono">{resource.backingView}</span>
 								)}
 							</button>
-							{confirming === resource.id ? (
-								<span className="wsp-confirm">
-									<button
-										className="wsp-confirm-yes"
-										onClick={() => void remove(resource)}
-										disabled={deleting === resource.id}
-									>
-										{deleting === resource.id ? "…" : "Delete"}
-									</button>
-									<button className="wsp-confirm-no" onClick={() => setConfirming(null)}>
-										Keep
-									</button>
-								</span>
-							) : (
+							{canDelete && removalTarget(resource) && (
 								<button
 									className="wsp-delete"
-									onClick={() => setConfirming(resource.id)}
-									title={`Remove ${resource.name} from the workspace`}
-									aria-label={`Remove ${resource.name}`}
+									onClick={() => setRemoving(resource)}
+									title={`Delete ${resource.name}`}
+									aria-label={`Delete ${resource.name}`}
 								>
-									×
+									<Icon name="trash" size={14} />
 								</button>
 							)}
 						</li>
 					))}
 				</ul>
-				<p className="rb-foot muted">
-					Removing a card unregisters it from the workspace. The view, object type or
-					dashboard itself is not dropped.
-				</p>
+				{canDelete && (
+					<p className="rb-foot muted">
+						Deleting one removes the {spec.label.toLowerCase()} itself, not only its entry here. What goes with it
+						is listed before anything is removed.
+					</p>
+				)}
 			</aside>
 
 			<section className="rb-detail">
@@ -191,6 +231,7 @@ export function ResourceBrowser() {
 						resource={selected}
 						kindLabel={spec.label}
 						canWrite={canWrite}
+						onDelete={canDelete && removalTarget(selected) ? () => setRemoving(selected) : null}
 						onOpenGrid={() => setGridOpen(true)}
 						onChanged={(message) => {
 							setNotice(message);
@@ -203,6 +244,30 @@ export function ResourceBrowser() {
 					</div>
 				)}
 			</section>
+
+			{addingDataset && (
+				<div
+					className="rb-dialog-backdrop"
+					onMouseDown={(event) => {
+						if (event.target === event.currentTarget) setAddingDataset(false);
+					}}
+				>
+					<div className="rb-dialog">
+						<AddDatasetDialog
+							connections={connections}
+							onClose={() => setAddingDataset(false)}
+							onDone={(message, datasetResourceId) => {
+								setAddingDataset(false);
+								setNotice(message);
+								// The new dataset is opened once the list has it.
+								void refresh().then(() => {
+									if (datasetResourceId !== null) setSelectedId(datasetResourceId);
+								});
+							}}
+						/>
+					</div>
+				</div>
+			)}
 
 			{creating && (
 				<div className="rb-dialog-backdrop">
@@ -226,6 +291,23 @@ export function ResourceBrowser() {
 				title={selected?.name ?? ""}
 				onClose={() => setGridOpen(false)}
 			/>
+
+			{removing && removingTarget && (
+				<DeleteDialog
+					kind={removingTarget.kind}
+					target={removingTarget.target}
+					label={removing.name}
+					onClose={() => setRemoving(null)}
+					onDeleted={(plan) => {
+						setRemoving(null);
+						setError(null);
+						setNotice(deletedNotice(plan));
+						// The lists, and the counts beside them in the navigation.
+						void refresh();
+						reload();
+					}}
+				/>
+			)}
 		</div>
 	);
 }
@@ -234,12 +316,15 @@ function ResourceDetail({
 	resource,
 	kindLabel,
 	canWrite,
+	onDelete,
 	onOpenGrid,
 	onChanged,
 }: {
 	resource: BrowseResource;
 	kindLabel: string;
 	canWrite: boolean;
+	/** Null when this person may not delete here, or the card stands for nothing. */
+	onDelete: (() => void) | null;
 	onOpenGrid: () => void;
 	onChanged: (message: string) => void;
 }) {
@@ -279,9 +364,10 @@ function ResourceDetail({
 							style={{ marginLeft: "auto" }}
 							onClick={() => setModelling(true)}
 							title="Model this dataset as an object type, a property per column"
-						>
-							Create object type
-						</button>
+							>
+								<Icon name="plus" size={13} />
+								Create object type
+							</button>
 					)}
 					<button
 						className="btn sm"
@@ -289,9 +375,11 @@ function ResourceDetail({
 						onClick={onOpenGrid}
 						disabled={!data || data.total === 0}
 						title={data && data.total === 0 ? "There are no rows to open." : undefined}
-					>
-						Open full data
-					</button>
+						>
+							<Icon name="maximize" size={13} />
+							Open full data
+						</button>
+					{onDelete && <DeleteButton onClick={onDelete} title={`Delete ${resource.name}`} />}
 				</div>
 				{resource.description && (
 					<p className="secondary" style={{ margin: "0 0 10px" }}>

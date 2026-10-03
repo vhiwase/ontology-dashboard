@@ -166,6 +166,56 @@ export function resolveFields(
 	return fields;
 }
 
+/**
+ * The title an edit names, as the column it is - or null for "no title".
+ *
+ * title_column is not a label: it goes into SQL as an identifier - the ORDER
+ * BY of every object search, the name shown for a linked object - so a value
+ * that is not one of the type's columns would be stored without complaint and
+ * then fail every later query on the type. It is checked against the type's
+ * own properties here, and a property's API name is accepted for its column,
+ * since that is the name the rest of the API speaks.
+ */
+export function resolveTitleColumn(
+	type: {
+		apiName: string;
+		properties: Array<{ apiName: string; sqlColumn: string }>;
+	},
+	value: unknown,
+): string | null {
+	if (value === null || value === undefined || value === "") return null;
+	const named = String(value);
+	const property =
+		type.properties.find((entry) => entry.sqlColumn === named) ??
+		type.properties.find((entry) => entry.apiName === named);
+	if (!property) {
+		throw new BadRequest(
+			`'${named}' is not a column of ${type.apiName}, so it cannot be its title. ` +
+				`Its columns: ${type.properties.map((entry) => entry.sqlColumn).join(", ")}.`,
+		);
+	}
+	return property.sqlColumn;
+}
+
+/**
+ * Keep each property's title flag in step with its type's title column.
+ *
+ * The title is recorded twice: title_column on the type, and is_title on one
+ * of its properties. Changing only the first left the flag pointing at the
+ * title the type was created with - and since the flag is what stands in when
+ * there is no title_column, a title that had been cleared came straight back.
+ * Every write of title_column is followed by this, so the two cannot disagree.
+ */
+async function alignTitleFlag(versionId: number, rid: string, titleColumn: string | null): Promise<void> {
+	await query(
+		`UPDATE platform.object_property
+		    SET is_title = (sql_column IS NOT DISTINCT FROM $3::text)
+		  WHERE ontology_version_id = $1 AND object_type_rid = $2
+		    AND is_title IS DISTINCT FROM (sql_column IS NOT DISTINCT FROM $3::text)`,
+		[versionId, rid, titleColumn],
+	);
+}
+
 /** The current values of the fields about to change, for the journal. */
 async function readPrevious(
 	kind: EditKind,
@@ -198,6 +248,18 @@ export async function editOntologyObject(
 ): Promise<EditRecord> {
 	const { id: versionId } = await activeVersion();
 	const fields = resolveFields(kind, payload);
+
+	// A title is one of the type's own columns; see resolveTitleColumn. What is
+	// journalled is the column that was stored, not the name that was sent.
+	let recorded = payload;
+	const title = kind === "objectType" ? fields.find((field) => field.column === "title_column") : undefined;
+	if (title) {
+		const type = getRegistry().objectTypeByRid.get(rid);
+		if (!type) throw new NotFound(`No objectType '${rid}' in this space's ontology.`);
+		title.value = resolveTitleColumn(type, title.value);
+		recorded = { ...payload, titleColumn: title.value };
+	}
+
 	const previous = await readPrevious(
 		kind,
 		rid,
@@ -215,8 +277,9 @@ export async function editOntologyObject(
 		  WHERE ${quoteIdentifier(ridColumn)} = $1 AND ontology_version_id = $2`,
 		[rid, versionId, ...fields.map((f) => f.value)],
 	);
+	if (title) await alignTitleFlag(versionId, rid, title.value as string | null);
 
-	const record = await journal(kind, rid, "update", payload, previous, editedBy, note);
+	const record = await journal(kind, rid, "update", recorded, previous, editedBy, note);
 	await publishChange();
 	return record;
 }
@@ -622,6 +685,10 @@ export async function undoEdit(editId: number, undoneBy: string): Promise<void> 
 			  WHERE ${quoteIdentifier(ridColumn)} = $1 AND ontology_version_id = $2`,
 			[row.target_rid, versionId, ...columns.map((c) => row.previous[c])],
 		);
+		// Putting a title back is a write of title_column like any other.
+		if (row.target_kind === "objectType" && "title_column" in row.previous) {
+			await alignTitleFlag(versionId, row.target_rid, (row.previous.title_column as string | null) ?? null);
+		}
 	}
 
 	await query(

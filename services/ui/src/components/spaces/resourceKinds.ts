@@ -7,6 +7,8 @@
  * actions), computation (metrics) and output (dashboards).
  */
 
+import type { IconName } from "../icons";
+
 export type ResourceKind =
 	| "connection"
 	| "dataset"
@@ -19,6 +21,8 @@ export type ResourceKind =
 export interface ResourceSpec {
 	kind: ResourceKind;
 	glyph: string;
+	/** The same kind drawn as an icon, for the rail, lists and window headers. */
+	icon: IconName;
 	label: string;
 	plural: string;
 	accent: string;
@@ -30,6 +34,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	connection: {
 		kind: "connection",
 		glyph: "⛁",
+		icon: "database",
 		label: "Connection",
 		plural: "Connections",
 		accent: "var(--node-data)",
@@ -37,6 +42,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	dataset: {
 		kind: "dataset",
 		glyph: "▤",
+		icon: "table",
 		label: "Dataset",
 		plural: "Datasets",
 		accent: "var(--node-data)",
@@ -44,6 +50,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	objectType: {
 		kind: "objectType",
 		glyph: "◈",
+		icon: "box",
 		label: "Object Type",
 		plural: "Object Types",
 		accent: "var(--node-ontology)",
@@ -52,6 +59,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	linkType: {
 		kind: "linkType",
 		glyph: "↔",
+		icon: "link",
 		label: "Link Type",
 		plural: "Links",
 		accent: "var(--node-ontology)",
@@ -60,6 +68,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	actionType: {
 		kind: "actionType",
 		glyph: "⚡",
+		icon: "zap",
 		label: "Action Type",
 		// "Action Types", not "Actions": these are the DEFINITIONS in the
 		// ontology. "Actions" is the page where one is executed, and naming both
@@ -71,6 +80,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	kpi: {
 		kind: "kpi",
 		glyph: "Σ",
+		icon: "sigma",
 		label: "Metric",
 		plural: "Metrics",
 		accent: "var(--node-transform)",
@@ -78,6 +88,7 @@ export const RESOURCE_SPECS: Record<ResourceKind, ResourceSpec> = {
 	dashboard: {
 		kind: "dashboard",
 		glyph: "▦",
+		icon: "dashboard",
 		label: "Dashboard",
 		plural: "Dashboards",
 		accent: "var(--node-output)",
